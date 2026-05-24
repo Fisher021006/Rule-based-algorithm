@@ -1,0 +1,45 @@
+from typing import List, Dict, Tuple, Set
+from dataclasses import dataclass
+
+# 允许换道的车道线类型
+CHANGEABLE_MARKS = ['broken', 'broken broken', 'broken solid', 'none']
+
+# ==================== 规划参数 ====================
+# 换道惩罚系数（越大越不倾向换道）
+LANE_CHANGE_COST = 5.0
+
+# 最小换道长度（米）
+MIN_LANE_CHANGE_LENGTH = 10.0
+
+# 最大搜索距离（米）- 用于KDTree查找最近车道
+MAX_SEARCH_DISTANCE = 10.0
+
+
+@dataclass
+class RoadSegment:
+    """路段信息"""
+    road_id: str
+    planned_lanes: List[str]
+    all_lanes: List[str]
+    drivable_lanes: Set[str]
+    entry_lane: str
+    exit_lane: str
+    start_coord: Tuple[float, float]
+    end_coord: Tuple[float, float]
+    length: float
+
+
+# ==================== 换道曲线配置（可调整）====================
+LANE_CHANGE_CONFIG = {
+    # === 单次换道参数 ===
+    'single_start_ratio': 0.1,  # 换道开始位置 (范围: 0.1~0.4，越小越早开始)
+    'single_end_ratio': 0.7,  # 换道结束位置 (范围: 0.6~0.9，越大越晚结束)
+    'single_num_points': 50,  # 曲线采样点数 (范围: 30~100，越大越平滑)
+    'single_control_factor': 3.0,  # 贝塞尔控制点系数 (范围: 2.0~5.0，越小曲线越圆润)
+
+    # === 多车道换道参数 ===
+    'multi_num_points_per_lane': 50,  # 每跨一个车道增加的点数
+    'multi_control_factor': 2.5,  # 五次贝塞尔控制点系数 (范围: 2.0~4.0)
+    'multi_start_adjust': 0.05,  # 每多跨一个车道，起点提前的比例
+    'multi_end_adjust': 0.05,  # 每多跨一个车道，终点延后的比例
+}

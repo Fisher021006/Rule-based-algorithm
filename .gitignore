@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches
+.cache/
+.mplcache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Test and coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# IDE/editor files
+.idea/
+.vscode/
+
+# Runtime logs and temp files
+*.log
+*.tmp
+*.temp
+*.pid
+
+# Project-generated outputs
+outputs/
+info.npy
+
+# Large source GIS attachments not used by runtime
+xodr_parser/data/nongan_v5_1202（农安地图完整版）/nongan_v5_1202/shp/

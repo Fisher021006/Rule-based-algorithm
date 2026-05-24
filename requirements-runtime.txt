@@ -1,0 +1,8 @@
+numpy==1.24.4
+pyproj==3.5.0
+lxml==4.9.4
+networkx==3.1
+scipy==1.10.1
+osqp==0.6.5
+rospkg
+catkin_pkg

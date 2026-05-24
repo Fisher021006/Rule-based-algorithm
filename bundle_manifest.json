@@ -1,0 +1,24 @@
+{
+  "bundle_name": "direct_control_bundle",
+  "included_files": [
+    "direct_control_node.py",
+    "simulate_rollout.py"
+  ],
+  "included_dirs": [
+    "simulator",
+    "traj_planner",
+    "drivable_lanes_planner",
+    "global_planner",
+    "utils",
+    "xodr_parser"
+  ],
+  "included_msgs": [
+    "controlcmd.msg",
+    "sensorgps.msg",
+    "actuator.msg"
+  ],
+  "map_data": [
+    "xodr_parser/data/同济测试场.xodr",
+    "xodr_parser/cache/同济测试场.pkl"
+  ]
+}
