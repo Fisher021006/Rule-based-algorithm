@@ -107,6 +107,7 @@ def main() -> None:
         "output_live_png": summary.get("output_live_png"),
         "output_gif": summary["output_gif"],
         "output_json": summary["output_json"],
+        "output_timing_json": summary.get("output_timing_json"),
     }
     print(compact)
 

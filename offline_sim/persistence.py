@@ -38,6 +38,21 @@ def write_summary_json(output_json: Path, summary: dict[str, Any]) -> None:
     output_json.write_text(json.dumps(to_builtin(summary), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_timing_json(output_json: Path, summary: dict[str, Any]) -> None:
+    """把模块耗时摘要单独写入 JSON，便于直接做可视化。"""
+
+    payload = {
+        "planner_mode": summary.get("planner_mode"),
+        "scene_algorithm_symbol": summary.get("scene_algorithm_symbol"),
+        "status": summary.get("status"),
+        "failure_reason": summary.get("failure_reason"),
+        "max_steps": summary.get("max_steps"),
+        "completed_steps": summary.get("completed_steps"),
+        "timing_frames": summary.get("timing_frames", []),
+    }
+    output_json.write_text(json.dumps(to_builtin(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def persist_simulation_artifacts(
     args: argparse.Namespace,
     xodr_parser: XODRParser,
@@ -54,10 +69,12 @@ def persist_simulation_artifacts(
     output_png = output_dir / f"{args.output_prefix}.png"
     output_gif = None if bool(args.skip_gif) else output_dir / f"{args.output_prefix}.gif"
     output_json = output_dir / f"{args.output_prefix}.json"
+    output_timing_json = output_dir / f"{args.output_prefix}_timing.json"
 
     summary["output_png"] = str(output_png)
     summary["output_gif"] = None if output_gif is None else str(output_gif)
     summary["output_json"] = str(output_json)
+    summary["output_timing_json"] = str(output_timing_json)
     summary["gif_saved"] = False
 
     print(f"[render] writing PNG -> {output_png}", flush=True)
@@ -72,11 +89,13 @@ def persist_simulation_artifacts(
         planner_mode=str(args.planner_mode),
     )
     write_summary_json(output_json, summary)
+    write_timing_json(output_timing_json, summary)
 
     if output_gif is None:
         summary["gif_saved"] = False
         summary["gif_skipped"] = True
         write_summary_json(output_json, summary)
+        write_timing_json(output_timing_json, summary)
         return summary
 
     try:
@@ -103,4 +122,5 @@ def persist_simulation_artifacts(
             summary["failure_reason"] = str(summary.get("failure_reason") or "keyboard_interrupt")
         print("[render] GIF generation interrupted; PNG/JSON 已保存", flush=True)
     write_summary_json(output_json, summary)
+    write_timing_json(output_timing_json, summary)
     return summary

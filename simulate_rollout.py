@@ -213,6 +213,7 @@ def build_sampling_frame(
     gvt,
     step_idx,
     sim_time_s,
+    replan_dt,
     ego_state_before_plan,
     ego_state_after_execute,
     status,
@@ -233,11 +234,24 @@ def build_sampling_frame(
             if 0 <= selected_line_index < len(gvt.refer_line_lateral_steps):
                 selected_lateral_step = int(gvt.refer_line_lateral_steps[selected_line_index])
 
+    local_timing = dict(getattr(planner, "last_module_timing_ms", {}) or {})
+    provider = getattr(gvt, "scene_target_provider", None)
+    scene_time_ms = 0.0 if provider is None else float(getattr(provider, "last_scene_algorithm_timing_ms", 0.0) or 0.0)
+    module_timing_ms = dict(local_timing)
+    module_timing_ms["scene_algorithm_ms"] = round(scene_time_ms, 3)
+    module_timing_ms["end_to_end_total_ms"] = round(scene_time_ms + float(local_timing.get("plan_total_ms", 0.0)), 3)
+    planning_budget_ms = round(float(replan_dt) * 1000.0, 3)
+    overrun_ms = round(max(module_timing_ms["end_to_end_total_ms"] - planning_budget_ms, 0.0), 3)
+
     return {
         "step": int(step_idx),
         "sim_time_s": round(float(sim_time_s), 6),
         "status": status,
         "remain_dist": float(remain_dist),
+        "module_timing_ms": to_builtin(module_timing_ms),
+        "planning_budget_ms": planning_budget_ms,
+        "realtime_ok": bool(module_timing_ms["end_to_end_total_ms"] <= planning_budget_ms),
+        "overrun_ms": overrun_ms,
         "ego_state_before_plan": ego_state_before_plan,
         "ego_state_after_execute": ego_state_after_execute,
         "current_mode": planner.attribute.get("plan_mode", ""),
@@ -276,6 +290,7 @@ def build_sampling_frame(
 
 def build_summary(result, start_xy, goal_xy):
     sampling_frames = result["sampling_frames"]
+    timing_frames = result.get("timing_frames", [])
     debug_steps = result["debug_steps"]
     mode_counts = Counter(
         frame["current_mode"] for frame in sampling_frames if frame.get("current_mode")
@@ -299,6 +314,11 @@ def build_summary(result, start_xy, goal_xy):
         ),
         None,
     )
+    total_plan_ms = [
+        float(frame.get("module_timing_ms", {}).get("end_to_end_total_ms", 0.0))
+        for frame in timing_frames
+    ]
+    realtime_ok_count = sum(1 for frame in timing_frames if bool(frame.get("realtime_ok", False)))
     return {
         "start_xy": [float(start_xy[0]), float(start_xy[1])],
         "goal_xy": [float(goal_xy[0]), float(goal_xy[1])],
@@ -311,6 +331,10 @@ def build_summary(result, start_xy, goal_xy):
         "sampling_frame_count": len(sampling_frames),
         "candidate_total": int(candidate_total),
         "feasible_candidate_total": int(feasible_candidate_total),
+        "timing_frame_count": len(timing_frames),
+        "avg_plan_total_ms": float(np.mean(total_plan_ms)) if total_plan_ms else 0.0,
+        "max_plan_total_ms": float(np.max(total_plan_ms)) if total_plan_ms else 0.0,
+        "realtime_ok_rate": float(realtime_ok_count / len(timing_frames)) if timing_frames else 0.0,
         "mode_counts": dict(mode_counts),
         "selected_lateral_step_counts": dict(selected_lateral_step_counts),
         "first_lane_change_step": first_lane_change_step,
@@ -426,6 +450,7 @@ def rollout(
                 gvt=gvt,
                 step_idx=step_idx,
                 sim_time_s=step_idx * replan_dt,
+                replan_dt=replan_dt,
                 ego_state_before_plan=ego_state_before_plan,
                 ego_state_after_execute=ego_state_before_plan,
                 status=status,
@@ -496,6 +521,7 @@ def rollout(
             gvt=gvt,
             step_idx=step_idx,
             sim_time_s=step_idx * replan_dt,
+            replan_dt=replan_dt,
             ego_state_before_plan=ego_state_before_plan,
             ego_state_after_execute=ego_state_after_execute,
             status="running",
@@ -539,6 +565,17 @@ def rollout(
         "debug_steps": debug_steps,
         "control_sequence": control_sequence,
         "sampling_frames": sampling_frames,
+        "timing_frames": [
+            {
+                "step": frame["step"],
+                "sim_time_s": frame["sim_time_s"],
+                "module_timing_ms": frame["module_timing_ms"],
+                "planning_budget_ms": frame["planning_budget_ms"],
+                "realtime_ok": frame["realtime_ok"],
+                "overrun_ms": frame["overrun_ms"],
+            }
+            for frame in sampling_frames
+        ],
         "vehicle_states": vehicle_states,
         "goal_xy": np.asarray(goal_xy, dtype=float),
     }
@@ -685,6 +722,7 @@ def main():
     sampling_path = output_dir / f"{args.output_prefix}_sampling_frames.json"
     vehicle_path = output_dir / f"{args.output_prefix}_vehicle_states.json"
     summary_path = output_dir / f"{args.output_prefix}_summary.json"
+    timing_path = output_dir / f"{args.output_prefix}_timing.json"
     img_path = output_dir / f"{args.output_prefix}_plot.png"
     summary = build_summary(result, start_xy, goal_xy)
 
@@ -719,6 +757,8 @@ def main():
         json.dump(result["sampling_frames"], f, ensure_ascii=False, indent=2)
     with vehicle_path.open("w", encoding="utf-8") as f:
         json.dump(result["vehicle_states"], f, ensure_ascii=False, indent=2)
+    with timing_path.open("w", encoding="utf-8") as f:
+        json.dump(result["timing_frames"], f, ensure_ascii=False, indent=2)
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
@@ -730,6 +770,7 @@ def main():
     print(f"CONTROL_JSON {control_path}")
     print(f"SAMPLING_JSON {sampling_path}")
     print(f"VEHICLE_JSON {vehicle_path}")
+    print(f"TIMING_JSON {timing_path}")
     print(f"SUMMARY_JSON {summary_path}")
     print(f"PLOT_PNG {img_path}")
     print(f"PLANNED_PATH {result['planned_path']}")

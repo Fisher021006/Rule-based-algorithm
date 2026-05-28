@@ -122,6 +122,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     ego_trace = [[ego_vehicle.x, ego_vehicle.y, ego_vehicle.heading, ego_vehicle.v, ego_vehicle.a, ego_vehicle.kappa]]
     main_trace = [[main_vehicle.x, main_vehicle.y, main_vehicle.heading, main_vehicle.v, main_vehicle.a]]
     planner_frames: list[dict[str, Any]] = []
+    timing_frames: list[dict[str, Any]] = []
     obstacle_input_history: list[dict[str, Any]] = []
     status = "running"
     failure_reason = ""
@@ -162,6 +163,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     f"[sim] step {step_index + 1}/{max_steps} failed "
                     f"status={status} reason={failure_reason or '-'}"
                 )
+                local_timing = dict(getattr(ego_vehicle.traj_planner, "last_module_timing_ms", {}) or {})
+                scene_time_ms = float(getattr(provider, "last_scene_algorithm_timing_ms", 0.0) or 0.0)
+                module_timing_ms = dict(local_timing)
+                module_timing_ms["scene_algorithm_ms"] = round(scene_time_ms, 3)
+                module_timing_ms["end_to_end_total_ms"] = round(scene_time_ms + float(local_timing.get("plan_total_ms", 0.0)), 3)
+                budget_ms = round(float(args.dt) * 1000.0, 3)
+                timing_frames.append(
+                    {
+                        "step_index": step_index,
+                        "time_s": time_s,
+                        "module_timing_ms": module_timing_ms,
+                        "planning_budget_ms": budget_ms,
+                        "realtime_ok": bool(module_timing_ms["end_to_end_total_ms"] <= budget_ms),
+                        "overrun_ms": round(max(module_timing_ms["end_to_end_total_ms"] - budget_ms, 0.0), 3),
+                    }
+                )
                 break
             if args.planner_mode == "local_sampling":
                 record_local_sampling_result(
@@ -188,6 +205,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             main_trace.append([main_vehicle.x, main_vehicle.y, main_vehicle.heading, main_vehicle.v, main_vehicle.a])
 
             remain_dist = float(np.linalg.norm(np.array([ego_vehicle.x, ego_vehicle.y], dtype=float) - ego_goal_xy))
+            local_timing = dict(getattr(ego_vehicle.traj_planner, "last_module_timing_ms", {}) or {})
+            scene_time_ms = float(getattr(provider, "last_scene_algorithm_timing_ms", 0.0) or 0.0)
+            module_timing_ms = dict(local_timing)
+            module_timing_ms["scene_algorithm_ms"] = round(scene_time_ms, 3)
+            module_timing_ms["end_to_end_total_ms"] = round(scene_time_ms + float(local_timing.get("plan_total_ms", 0.0)), 3)
+            budget_ms = round(float(args.dt) * 1000.0, 3)
+            timing_frames.append(
+                {
+                    "step_index": step_index,
+                    "time_s": time_s,
+                    "module_timing_ms": module_timing_ms,
+                    "planning_budget_ms": budget_ms,
+                    "realtime_ok": bool(module_timing_ms["end_to_end_total_ms"] <= budget_ms),
+                    "overrun_ms": round(max(module_timing_ms["end_to_end_total_ms"] - budget_ms, 0.0), 3),
+                }
+            )
             planner_frames.append(
                 {
                     "step_index": step_index,
@@ -208,6 +241,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                         "a": main_vehicle.a,
                     },
                     "planner_attr": dict(ego_vehicle.traj_planner.attribute),
+                    "module_timing_ms": module_timing_ms,
+                    "planning_budget_ms": budget_ms,
+                    "realtime_ok": bool(module_timing_ms["end_to_end_total_ms"] <= budget_ms),
+                    "overrun_ms": round(max(module_timing_ms["end_to_end_total_ms"] - budget_ms, 0.0), 3),
                     "obstacle_inputs": [] if obstacle_snapshot is None else [obstacle_snapshot],
                     "remain_dist": remain_dist,
                 }
@@ -251,6 +288,19 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     summary = {
+        "timing_frame_count": len(timing_frames),
+        "avg_plan_total_ms": round(
+            float(np.mean([frame["module_timing_ms"]["end_to_end_total_ms"] for frame in timing_frames])),
+            3,
+        ) if timing_frames else 0.0,
+        "max_plan_total_ms": round(
+            float(np.max([frame["module_timing_ms"]["end_to_end_total_ms"] for frame in timing_frames])),
+            3,
+        ) if timing_frames else 0.0,
+        "realtime_ok_rate": round(
+            float(sum(1 for frame in timing_frames if frame["realtime_ok"]) / len(timing_frames)),
+            6,
+        ) if timing_frames else 0.0,
         "planner_mode": str(args.planner_mode),
         "scene_algorithm_symbol": str(getattr(args, "scene_algorithm_symbol", "scenarios.scene_algorithm.scene_algorithm")),
         "status": status,
@@ -272,6 +322,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         "planner_debug_markers": provider.history,
         "obstacle_input_history": obstacle_input_history,
         "planner_frames": planner_frames,
+        "timing_frames": timing_frames,
         "output_live_png": None if live_output_png is None else str(live_output_png),
     }
     try:

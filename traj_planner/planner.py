@@ -17,6 +17,10 @@ PlanningInput
     列顺序：``[x, y, heading, v, a, kappa]``
 """
 
+from __future__ import annotations
+
+import time
+
 import numpy as np
 
 from traj_planner.behavior import decide_behavior, update_behavior_memory
@@ -90,6 +94,18 @@ class LocalPlanner:
         self.last_templates = []
         self.last_terminals = []
         self.last_best_candidate: CandidateTrajectory | None = None
+        self.last_module_timing_ms: dict[str, float] = {}
+        self.attribute["module_timing_ms"] = {}
+
+    def _set_last_module_timing(self, timings: dict[str, float]) -> None:
+        """保存单帧模块耗时摘要，便于离线落盘与可视化。"""
+
+        normalized = {
+            key: round(float(value), 3)
+            for key, value in timings.items()
+        }
+        self.last_module_timing_ms = normalized
+        self.attribute["module_timing_ms"] = dict(normalized)
 
     def plan(self, planning_input: PlanningInput):
         """执行一次完整的局部规划周期。
@@ -105,8 +121,24 @@ class LocalPlanner:
         planning_input.planner_memory = self.memory
         if getattr(planning_input, "external_target", None) is not None:
             return self._plan_with_external_target(planning_input)
+        plan_start = time.perf_counter()
+        timings = {
+            "context_ms": 0.0,
+            "behavior_ms": 0.0,
+            "sampling_ms": 0.0,
+            "generator_ms": 0.0,
+            "evaluator_ms": 0.0,
+            "refine_ms": 0.0,
+            "plan_total_ms": 0.0,
+        }
+
+        context_start = time.perf_counter()
         context = build_planning_context(planning_input)
+        timings["context_ms"] = (time.perf_counter() - context_start) * 1000.0
+
+        behavior_start = time.perf_counter()
         decision = decide_behavior(context)
+        timings["behavior_ms"] = (time.perf_counter() - behavior_start) * 1000.0
         if decision.mode == BehaviorMode.ARRIVED:
             self.memory = update_behavior_memory(context, decision, None)
             output = PlanningOutput(
@@ -120,11 +152,17 @@ class LocalPlanner:
             self.last_terminals = []
             self.last_output = output
             self.last_best_candidate = None
+            timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+            self._set_last_module_timing(timings)
             self._update_attribute(output, None)
             return None
 
+        sampling_start = time.perf_counter()
         templates = build_candidate_templates(context, decision)
         terminals = sample_terminal_states(context, decision, templates)
+        timings["sampling_ms"] = (time.perf_counter() - sampling_start) * 1000.0
+
+        generator_start = time.perf_counter()
         candidates = [
             apply_time_param_to_candidate(
                 context,
@@ -137,8 +175,15 @@ class LocalPlanner:
         if continuation_candidate is not None:
             candidates.append(continuation_candidate)
             terminals.append(continuation_candidate.terminal)
+        timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
+
+        evaluator_start = time.perf_counter()
         best_candidate, candidates = evaluate_candidates(context, decision, candidates)
+        timings["evaluator_ms"] = (time.perf_counter() - evaluator_start) * 1000.0
+
+        refine_start = time.perf_counter()
         best_candidate, candidates = self._refine_best_candidate(context, decision, best_candidate, candidates)
+        timings["refine_ms"] = (time.perf_counter() - refine_start) * 1000.0
         self.memory = update_behavior_memory(context, decision, best_candidate)
 
         output = PlanningOutput(
@@ -152,6 +197,8 @@ class LocalPlanner:
         self.last_terminals = list(terminals)
         self.last_output = output
         self.last_best_candidate = best_candidate
+        timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+        self._set_last_module_timing(timings)
         self._update_attribute(output, best_candidate)
 
         if best_candidate is None:
@@ -164,9 +211,24 @@ class LocalPlanner:
         if external_target is None:
             return None
 
+        plan_start = time.perf_counter()
+        timings = {
+            "context_ms": 0.0,
+            "behavior_ms": 0.0,
+            "sampling_ms": 0.0,
+            "generator_ms": 0.0,
+            "evaluator_ms": 0.0,
+            "refine_ms": 0.0,
+            "plan_total_ms": 0.0,
+        }
+
+        context_start = time.perf_counter()
         context = build_planning_context(planning_input)
+        timings["context_ms"] = (time.perf_counter() - context_start) * 1000.0
         target_line_index = int(external_target.target_line_index)
         if target_line_index < 0 or target_line_index >= len(context.line_contexts):
+            timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+            self._set_last_module_timing(timings)
             return None
 
         target_line = context.line_contexts[target_line_index]
@@ -174,6 +236,7 @@ class LocalPlanner:
         _, target_s, _ = project_point_to_path(target_xy, target_line.line)
         target_s = max(float(target_s), float(target_line.current_s) + 1.0)
 
+        generator_start = time.perf_counter()
         terminal = TerminalCandidate(
             line_index=target_line_index,
             line_id=target_line.line_id,
@@ -189,13 +252,41 @@ class LocalPlanner:
             candidate = candidate_osqp
         else:
             candidate = apply_time_param_to_candidate(context, candidate, method="quintic")
+        timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
         if candidate.trajectory is None or len(candidate.trajectory) == 0:
+            timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+            self._set_last_module_timing(timings)
             return None
 
         self.last_context = context
         self.last_templates = []
         self.last_terminals = [terminal]
         self.last_best_candidate = candidate
+        self.last_output = None
+        timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+        self._set_last_module_timing(timings)
+        self.attribute.update(
+            {
+                "plan_mode": "external_target",
+                "candidate_count": 1,
+                "feasible_candidate_count": 1,
+                "target_point": np.asarray(candidate.trajectory[-1, :2], dtype=float).tolist(),
+                "selected_line_id": terminal.line_id,
+                "selected_template": terminal.template_name,
+                "selected_score": None,
+                "failure_reason": candidate.failure_reason,
+                "target_lane_id": terminal.line_id,
+                "must_change": False,
+                "deadline_margin_m": None,
+                "reason": str(getattr(external_target, "source", "external_target")),
+                "best_mobil_incentive": 0.0,
+                "current_front_ttc": None,
+                "current_front_stop_margin": None,
+                "current_front_gap": None,
+                "is_arrive": False,
+                "is_on_lane": terminal.line_index == 0,
+            }
+        )
         return np.asarray(candidate.trajectory, dtype=float)
 
     def _refine_best_candidate(

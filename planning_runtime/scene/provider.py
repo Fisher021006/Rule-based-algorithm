@@ -9,6 +9,7 @@ PlanningFrame
 from __future__ import annotations
 
 import importlib
+import time
 from typing import Any
 
 import numpy as np
@@ -161,6 +162,7 @@ class SceneTargetProvider:
         self.scene_algorithm = None
         self.history: list[dict[str, Any]] = []
         self.last_scene_context: SceneContext | None = None
+        self.last_scene_algorithm_timing_ms: float = 0.0
         self._main_lane_locator: DrivableLanesExtender | None = None
         self.set_scene_algorithm_symbol(scene_algorithm_symbol)
 
@@ -434,7 +436,9 @@ class SceneTargetProvider:
         main_vehicle = scene_context.main_vehicle
 
         # 用户算法只需要返回 6 个主体参数，框架在这里补齐元信息。
+        scene_start = time.perf_counter()
         raw_output = self.scene_algorithm(scene_context)
+        self.last_scene_algorithm_timing_ms = (time.perf_counter() - scene_start) * 1000.0
         output = self._normalize_algorithm_output(raw_output, ego_vehicle)
 
         # 保留逐帧目标与主车关系，供可视化和离线排查使用。
@@ -457,6 +461,7 @@ class SceneTargetProvider:
                 "main_relative_s_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_s_to_ego,
                 "main_relative_d_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_d_to_ego,
                 "scene_algorithm_symbol": self.scene_algorithm_symbol,
+                "scene_algorithm_time_ms": round(float(self.last_scene_algorithm_timing_ms), 3),
             }
         )
 
