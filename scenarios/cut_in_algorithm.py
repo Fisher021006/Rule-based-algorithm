@@ -11,12 +11,24 @@ from __future__ import annotations
 
 import copy
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
+
+
+@dataclass(frozen=True)
+class VehicleLimits:
+    """场景算法实际使用的车辆尺寸与平台约束。"""
+
+    ego_length: float
+    main_length: float
+    max_v: float
+    min_acc: float
+    max_acc: float
 
 
 CFG: dict[str, Any] = {
@@ -368,7 +380,8 @@ def _build_keep_lane_output(
     """构造沿当前参考线前进的保底目标点。"""
     ego = context.ego_vehicle
     line = ego.current_ref_line
-    target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, _read_max_v(context))
+    limits = _read_vehicle_limits(context)
+    target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
     plan_t = 2.0
     travel_s = max(float(CFG["min_target_progress_m"]), target_v * plan_t + 4.0)
     target_s = _clamp(
@@ -414,10 +427,11 @@ def _build_prepare_output(
         float(line.cumulative_s[-1]) - 0.5,
     )
     target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
+    limits = _read_vehicle_limits(context)
     a_req = _clamp(
         (target_v - float(ego.v)) / max(plan_t, 1e-3),
-        _read_min_acc(context),
-        _read_max_acc(context),
+        limits.min_acc,
+        limits.max_acc,
     )
 
     debug = copy.deepcopy(launch_plan["debug"])
@@ -522,10 +536,11 @@ def _build_stabilize_output(
     """构造换道完成后的短时稳定跟随输出。"""
     # 逻辑：
     # 1. STABILIZE 只做短时跟随，不再改变场景定义。
+    limits = _read_vehicle_limits(context)
     target_v = (
-        _clamp(float(context.main_vehicle.v), 0.0, _read_max_v(context))
+        _clamp(float(context.main_vehicle.v), 0.0, limits.max_v)
         if context.main_vehicle is not None
-        else _clamp(float(CFG["cruise_target_v"]), 0.0, _read_max_v(context))
+        else _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
     )
     travel_s = max(8.0, target_v * 2.0 + 4.0)
     target_s = min(float(target_line.current_s) + float(travel_s), float(target_line.cumulative_s[-1]) - 0.5)
@@ -734,8 +749,9 @@ def _build_prepare_strategy(
     # 1. PREPARE 的目标不是跟主车接近，而是把 exact 可行性缺口补出来。
     # 2. exact 不可行且是上界受限时，会主动把目标相对距离压小，甚至压成负值。
     main = context.main_vehicle
+    limits = _read_vehicle_limits(context)
     if main is None:
-        target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, _read_max_v(context))
+        target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
         return {
             "rel_s": 0.0,
             "rel_s_target": 0.0,
@@ -786,7 +802,7 @@ def _build_prepare_strategy(
         -float(CFG["prepare_max_speed_lag_mps"]),
         float(CFG["prepare_max_speed_adv_mps"]),
     )
-    target_v = _clamp(float(main.v) + float(speed_delta), 0.0, _read_max_v(context))
+    target_v = _clamp(float(main.v) + float(speed_delta), 0.0, limits.max_v)
     rel_s_error = abs(float(rel_s) - float(rel_s_target))
 
     return {
@@ -956,7 +972,8 @@ def _prepare_activation_ok(
     target_v = float(candidate_solution.get("v", 0.0))
     plan_t = max(float(CFG["lane_change_time_s"]), 1e-3)
     a_req = (target_v - ego_v) / plan_t
-    min_acc_allowed = _read_min_acc(context) + float(CFG["prepare_acc_margin_mps2"])
+    limits = _read_vehicle_limits(context)
+    min_acc_allowed = limits.min_acc + float(CFG["prepare_acc_margin_mps2"])
     acc_margin_ok = a_req >= min_acc_allowed
     return bool(acc_margin_ok), {
         "prepare_start_a_req": float(a_req),
@@ -1400,12 +1417,10 @@ def _build_solve_context(
 
     main_pred = _predict_main_vehicle_at_t(context, target_line, remaining_t)
     target_line_end_s = float(target_line.cumulative_s[-1]) - 0.5
-    ego_length = _read_ego_length(context)
-    main_length = _read_main_length(context)
+    limits = _read_vehicle_limits(context)
+    ego_length = limits.ego_length
+    main_length = limits.main_length
     A = float(main_pred["s_on_target_line"]) + 0.5 * (float(main_length) - float(ego_length)) - float(ego_s_on_target)
-    max_v = _read_max_v(context)
-    min_acc = _read_min_acc(context)
-    max_acc = _read_max_acc(context)
 
     return {
         "ok": True,
@@ -1424,9 +1439,9 @@ def _build_solve_context(
             "target_line": target_line,
             "min_physical_gap": float(CFG["min_physical_gap_m"]),
             "physical_gap_tol": float(CFG["physical_gap_tol_m"]),
-            "min_acc": float(min_acc),
-            "max_acc": float(max_acc),
-            "max_v": float(max_v),
+            "min_acc": float(limits.min_acc),
+            "max_acc": float(limits.max_acc),
+            "max_v": float(limits.max_v),
             "debug": {
                 "remaining_t": float(remaining_t),
                 "ego_v": float(ego.v),
@@ -1436,9 +1451,9 @@ def _build_solve_context(
                 "main_s_pred": float(main_pred["s_on_target_line"]),
                 "A": float(A),
                 "target_line_end_s": float(target_line_end_s),
-                "max_v": float(max_v),
-                "min_acc": float(min_acc),
-                "max_acc": float(max_acc),
+                "max_v": float(limits.max_v),
+                "min_acc": float(limits.min_acc),
+                "max_acc": float(limits.max_acc),
             },
         },
     }
@@ -1856,48 +1871,18 @@ def _heading_diff_deg(h1: float, h2: float) -> float:
     return float(np.degrees(abs(normalize_angle(float(h1) - float(h2)))))
 
 
-def _read_ego_length(context: SceneContext) -> float:
-    """读取场景车长度。"""
+def _read_vehicle_limits(context: SceneContext) -> VehicleLimits:
+    """统一读取场景算法使用的车辆尺寸和平台约束。"""
     # 逻辑：
-    # 1. THW 的几何换算需要车长，缺省时回退到默认值。
+    # 1. 把 runtime_frame.config 的字段路径隔离在这里，核心求解只消费 VehicleLimits。
     runtime_frame = context.runtime_frame
-    if runtime_frame is None:
-        return 4.5
-    return float(runtime_frame.config.get("size", {}).get("L", 4.5))
-
-
-def _read_main_length(context: SceneContext) -> float:
-    """读取主车长度。"""
-    # 逻辑：
-    # 1. 当前版本默认主车长度和场景车长度一致。
-    return _read_ego_length(context)
-
-
-def _read_max_v(context: SceneContext) -> float:
-    """读取平台允许的最大速度。"""
-    # 逻辑：
-    # 1. 平台 max_v 只用于可执行性约束，不参与场景定义。
-    runtime_frame = context.runtime_frame
-    if runtime_frame is None:
-        return 6.94
-    return float(runtime_frame.config.get("constrain", {}).get("max_v", 6.94))
-
-
-def _read_min_acc(context: SceneContext) -> float:
-    """读取平台允许的最小加速度。"""
-    # 逻辑：
-    # 1. 平台 min_acc 只用于可执行性约束。
-    runtime_frame = context.runtime_frame
-    if runtime_frame is None:
-        return -2.0
-    return float(runtime_frame.config.get("constrain", {}).get("min_acc", -2.0))
-
-
-def _read_max_acc(context: SceneContext) -> float:
-    """读取平台允许的最大加速度。"""
-    # 逻辑：
-    # 1. 平台 max_acc 只用于可执行性约束。
-    runtime_frame = context.runtime_frame
-    if runtime_frame is None:
-        return 2.0
-    return float(runtime_frame.config.get("constrain", {}).get("max_acc", 2.0))
+    config = {} if runtime_frame is None else runtime_frame.config
+    ego_length = float(config.get("size", {}).get("L", 4.5))
+    constrain = config.get("constrain", {})
+    return VehicleLimits(
+        ego_length=float(ego_length),
+        main_length=float(ego_length),
+        max_v=float(constrain.get("max_v", 6.94)),
+        min_acc=float(constrain.get("min_acc", -2.0)),
+        max_acc=float(constrain.get("max_acc", 2.0)),
+    )
