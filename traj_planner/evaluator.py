@@ -140,21 +140,25 @@ def _collision_metrics(context: PlanningContext, traj: np.ndarray, obstacles: It
     }
 
 
-def _trajectory_ttc_metrics(
+def _trajectory_safety_metrics(
     context: PlanningContext,
     traj: np.ndarray,
     obstacles: Iterable[ObstacleSnapshot],
 ) -> dict[str, float]:
-    """计算轨迹上的最小 TTC 与最小停车余量。"""
+    """单次遍历计算碰撞、净空、TTC 和停车余量。"""
 
     ego_length, ego_width = _ego_box(context)
     idm_cfg = context.config["IDM"]
     ttc_cfg = context.config["TTC"]
+    collision_longitudinal_buffer = 0.5
+    collision_lateral_buffer = 0.2
     longitudinal_buffer = float(idm_cfg.get("longitudinal_buffer", 0.5))
     lateral_buffer = float(idm_cfg.get("lateral_buffer", 0.3))
     closing_speed_eps = float(ttc_cfg["closing_speed_eps"])
+    min_clearance = float("inf")
     min_ttc = float("inf")
     min_stop_margin = float("inf")
+    collision = False
 
     for idx, point in enumerate(traj):
         t = idx * DT
@@ -167,12 +171,25 @@ def _trajectory_ttc_metrics(
 
         for obstacle in obstacles:
             obs_xy = _predict_obstacle_position(obstacle, t)
+            obs_length, obs_width = _obstacle_box(obstacle)
+
+            collision_rel = np.asarray(ego_xy - obs_xy, dtype=float)
+            cos_obs = math.cos(-float(obstacle.heading))
+            sin_obs = math.sin(-float(obstacle.heading))
+            rel_x = collision_rel[0] * cos_obs - collision_rel[1] * sin_obs
+            rel_y = collision_rel[0] * sin_obs + collision_rel[1] * cos_obs
+            longitudinal_limit = 0.5 * (ego_length + obs_length) + collision_longitudinal_buffer
+            lateral_limit = 0.5 * (ego_width + obs_width) + collision_lateral_buffer
+            margin = max(abs(rel_x) - longitudinal_limit, abs(rel_y) - lateral_limit)
+            min_clearance = min(min_clearance, margin)
+            if margin < 0.0:
+                collision = True
+
             rel = np.asarray(obs_xy - ego_xy, dtype=float)
             s_rel = float(np.dot(rel, tangent))
             if s_rel <= 0.0:
                 continue
 
-            obs_length, obs_width = _obstacle_box(obstacle)
             d_rel = float(np.dot(rel, normal))
             lateral_gate = 0.5 * (ego_width + obs_width) + lateral_buffer
             if abs(d_rel) > lateral_gate:
@@ -194,14 +211,32 @@ def _trajectory_ttc_metrics(
             if closing_v > closing_speed_eps:
                 min_ttc = min(min_ttc, gap_eff / closing_v)
 
+    if min_clearance == float("inf"):
+        min_clearance = 999.0
     if min_ttc == float("inf"):
         min_ttc = 999.0
     if min_stop_margin == float("inf"):
         min_stop_margin = 999.0
 
     return {
+        "collision": collision,
+        "min_clearance": float(min_clearance),
         "min_ttc": float(min_ttc),
         "min_stop_margin": float(min_stop_margin),
+    }
+
+
+def _trajectory_ttc_metrics(
+    context: PlanningContext,
+    traj: np.ndarray,
+    obstacles: Iterable[ObstacleSnapshot],
+) -> dict[str, float]:
+    """兼容旧调用：从合并安全评估中取 TTC 相关指标。"""
+
+    metrics = _trajectory_safety_metrics(context, traj, obstacles)
+    return {
+        "min_ttc": metrics["min_ttc"],
+        "min_stop_margin": metrics["min_stop_margin"],
     }
 
 
@@ -267,6 +302,38 @@ def _rear_required_brake_after_merge(context: PlanningContext, candidate: Candid
     if closing_v <= 1e-6:
         return 0.0
     return closing_v * closing_v / (2.0 * gap)
+
+
+def _rough_merge_margins(context: PlanningContext, candidate: CandidateTrajectory, traj: np.ndarray) -> tuple[float, float, float]:
+    """用采样终点和已投影障碍物粗估并线余量，避免重复投影。"""
+
+    line_context = context.line_contexts[candidate.terminal.line_index]
+    duration = max(0.0, DT * (len(traj) - 1))
+    terminal_s = float(candidate.terminal.target_s)
+    terminal_v = float(traj[-1, 3])
+
+    if line_context.front_obstacle is None:
+        front_margin = 999.0
+    else:
+        front = line_context.front_obstacle.obstacle
+        front_s = float(line_context.front_obstacle.s) + max(float(front.v), 0.0) * duration
+        gap = float(front_s - terminal_s)
+        required_gap = max(6.0, terminal_v * 1.2 + terminal_v * terminal_v / (2.0 * 2.5))
+        front_margin = gap - required_gap
+
+    if line_context.rear_obstacle is None:
+        return float(front_margin), 999.0, 0.0
+
+    rear = line_context.rear_obstacle.obstacle
+    rear_s = float(line_context.rear_obstacle.s) + max(float(rear.v), 0.0) * duration
+    gap = float(terminal_s - rear_s)
+    rear_margin = gap - max(4.0, float(rear.v) * 0.8)
+    closing_v = max(float(rear.v) - terminal_v, 0.0)
+    if closing_v <= 1e-6:
+        rear_required_brake = 0.0
+    else:
+        rear_required_brake = closing_v * closing_v / (2.0 * max(gap - 4.0, 1e-3))
+    return float(front_margin), float(rear_margin), float(rear_required_brake)
 
 
 def _within_deadline(context: PlanningContext, decision: BehaviorDecision, candidate: CandidateTrajectory) -> bool:
@@ -441,24 +508,7 @@ def evaluate_candidates(
 
         traj = np.asarray(candidate.trajectory, dtype=float)
         dyn = _trajectory_dynamic_metrics(traj)
-        collision = _collision_metrics(context, traj, context.obstacle_snapshots)
-        ttc_metrics = _trajectory_ttc_metrics(context, traj, context.obstacle_snapshots)
-        front_margin = _front_margin_after_merge(context, candidate)
-        rear_margin = _rear_margin_after_merge(context, candidate)
-        rear_required_brake = _rear_required_brake_after_merge(context, candidate)
-        deadline_ok = _within_deadline(context, decision, candidate)
-
-        metrics = {
-            **dyn,
-            **collision,
-            **ttc_metrics,
-            "front_margin_after_merge": float(front_margin),
-            "rear_margin_after_merge": float(rear_margin),
-            "rear_required_brake_after_merge": float(rear_required_brake),
-            "deadline_ok": bool(deadline_ok),
-            "goal_cost": _goal_progress_cost(context, traj),
-        }
-        candidate.metrics.update(metrics)
+        candidate.metrics.update(dyn)
 
         if dyn["max_v"] > max_v_allowed:
             candidate.feasible = False
@@ -472,18 +522,22 @@ def evaluate_candidates(
             candidate.feasible = False
             candidate.failure_reason = "over_kappa"
             continue
-        if ttc_metrics["min_ttc"] < ttc_hard_min:
+
+        deadline_ok = _within_deadline(context, decision, candidate)
+        candidate.metrics["deadline_ok"] = bool(deadline_ok)
+        if not deadline_ok:
             candidate.feasible = False
-            candidate.failure_reason = "ttc_too_small"
+            candidate.failure_reason = "deadline_violation"
             continue
-        if collision["collision"]:
-            candidate.feasible = False
-            candidate.failure_reason = "collision"
-            continue
-        if collision["min_clearance"] < 0.5:
-            candidate.feasible = False
-            candidate.failure_reason = "clearance_too_small"
-            continue
+
+        front_margin, rear_margin, rear_required_brake = _rough_merge_margins(context, candidate, traj)
+        candidate.metrics.update(
+            {
+                "front_margin_after_merge": float(front_margin),
+                "rear_margin_after_merge": float(rear_margin),
+                "rear_required_brake_after_merge": float(rear_required_brake),
+            }
+        )
         if candidate.terminal.line_index != 0 and front_margin < 0.0:
             candidate.feasible = False
             candidate.failure_reason = "front_margin_negative"
@@ -496,14 +550,26 @@ def evaluate_candidates(
             candidate.feasible = False
             candidate.failure_reason = "rear_brake_excessive"
             continue
-        if not deadline_ok:
-            candidate.feasible = False
-            candidate.failure_reason = "deadline_violation"
-            continue
 
-        ttc_cost = _ttc_cost(context, ttc_metrics["min_ttc"])
-        stop_margin_cost = _stop_margin_cost(ttc_metrics["min_stop_margin"])
-        clearance_cost = _clearance_cost(collision["min_clearance"])
+        safety_metrics = _trajectory_safety_metrics(context, traj, context.obstacle_snapshots)
+        candidate.metrics.update(safety_metrics)
+        if safety_metrics["min_ttc"] < ttc_hard_min:
+            candidate.feasible = False
+            candidate.failure_reason = "ttc_too_small"
+            continue
+        if safety_metrics["collision"]:
+            candidate.feasible = False
+            candidate.failure_reason = "collision"
+            continue
+        if safety_metrics["min_clearance"] < 0.5:
+            candidate.feasible = False
+            candidate.failure_reason = "clearance_too_small"
+            continue
+        candidate.metrics["goal_cost"] = _goal_progress_cost(context, traj)
+
+        ttc_cost = _ttc_cost(context, safety_metrics["min_ttc"])
+        stop_margin_cost = _stop_margin_cost(safety_metrics["min_stop_margin"])
+        clearance_cost = _clearance_cost(safety_metrics["min_clearance"])
         mobil_cost = _mobil_cost(context, decision, candidate)
         efficiency_cost = _efficiency_cost(context, decision, candidate, traj)
         comfort_cost = _comfort_cost(context, dyn)

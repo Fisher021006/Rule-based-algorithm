@@ -9,6 +9,7 @@ PlanningFrame
 from __future__ import annotations
 
 import importlib
+import copy
 import time
 from typing import Any
 
@@ -28,7 +29,7 @@ from planning_runtime.scene.types import (
     SceneVehicleState,
 )
 from traj_planner.config import VehicleState
-from traj_planner.tools import project_point_to_path
+from traj_planner.tools import calculate_path_cumulative_distance, get_path_point_at_s, project_point_to_path
 from traj_planner.types import ExternalTarget, PlanningInput
 from xodr_parser.xodr_parser import XODRParser
 
@@ -244,6 +245,24 @@ class SceneTargetProvider:
             ),
         )
 
+    def _project_to_full_lane(
+        self,
+        lane_id: str,
+        x: float,
+        y: float,
+    ) -> tuple[float, float, float, np.ndarray | None]:
+        """把坐标投影到完整 lane centerline，供场景关系判断使用。"""
+
+        centerline = np.asarray(self.parser.lane_centerlines.get(str(lane_id), []), dtype=float)
+        if centerline.ndim != 2 or len(centerline) < 2:
+            return 0.0, 0.0, 0.0, None
+
+        line_xy = np.asarray(centerline[:, :2], dtype=float)
+        _, lane_s, lane_d = project_point_to_path(np.array([x, y], dtype=float), line_xy)
+        cumulative_s = calculate_path_cumulative_distance(line_xy)
+        _, lane_heading = get_path_point_at_s(line_xy, lane_s, cumulative_s)
+        return float(lane_s), float(lane_d), float(lane_heading), line_xy
+
     def _build_main_views_from_ego_corridor(
         self,
         planning_frame: PlanningFrame,
@@ -322,6 +341,15 @@ class SceneTargetProvider:
             if main_views is None:
                 main_views = self._build_main_views_from_global_lane(main_actor)
         main_current = self._pick_current_view(main_views)
+        main_lane_s, main_lane_d, main_lane_heading, main_lane_centerline = self._project_to_full_lane(
+            str(main_current.lane_id),
+            float(main_actor.x),
+            float(main_actor.y),
+        )
+        if main_lane_centerline is None:
+            main_lane_s = float(main_current.current_s)
+            main_lane_d = float(main_current.current_d)
+            main_lane_heading = float(main_actor.heading)
         # 主车相对自车的 s / d 关系统一投影到自车当前主参考线上。
         _, main_s_on_ego, main_d_on_ego = project_point_to_path(
             np.array([main_actor.x, main_actor.y], dtype=float),
@@ -345,10 +373,13 @@ class SceneTargetProvider:
             relative_y_to_ego=float(main_actor.y - ego_vehicle.y),
             relative_s_to_ego=float(main_s_on_ego - ego_vehicle.current_ref_line.current_s),
             relative_d_to_ego=float(main_d_on_ego),
+            lane_s=float(main_lane_s),
+            lane_d=float(main_lane_d),
+            lane_heading=float(main_lane_heading),
+            lane_centerline=main_lane_centerline,
         )
 
-    @staticmethod
-    def _build_ego_vehicle_state(planning_frame: PlanningFrame) -> SceneVehicleState:
+    def _build_ego_vehicle_state(self, planning_frame: PlanningFrame) -> SceneVehicleState:
         """根据原始运行时帧构造统一视图中的自车状态。"""
 
         ego_point = np.array([planning_frame.ego_state.x, planning_frame.ego_state.y], dtype=float)
@@ -357,6 +388,15 @@ class SceneTargetProvider:
             query_point=ego_point,
         )
         current_view = ego_views[0]
+        ego_lane_s, ego_lane_d, ego_lane_heading, ego_lane_centerline = self._project_to_full_lane(
+            str(current_view.lane_id),
+            float(planning_frame.ego_state.x),
+            float(planning_frame.ego_state.y),
+        )
+        if ego_lane_centerline is None:
+            ego_lane_s = float(current_view.current_s)
+            ego_lane_d = float(current_view.current_d)
+            ego_lane_heading = float(planning_frame.ego_state.heading)
         return SceneVehicleState(
             role="ego",
             x=float(planning_frame.ego_state.x),
@@ -371,6 +411,10 @@ class SceneTargetProvider:
             d=float(current_view.current_d),
             current_ref_line=current_view,
             candidate_ref_lines=ego_views,
+            lane_s=float(ego_lane_s),
+            lane_d=float(ego_lane_d),
+            lane_heading=float(ego_lane_heading),
+            lane_centerline=ego_lane_centerline,
         )
 
     @staticmethod
@@ -440,6 +484,7 @@ class SceneTargetProvider:
         raw_output = self.scene_algorithm(scene_context)
         self.last_scene_algorithm_timing_ms = (time.perf_counter() - scene_start) * 1000.0
         output = self._normalize_algorithm_output(raw_output, ego_vehicle)
+        scene_metadata = raw_output if isinstance(raw_output, dict) else {}
 
         # 保留逐帧目标与主车关系，供可视化和离线排查使用。
         self.history.append(
@@ -460,6 +505,9 @@ class SceneTargetProvider:
                 "main_lane_id": "" if main_vehicle is None else main_vehicle.lane_id,
                 "main_relative_s_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_s_to_ego,
                 "main_relative_d_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_d_to_ego,
+                "scene_status": str(scene_metadata.get("scene_status", "")),
+                "scene_detail": str(scene_metadata.get("scene_detail", "")),
+                "scene_debug": copy.deepcopy(scene_metadata.get("scene_debug", {})),
                 "scene_algorithm_symbol": self.scene_algorithm_symbol,
                 "scene_algorithm_time_ms": round(float(self.last_scene_algorithm_timing_ms), 3),
             }

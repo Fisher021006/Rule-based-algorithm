@@ -25,6 +25,10 @@ from traj_planner.types import BehaviorDecision, BehaviorMode, PlanningContext, 
 
 
 TARGET_V_STEP = 0.5
+TARGET_V_STEP_MID_SPEED = 0.8
+TARGET_V_STEP_HIGH_SPEED = 1.0
+TARGET_V_MID_SPEED_THRESH = 3.0
+TARGET_V_HIGH_SPEED_THRESH = 6.0
 FRONT_REQUIRED_TIME_GAP = 1.2
 FRONT_COMFORT_BRAKE = 2.5
 FRONT_MIN_REQUIRED_GAP = 6.0
@@ -90,6 +94,17 @@ def _sample_speed_values(v_lower: float, v_upper: float, step: float = TARGET_V_
         speeds.append(round(v_upper, 6))
 
     return speeds
+
+
+def _adaptive_target_v_step(context: PlanningContext) -> float:
+    """根据当前自车速度调整速度采样粒度。"""
+
+    ego_v = float(context.ego_state.v)
+    if ego_v >= TARGET_V_HIGH_SPEED_THRESH:
+        return TARGET_V_STEP_HIGH_SPEED
+    if ego_v >= TARGET_V_MID_SPEED_THRESH:
+        return TARGET_V_STEP_MID_SPEED
+    return TARGET_V_STEP
 
 
 def _predict_obstacle_s(line_context, obstacle, travel_time: float) -> float:
@@ -198,15 +213,15 @@ def build_candidate_templates(context: PlanningContext, decision: BehaviorDecisi
                 name="prepare_dlc_keep",
                 line_indices=[0],
                 hold_t_values=[0.0],
-                plan_T_values=[2.5,2.7,2.9,3.1,3.3,3.5],
+                plan_T_values=[2.0, 2.5, 3.0],
                 target_v_values=[],
                 s_bias_values=[0.0],
             ),
             SamplingTemplate(
                 name="prepare_dlc_target",
                 line_indices=[decision.target_line_index],
-                hold_t_values=[0.0,0.3,0.6],
-                plan_T_values=[3.0,3.3,3.6],
+                hold_t_values=[0.0,0.4],
+                plan_T_values=[3.0,3.6],
                 target_v_values=[],
                 s_bias_values=[0.0],
             ),
@@ -218,7 +233,7 @@ def build_candidate_templates(context: PlanningContext, decision: BehaviorDecisi
                 name="execute_dlc_target",
                 line_indices=[decision.target_line_index],
                 hold_t_values=[0.0],
-                plan_T_values=[2.5,2.8,3.1,3.4,3.7,4.0],
+                plan_T_values=[2.8, 3.4, 4.0],
                 target_v_values=[],
                 s_bias_values=[0.0],
             )
@@ -237,8 +252,8 @@ def build_candidate_templates(context: PlanningContext, decision: BehaviorDecisi
             SamplingTemplate(
                 name="prepare_target",
                 line_indices=[decision.target_line_index],
-                hold_t_values=[0.0,0.3,0.6],
-                plan_T_values=[3.0,3.3,3.6],
+                hold_t_values=[0.0,0.4],
+                plan_T_values=[3.0,3.6],
                 target_v_values=[],
                 s_bias_values=[0.0],
             ),
@@ -250,7 +265,7 @@ def build_candidate_templates(context: PlanningContext, decision: BehaviorDecisi
                 name="execute_target",
                 line_indices=[decision.target_line_index],
                 hold_t_values=[0.0],
-                plan_T_values=[2.5,2.8,3.1,3.4,3.7,4.0],
+                plan_T_values=[2.8, 3.4, 4.0],
                 target_v_values=[],
                 s_bias_values=[0.0],
             )
@@ -295,7 +310,8 @@ def sample_terminal_states(
             for hold_t in template.hold_t_values:
                 for plan_T in template.plan_T_values:
                     v_lower, v_upper = _dynamic_speed_bounds(context, plan_T, decision)
-                    speed_samples = _sample_speed_values(v_lower, v_upper, TARGET_V_STEP)
+                    speed_samples = _sample_speed_values(v_lower, v_upper, _adaptive_target_v_step(context))
+
 
                     for target_v in speed_samples:
                         target_s = base_s + ego_v * float(hold_t) + 0.5 * (ego_v + float(target_v)) * float(plan_T)

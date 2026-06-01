@@ -1,9 +1,14 @@
+from collections import OrderedDict
+
 import numpy as np
 from scipy.spatial import KDTree
 
 
 CURVATURE_WARNING_PRINT_LIMIT = 5
 _curvature_warning_count = 0
+REFERENCE_PROPERTY_CACHE_LIMIT = 64
+_reference_property_cache = OrderedDict()
+_last_successful_scale_by_line = {}
 
 
 def _log_curvature_warning() -> None:
@@ -18,6 +23,49 @@ def _log_curvature_warning() -> None:
         )
     elif _curvature_warning_count == CURVATURE_WARNING_PRINT_LIMIT + 1:
         print("⚠: 后续相同曲率告警已省略，请结合 step 日志观察仿真进度", flush=True)
+
+
+def _line_cache_key(target_line):
+    line = np.asarray(target_line)
+    data_ptr = int(line.__array_interface__["data"][0])
+    return id(target_line), data_ptr, tuple(line.shape)
+
+
+def _line_scale_key(target_line):
+    line = np.asarray(target_line, dtype=float)
+    if len(line) == 0:
+        return tuple(line.shape)
+    mid_idx = len(line) // 2
+    anchors = np.vstack([line[0, :2], line[mid_idx, :2], line[-1, :2]])
+    return tuple(line.shape), tuple(np.round(anchors.reshape(-1), 2))
+
+
+def _get_cached_reference_properties(target_line):
+    key = _line_cache_key(target_line)
+    cached = _reference_property_cache.get(key)
+    if cached is not None:
+        _reference_property_cache.move_to_end(key)
+        return key, cached
+
+    s_points, segments = compute_reference_properties(target_line)
+    kdtree = KDTree(target_line)
+    cached = (s_points, segments, kdtree)
+    _reference_property_cache[key] = cached
+    if len(_reference_property_cache) > REFERENCE_PROPERTY_CACHE_LIMIT:
+        _reference_property_cache.popitem(last=False)
+    return key, cached
+
+
+def _scale_candidates_for_line(line_key, fallback_scales):
+    last_scale = _last_successful_scale_by_line.get(line_key)
+    scales = []
+    if last_scale is not None:
+        scales.append(float(last_scale))
+    for scale in fallback_scales:
+        scale = float(scale)
+        if all(abs(scale - existing) > 1e-9 for existing in scales):
+            scales.append(scale)
+    return tuple(scales)
 
 
 def compute_path_curvature(path_xy):
@@ -175,7 +223,7 @@ def project_to_reference(pt, target_line, segments, kdtree=None):
     return best_s, best_l, best_proj, best_tangent, best_normal
 
 
-def cartesian_to_frenet_exact(points, target_line, segments):
+def cartesian_to_frenet_exact(points, target_line, segments, kdtree=None):
     """
     将多个点精确转换到Frenet坐标系
     返回：
@@ -184,7 +232,8 @@ def cartesian_to_frenet_exact(points, target_line, segments):
         tangents: 每个点处的切线向量数组
         normals:  每个点处的法线向量数组
     """
-    kdtree = KDTree(target_line)
+    if kdtree is None:
+        kdtree = KDTree(target_line)
     s_arr = np.zeros(len(points))
     l_arr = np.zeros(len(points))
     tangents = np.zeros((len(points), 2))
@@ -267,10 +316,10 @@ def frenet_to_cartesian_exact(curve_sl, segments, s_points):
 
 def bezier_curve(target_line, start_point, end_point, start_theta, end_theta=None):
     # 1. 参考线预处理
-    s_points, segments = compute_reference_properties(target_line)
+    _, (s_points, segments, kdtree) = _get_cached_reference_properties(target_line)
     # 2. 精确转换起终点到Frenet
     points = np.vstack([start_point, end_point])
-    s, l, tangents, normals = cartesian_to_frenet_exact(points, target_line, segments)
+    s, l, tangents, normals = cartesian_to_frenet_exact(points, target_line, segments, kdtree)
     start_s, end_s = s[0], s[1]
     start_l, end_l = l[0], l[1]
     start_tangent, end_tangent = tangents[0], tangents[1]
@@ -284,7 +333,7 @@ def bezier_curve(target_line, start_point, end_point, start_theta, end_theta=Non
     ctrl_pts = generate_bezier_control_points_frenet(
         start_s, start_l, start_rel_theta,
         end_s, end_l, end_rel_theta,
-        scale=0.3
+        scale1=0.3
     )
     # 5. 采样Frenet曲线
     curve_sl = evaluate_bezier_frenet(ctrl_pts, num_points=50)
@@ -295,16 +344,16 @@ def bezier_curve(target_line, start_point, end_point, start_theta, end_theta=Non
 
 
 def bezier_curve_kappa(target_line, start_point, end_point, start_theta, end_theta=None, max_curvature=0.3,
-                       scale_list=(0.35, 0.3, 0.25, 0.2, 0.15, 0.1), num_path_points=50):
+                       scale_list=(0.3, 0.22, 0.15), num_path_points=50):
     """
     尝试不同的 scale，直到生成的路径最大曲率绝对值 < max_curvature。
     返回满足条件的 scale 和对应的笛卡尔路径 (num_path_points, 3)。
     如果无法满足，返回 None, None。
     """
-    # 预计算参考线属性（假设已有 compute_reference_properties, cartesian_to_frenet_exact 等函数）
-    s_points, segments = compute_reference_properties(target_line)
+    _, (s_points, segments, kdtree) = _get_cached_reference_properties(target_line)
+    scale_key = _line_scale_key(target_line)
     points = np.vstack([start_point, end_point])
-    s, l, tangents, normals = cartesian_to_frenet_exact(points, target_line, segments)
+    s, l, tangents, normals = cartesian_to_frenet_exact(points, target_line, segments, kdtree)
     start_s, end_s = s[0], s[1]
     start_l, end_l = l[0], l[1]
     start_tangent, end_tangent = tangents[0], tangents[1]
@@ -314,7 +363,7 @@ def bezier_curve_kappa(target_line, start_point, end_point, start_theta, end_the
     start_rel_theta = absolute_to_frenet_theta(start_theta, start_tangent)
     end_rel_theta = absolute_to_frenet_theta(end_theta, end_tangent)
 
-    for scale in scale_list:
+    for scale in _scale_candidates_for_line(scale_key, scale_list):
         # 生成 Frenet 贝塞尔控制点
         ctrl_pts = generate_bezier_control_points_frenet(start_s, start_l, start_rel_theta, end_s, end_l, end_rel_theta,
                                                          scale1=scale)
@@ -327,6 +376,7 @@ def bezier_curve_kappa(target_line, start_point, end_point, start_theta, end_the
         max_kappa = np.max(np.abs(kappa))
         # print(f"scale={scale:.3f}, max curvature={max_kappa:.4f}")
         if max_kappa < max_curvature:
+            _last_successful_scale_by_line[scale_key] = float(scale)
             path_with_heading = compute_heading_from_path(path_xy, start_theta, end_theta)
             return path_with_heading
     _log_curvature_warning()

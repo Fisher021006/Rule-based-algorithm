@@ -35,8 +35,21 @@ class VehicleLimits:
 CFG: dict[str, Any] = {
     "cruise_target_v": 5.0,
     "prepare_target_v": 4.5,
+    "prepare_wait_v_min": 2.0,
+    "prepare_wait_v_max": 4.5,
+    "prepare_desired_trigger_time_s": 4.0,
+    "prepare_trigger_time_min_s": 1.5,
+    "prepare_trigger_gap_buffer_m": 1.0,
+    "prepare_min_closing_speed_mps": 0.8,
+    "prepare_max_closing_speed_mps": 4.0,
     "prepare_plan_t_s": 1.5,
     "prepare_timeout_s": 8.0,
+    "prepare_hard_timeout_s": 14.0,
+    "prepare_abort_predicted_trigger_time_s": 4.0,
+    "prepare_near_trigger_gap_margin_m": 8.0,
+    "prepare_min_gap_progress_m": 2.0,
+    "prepare_progress_min_closing_speed_mps": 0.3,
+    "prepare_pre_trigger_speed_recovery_mps": 0.0,
     "brake_plan_t_s": 1.2,
     "brake_duration_s": 2.5,
     "emergency_decel_mps2": 2.5,
@@ -64,6 +77,9 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "mode": "APPROACH",
     "cooldown_until_time_s": -1.0,
     "prepare_start_time_s": -1.0,
+    "prepare_initial_gap_m": float("inf"),
+    "prepare_best_gap_m": float("inf"),
+    "prepare_last_target_v": float("inf"),
     "active_start_time_s": -1.0,
     "active_end_time_s": -1.0,
     "active_start_v": 0.0,
@@ -169,9 +185,10 @@ def _handle_approach(
             scene_debug=metrics,
         ), memory
 
-    _enter_prepare_mode(memory, now)
+    _enter_prepare_mode(memory, now, metrics)
     return _build_prepare_output(
         context,
+        memory,
         metrics,
         reason="braking_prepare_enter",
         scene_status="prepare_wait_trigger",
@@ -185,6 +202,10 @@ def _handle_prepare(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """处理 PREPARE：等待 TTC / 间距进入紧急制动触发窗口。"""
     metrics = _compute_brake_metrics(context)
+    _update_prepare_progress(memory, metrics)
+    timeout_info = _evaluate_prepare_timeout(memory, now, metrics)
+    metrics_with_prepare_state = copy.deepcopy(metrics)
+    metrics_with_prepare_state.update(timeout_info)
     memory["last_metrics"] = copy.deepcopy(metrics)
     if not _is_brake_candidate(metrics):
         memory["mode"] = "APPROACH"
@@ -193,7 +214,7 @@ def _handle_prepare(
             context,
             reason="braking_candidate_lost",
             scene_status="approach_wait_candidate",
-            scene_debug=metrics,
+            scene_debug=metrics_with_prepare_state,
         ), memory
 
     if _brake_trigger_ready(metrics):
@@ -201,23 +222,24 @@ def _handle_prepare(
         return _build_brake_output(
             context,
             memory,
-            metrics,
+            metrics_with_prepare_state,
             reason="braking_triggered",
             scene_status="active_brake",
         ), memory
 
-    if _prepare_timeout(memory, now):
+    if bool(timeout_info["prepare_should_abort"]):
         _enter_cooldown(memory, now)
         return _build_keep_lane_output(
             context,
             reason="braking_prepare_timeout",
             scene_status="prepare_timeout",
-            scene_debug=metrics,
+            scene_debug=metrics_with_prepare_state,
         ), memory
 
     return _build_prepare_output(
         context,
-        metrics,
+        memory,
+        metrics_with_prepare_state,
         reason="braking_prepare_wait",
         scene_status="prepare_wait_trigger",
     ), memory
@@ -274,10 +296,14 @@ def _handle_unknown_mode(
 # ==================== Transition Helpers / 状态切换与记忆管理 ====================
 
 
-def _enter_prepare_mode(memory: dict[str, Any], now: float) -> None:
+def _enter_prepare_mode(memory: dict[str, Any], now: float, metrics: dict[str, Any]) -> None:
     """进入 PREPARE。"""
     memory["mode"] = "PREPARE"
     memory["prepare_start_time_s"] = float(now)
+    gap = float(metrics.get("net_gap_m", float("inf")))
+    if np.isfinite(gap):
+        memory["prepare_initial_gap_m"] = float(gap)
+        memory["prepare_best_gap_m"] = float(gap)
 
 
 def _enter_active_brake_mode(
@@ -305,6 +331,9 @@ def _enter_cooldown(memory: dict[str, Any], now: float) -> None:
 def _reset_prepare_memory(memory: dict[str, Any]) -> None:
     """清空 PREPARE 阶段缓存。"""
     memory["prepare_start_time_s"] = -1.0
+    memory["prepare_initial_gap_m"] = float("inf")
+    memory["prepare_best_gap_m"] = float("inf")
+    memory["prepare_last_target_v"] = float("inf")
 
 
 def _reset_execute_memory(memory: dict[str, Any]) -> None:
@@ -348,21 +377,99 @@ def _build_keep_lane_output(
     )
 
 
+def _select_prepare_target_v(
+    context: SceneContext,
+    memory: dict[str, Any],
+    metrics: dict[str, Any],
+    limits: VehicleLimits,
+) -> tuple[float, dict[str, Any]]:
+    """根据后车距离、速度和剩余等待时间选择 PREPARE 等待速度。"""
+    wait_min = _clamp(float(CFG["prepare_wait_v_min"]), 0.0, limits.max_v)
+    wait_max = _clamp(float(CFG["prepare_wait_v_max"]), wait_min, limits.max_v)
+    fallback_v = _clamp(float(CFG["prepare_target_v"]), wait_min, wait_max)
+
+    gap = float(metrics.get("net_gap_m", float("inf")))
+    main_v = float(metrics.get("main_v", 0.0))
+    ego_v = float(metrics.get("ego_v", context.ego_vehicle.v))
+    closing_speed = float(metrics.get("closing_speed_mps", 0.0))
+    if not np.isfinite(gap) or not np.isfinite(main_v):
+        return fallback_v, {
+            "prepare_speed_policy": "fallback_invalid_metrics",
+            "prepare_target_v": float(fallback_v),
+        }
+
+    elapsed = max(0.0, float(context.time_s) - float(memory.get("prepare_start_time_s", context.time_s)))
+    remaining = max(0.0, float(CFG["prepare_timeout_s"]) - elapsed)
+    min_trigger_time = float(CFG["prepare_trigger_time_min_s"])
+    desired_trigger_time = min(
+        float(CFG["prepare_desired_trigger_time_s"]),
+        max(min_trigger_time, remaining * 0.7),
+    )
+
+    trigger_gap = float(CFG["trigger_gap_m"]) + float(CFG["prepare_trigger_gap_buffer_m"])
+    gap_to_close = max(0.0, gap - trigger_gap)
+    raw_required_closing = gap_to_close / max(desired_trigger_time, 1e-3)
+    if gap_to_close <= 1e-3:
+        required_closing = float(CFG["prepare_min_closing_speed_mps"])
+    else:
+        required_closing = _clamp(
+            raw_required_closing,
+            float(CFG["prepare_min_closing_speed_mps"]),
+            float(CFG["prepare_max_closing_speed_mps"]),
+        )
+
+    if closing_speed >= required_closing:
+        raw_target_v = min(ego_v, wait_max)
+        policy = "hold_sufficient_closing"
+    else:
+        raw_target_v = main_v - required_closing
+        policy = "slow_down_for_required_closing"
+
+    target_v = _clamp(raw_target_v, wait_min, wait_max)
+    previous_target_v = float(memory.get("prepare_last_target_v", float("inf")))
+    pre_trigger = bool(gap > float(CFG["trigger_gap_m"]))
+    if pre_trigger and np.isfinite(previous_target_v):
+        recovery_limit = previous_target_v + max(0.0, float(CFG["prepare_pre_trigger_speed_recovery_mps"])) * float(context.dt)
+        target_v = min(target_v, recovery_limit)
+        policy = f"{policy}_hold_pre_trigger_speed"
+    memory["prepare_last_target_v"] = float(target_v)
+    return target_v, {
+        "prepare_speed_policy": policy,
+        "prepare_target_v": float(target_v),
+        "prepare_previous_target_v": float(previous_target_v),
+        "prepare_pre_trigger_speed_recovery_mps": float(CFG["prepare_pre_trigger_speed_recovery_mps"]),
+        "prepare_wait_v_min": float(wait_min),
+        "prepare_wait_v_max": float(wait_max),
+        "prepare_elapsed_s": float(elapsed),
+        "prepare_remaining_s": float(remaining),
+        "prepare_desired_trigger_time_s": float(desired_trigger_time),
+        "prepare_trigger_gap_with_buffer_m": float(trigger_gap),
+        "prepare_gap_to_close_m": float(gap_to_close),
+        "prepare_raw_required_closing_mps": float(raw_required_closing),
+        "prepare_required_closing_mps": float(required_closing),
+        "prepare_raw_target_v": float(raw_target_v),
+    }
+
+
 def _build_prepare_output(
     context: SceneContext,
+    memory: dict[str, Any],
     metrics: dict[str, Any],
     reason: str,
     scene_status: str,
 ) -> dict[str, Any]:
     """构造 PREPARE 阶段当前车道目标。"""
     limits = _read_vehicle_limits(context)
-    target_v = _clamp(float(CFG["prepare_target_v"]), 0.0, limits.max_v)
+    target_v, prepare_debug = _select_prepare_target_v(context, memory, metrics, limits)
     plan_t = float(CFG["prepare_plan_t_s"])
     a_req = _clamp(
         (target_v - float(context.ego_vehicle.v)) / max(plan_t, 1e-3),
         limits.min_acc,
         limits.max_acc,
     )
+    debug = copy.deepcopy(metrics)
+    debug.update(prepare_debug)
+    debug["prepare_target_acc_mps2"] = float(a_req)
     return _build_line_target_output(
         context=context,
         target_v=target_v,
@@ -370,7 +477,7 @@ def _build_prepare_output(
         plan_t=plan_t,
         reason=reason,
         scene_status=scene_status,
-        scene_debug=metrics,
+        scene_debug=debug,
     )
 
 
@@ -465,20 +572,14 @@ def _build_line_target_output(
 
 def _has_valid_main_vehicle(context: SceneContext) -> bool:
     """判断主车是否满足 emergency braking 的基本识别条件。"""
-    if context.main_vehicle is None:
-        return False
-    ego = context.ego_vehicle
-    main = context.main_vehicle
-    same_direction = _heading_diff_deg(main.heading, ego.heading) <= float(CFG["max_heading_diff_deg"])
-    rel_s_ok = float(CFG["search_rel_s_min"]) <= float(main.relative_s_to_ego) <= float(CFG["search_rel_s_max"])
-    return bool(same_direction and rel_s_ok)
+    return context.main_vehicle is not None
 
 
 def _is_brake_candidate(metrics: dict[str, Any]) -> bool:
     """判断当前主车是否是制动场景候选对象。"""
     if not bool(metrics.get("main_is_behind", False)):
         return False
-    if abs(float(metrics.get("main_d_on_ego", float("inf")))) > float(CFG["max_main_d_on_ego_m"]):
+    if float(metrics.get("relation_lateral_error_m", float("inf"))) > float(CFG["max_main_d_on_ego_m"]):
         return False
     gap = float(metrics.get("net_gap_m", float("inf")))
     return bool(float(CFG["behind_gap_min_m"]) <= gap <= float(CFG["behind_gap_max_m"]))
@@ -499,10 +600,79 @@ def _brake_trigger_ready(metrics: dict[str, Any]) -> bool:
     )
 
 
-def _prepare_timeout(memory: dict[str, Any], now: float) -> bool:
-    """判断 PREPARE 是否等待触发过久。"""
+def _update_prepare_progress(memory: dict[str, Any], metrics: dict[str, Any]) -> None:
+    """更新 PREPARE 阶段的缺口收敛进展。"""
+    gap = float(metrics.get("net_gap_m", float("inf")))
+    if not np.isfinite(gap):
+        return
+    if not np.isfinite(float(memory.get("prepare_initial_gap_m", float("inf")))):
+        memory["prepare_initial_gap_m"] = float(gap)
+    best_gap = float(memory.get("prepare_best_gap_m", float("inf")))
+    memory["prepare_best_gap_m"] = float(min(best_gap, gap))
+
+
+def _evaluate_prepare_timeout(
+    memory: dict[str, Any],
+    now: float,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """评估 PREPARE 是否应该超时退出，软超时后允许有进展的场景继续等待。"""
     start = float(memory.get("prepare_start_time_s", now))
-    return bool(max(0.0, float(now) - start) >= float(CFG["prepare_timeout_s"]))
+    elapsed = max(0.0, float(now) - start)
+    soft_timeout = float(CFG["prepare_timeout_s"])
+    hard_timeout = max(soft_timeout, float(CFG["prepare_hard_timeout_s"]))
+    gap = float(metrics.get("net_gap_m", float("inf")))
+    closing_speed = float(metrics.get("closing_speed_mps", 0.0))
+    trigger_gap = float(CFG["trigger_gap_m"])
+    gap_to_trigger = max(0.0, gap - trigger_gap) if np.isfinite(gap) else float("inf")
+    predicted_trigger_time = (
+        gap_to_trigger / closing_speed
+        if np.isfinite(gap_to_trigger) and closing_speed > 1e-3
+        else float("inf")
+    )
+    initial_gap = float(memory.get("prepare_initial_gap_m", float("inf")))
+    best_gap = float(memory.get("prepare_best_gap_m", float("inf")))
+    gap_progress = initial_gap - gap if np.isfinite(initial_gap) and np.isfinite(gap) else 0.0
+    best_gap_progress = initial_gap - best_gap if np.isfinite(initial_gap) and np.isfinite(best_gap) else 0.0
+    near_trigger = bool(np.isfinite(gap) and gap <= trigger_gap + float(CFG["prepare_near_trigger_gap_margin_m"]))
+    predicted_ok = bool(predicted_trigger_time <= float(CFG["prepare_abort_predicted_trigger_time_s"]))
+    making_progress = bool(
+        best_gap_progress >= float(CFG["prepare_min_gap_progress_m"])
+        and closing_speed >= float(CFG["prepare_progress_min_closing_speed_mps"])
+    )
+
+    should_abort = False
+    decision = "within_soft_timeout"
+    if elapsed >= hard_timeout:
+        should_abort = True
+        decision = "hard_timeout"
+    elif elapsed >= soft_timeout:
+        if near_trigger:
+            decision = "extend_near_trigger"
+        elif predicted_ok:
+            decision = "extend_predicted_trigger"
+        elif making_progress:
+            decision = "extend_gap_progress"
+        else:
+            should_abort = True
+            decision = "soft_timeout_no_progress"
+
+    return {
+        "prepare_elapsed_s": float(elapsed),
+        "prepare_soft_timeout_s": float(soft_timeout),
+        "prepare_hard_timeout_s": float(hard_timeout),
+        "prepare_gap_to_trigger_m": float(gap_to_trigger),
+        "prepare_predicted_trigger_time_s": float(predicted_trigger_time),
+        "prepare_initial_gap_m": float(initial_gap),
+        "prepare_best_gap_m": float(best_gap),
+        "prepare_gap_progress_m": float(gap_progress),
+        "prepare_best_gap_progress_m": float(best_gap_progress),
+        "prepare_near_trigger": bool(near_trigger),
+        "prepare_predicted_trigger_ok": bool(predicted_ok),
+        "prepare_making_progress": bool(making_progress),
+        "prepare_timeout_decision": str(decision),
+        "prepare_should_abort": bool(should_abort),
+    }
 
 
 def _brake_execution_completed(
@@ -523,6 +693,106 @@ def _brake_execution_completed(
 # ==================== Metrics / 纵向安全指标 ====================
 
 
+def _project_pair_on_braking_relation_line(context: SceneContext) -> dict[str, Any]:
+    """把 ego/main 投影到 braking 关系线，供 braking 计算相对关系。"""
+    ego = context.ego_vehicle
+    main = context.main_vehicle
+    if main is None:
+        return {
+            "source": "none",
+            "ego_s": 0.0,
+            "ego_d": 0.0,
+            "main_s": 0.0,
+            "main_d": float("inf"),
+            "rel_s": 0.0,
+            "rel_d": float("inf"),
+        }
+
+    candidate_lines = [
+        ("main_forward_corridor", getattr(main.current_ref_line, "line", None)),
+        ("ego_forward_corridor", getattr(ego.current_ref_line, "line", None)),
+        ("ego_full_lane", getattr(ego, "lane_centerline", None)),
+        ("main_full_lane", getattr(main, "lane_centerline", None)),
+    ]
+    projected: list[dict[str, Any]] = []
+    for source, raw_line in candidate_lines:
+        projection = _project_pair_on_line(context, raw_line, source)
+        if projection is not None:
+            projected.append(projection)
+
+    if not projected:
+        return _project_pair_by_ego_heading(context)
+
+    return min(
+        projected,
+        key=lambda item: (
+            max(abs(float(item["ego_d"])), abs(float(item["main_d"]))),
+            abs(float(item["rel_d"])),
+        ),
+    )
+
+
+def _project_pair_on_line(
+    context: SceneContext,
+    raw_line: Any,
+    source: str,
+) -> dict[str, Any] | None:
+    """把 ego/main 投影到一条候选关系线。"""
+    if raw_line is None:
+        return None
+    line = np.asarray(raw_line, dtype=float)
+    if line.ndim != 2 or len(line) < 2:
+        return None
+
+    ego = context.ego_vehicle
+    main = context.main_vehicle
+    if main is None:
+        return None
+
+    _, ego_s, ego_d = project_point_to_path(np.array([ego.x, ego.y], dtype=float), line)
+    _, main_s, main_d = project_point_to_path(np.array([main.x, main.y], dtype=float), line)
+    return {
+        "source": str(source),
+        "ego_s": float(ego_s),
+        "ego_d": float(ego_d),
+        "main_s": float(main_s),
+        "main_d": float(main_d),
+        "rel_s": float(main_s - ego_s),
+        "rel_d": float(main_d - ego_d),
+    }
+
+
+def _project_pair_by_ego_heading(context: SceneContext) -> dict[str, Any]:
+    """完整车道线不可用时，用 ego 航向局部坐标兜底。"""
+    ego = context.ego_vehicle
+    main = context.main_vehicle
+    if main is None:
+        return {
+            "source": "none",
+            "ego_s": 0.0,
+            "ego_d": 0.0,
+            "main_s": 0.0,
+            "main_d": float("inf"),
+            "rel_s": 0.0,
+            "rel_d": float("inf"),
+        }
+
+    rel_xy = np.array([float(main.x) - float(ego.x), float(main.y) - float(ego.y)], dtype=float)
+    ego_forward = np.array([np.cos(float(ego.heading)), np.sin(float(ego.heading))], dtype=float)
+    ego_left = np.array([-ego_forward[1], ego_forward[0]], dtype=float)
+    rel_s = float(np.dot(rel_xy, ego_forward))
+    rel_d = float(np.dot(rel_xy, ego_left))
+    return {
+        "source": "ego_heading_fallback",
+        "ego_s": 0.0,
+        "ego_d": 0.0,
+        "main_s": float(rel_s),
+        "main_d": float(rel_d),
+        "rel_s": float(rel_s),
+        "rel_d": float(rel_d),
+    }
+
+
 def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
     """计算 emergency braking 使用的当前车道纵向指标。"""
     ego = context.ego_vehicle
@@ -539,13 +809,13 @@ def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
             "stop_margin_m": float("inf"),
         }
 
-    rel_xy = np.array([float(main.x) - float(ego.x), float(main.y) - float(ego.y)], dtype=float)
-    ego_forward = np.array([np.cos(float(ego.heading)), np.sin(float(ego.heading))], dtype=float)
-    ego_left = np.array([-ego_forward[1], ego_forward[0]], dtype=float)
-    main_rel_longitudinal = float(np.dot(rel_xy, ego_forward))
-    main_d_on_ego = float(np.dot(rel_xy, ego_left))
-    main_is_behind = main_rel_longitudinal < 0.0
-    center_gap = -main_rel_longitudinal
+    projection = _project_pair_on_braking_relation_line(context)
+    rel_s = float(projection["rel_s"])
+    main_d_on_ego = float(projection["main_d"])
+    ego_d_on_relation_line = float(projection["ego_d"])
+    relation_lateral_error = max(abs(ego_d_on_relation_line), abs(main_d_on_ego))
+    main_is_behind = rel_s < 0.0
+    center_gap = -rel_s
     net_gap = center_gap - 0.5 * (limits.ego_length + limits.main_length)
     closing_speed = float(main.v) - float(ego.v)
     ttc = net_gap / closing_speed if net_gap > 0.0 and closing_speed > 1e-3 else float("inf")
@@ -556,13 +826,19 @@ def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
     return {
         "main_valid": True,
         "main_is_behind": bool(main_is_behind),
-        "main_rel_longitudinal_m": float(main_rel_longitudinal),
+        "projection_source": str(projection["source"]),
+        "ego_s_on_relation_line": float(projection["ego_s"]),
+        "ego_d_on_relation_line": float(projection["ego_d"]),
+        "main_s_on_relation_line": float(projection["main_s"]),
+        "main_rel_longitudinal_m": float(rel_s),
         "main_d_on_ego": float(main_d_on_ego),
+        "relation_lateral_error_m": float(relation_lateral_error),
         "net_gap_m": float(net_gap),
         "closing_speed_mps": float(closing_speed),
         "ttc_s": float(ttc),
         "required_decel_mps2": float(required_decel),
         "stop_margin_m": float(stop_margin),
+        "heading_diff_deg": _heading_diff_deg(float(main.heading), float(ego.heading)),
         "ego_v": float(ego.v),
         "main_v": float(main.v),
     }

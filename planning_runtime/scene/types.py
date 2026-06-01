@@ -45,6 +45,10 @@ class SceneVehicleState:
     relative_y_to_ego: float = 0.0
     relative_s_to_ego: float = 0.0
     relative_d_to_ego: float = 0.0
+    lane_s: float = 0.0
+    lane_d: float = 0.0
+    lane_heading: float = 0.0
+    lane_centerline: np.ndarray | None = None
 
 
 @dataclass
