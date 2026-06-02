@@ -78,13 +78,15 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     else:
         main_start_xy = np.asarray(args.main_start_xy, dtype=float)
         main_goal_xy = np.asarray(args.main_goal_xy, dtype=float)
+        main_motion = str(args.main_motion)
+        main_desired_speed = float(args.main_start_speed) if main_motion == "constant" else float(args.main_desired_speed)
         main_vehicle = IDMRouteVehicle(
             xodr_parser=xodr_parser,
             start_xy=main_start_xy,
             goal_xy=main_goal_xy,
             start_speed=float(args.main_start_speed),
-            desired_speed=float(args.main_desired_speed),
-            motion_mode="idm",
+            desired_speed=main_desired_speed,
+            motion_mode=main_motion,
         )
         main_lane_extender = DrivableLanesExtender(xodr_parser)
         if not main_lane_extender.plan_shortest_path(

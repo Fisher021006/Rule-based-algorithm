@@ -19,7 +19,7 @@ def instantiate_ego_vehicle(xodr_parser: XODRParser) -> GVT:
     """创建离线仿真自车，并补齐可视化所需字段。"""
 
     outline = {"height": 4640.0, "width": 1780.0, "wheelbase": 2700.0}
-    sport_params = {"maxSpeed": 25.0, "maxAcc": 3.0, "minAcc": 2.0}
+    sport_params = {"maxSpeed": 25.0, "maxAcc": 3.0, "minAcc": 3.0}
     ego = GVT("ego", outline, sport_params, xodr_parser)
     ego.length = ego.config["size"]["L"]
     ego.width = ego.config["size"]["W"]
@@ -86,7 +86,7 @@ class IDMRouteVehicle:
             self.v = 0.0
         else:
             if goal_xy is None:
-                raise ValueError("IDM 模式下主车必须提供终点")
+                raise ValueError(f"{self.motion_mode} 模式下主车必须提供终点")
             lane_id_list, actions = planner.plan_route(start_xy[0], start_xy[1], goal_xy[0], goal_xy[1])
             if not lane_id_list:
                 raise ValueError("主车全局路线规划失败")
@@ -151,10 +151,15 @@ class IDMRouteVehicle:
             self.timestamp_ms = int(round(time_s * 1000.0))
             return
 
-        leader = self._find_leader(obstacles)
-        self.a = self._compute_idm_acc(leader)
-        travel_s = max(0.0, self.v * dt + 0.5 * self.a * dt * dt)
-        next_v = max(0.0, min(self.v + self.a * dt, self.desired_speed))
+        if self.motion_mode == "constant":
+            self.a = 0.0
+            travel_s = max(0.0, self.v * dt)
+            next_v = float(self.v)
+        else:
+            leader = self._find_leader(obstacles)
+            self.a = self._compute_idm_acc(leader)
+            travel_s = max(0.0, self.v * dt + 0.5 * self.a * dt * dt)
+            next_v = max(0.0, min(self.v + self.a * dt, self.desired_speed))
         self.progress_s = min(self.progress_s + travel_s, float(self.path_cumulative_s[-1]))
 
         pos, heading = get_path_point_at_s(self.path, self.progress_s, self.path_cumulative_s)

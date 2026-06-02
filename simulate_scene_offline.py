@@ -33,7 +33,7 @@ def configure_matplotlib_environment(interactive: bool) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     """构造命令行参数解析器。"""
 
-    parser = argparse.ArgumentParser(description="场景算法离线仿真壳，主车按 IDM 运动")
+    parser = argparse.ArgumentParser(description="场景算法离线仿真壳，支持场景目标和局部采样规划")
     parser.add_argument(
         "--planner-mode",
         choices=["scene_target", "local_sampling"],
@@ -48,18 +48,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--map-cache", default=str(DEFAULT_MAP_CACHE), help="地图缓存 .pkl 路径")
     parser.add_argument("--ego-start-xy", nargs=2, type=float, default=DEFAULT_EGO_START, metavar=("X", "Y"))
     parser.add_argument("--ego-goal-xy", nargs=2, type=float, default=DEFAULT_EGO_GOAL, metavar=("X", "Y"))
-    parser.add_argument("--main-start-xy", nargs=2, type=float, default=DEFAULT_MAIN_START, metavar=("X", "Y"), help="主车 IDM 模式起点")
-    parser.add_argument("--main-goal-xy", nargs=2, type=float, default=DEFAULT_MAIN_GOAL, metavar=("X", "Y"), help="主车 IDM 模式终点")
+    parser.add_argument("--main-start-xy", nargs=2, type=float, default=DEFAULT_MAIN_START, metavar=("X", "Y"), help="主车路线模式起点")
+    parser.add_argument("--main-goal-xy", nargs=2, type=float, default=DEFAULT_MAIN_GOAL, metavar=("X", "Y"), help="主车路线模式终点")
     parser.add_argument("--main-static-xy", nargs=2, type=float, default=DEFAULT_MAIN_START, metavar=("X", "Y"), help="主车 static 模式位置")
     parser.add_argument("--ego-start-speed", type=float, default=0.0, help="自车初始速度 m/s")
     parser.add_argument("--main-start-speed", type=float, default=2.0, help="主车初始速度 m/s")
-    parser.add_argument("--main-desired-speed", type=float, default=4.0, help="主车 IDM 期望速度 m/s")
+    parser.add_argument("--main-desired-speed", type=float, default=4.0, help="主车 IDM 期望速度 m/s；constant 模式忽略该参数")
     parser.add_argument("--disable-main-obstacle", action="store_true", help="不向局部规划器注入主车障碍物，用于无障碍基线测试")
     parser.add_argument(
         "--main-motion",
-        choices=["idm", "static"],
+        choices=["idm", "constant", "static"],
         default="idm",
-        help="主车运动模式：idm 表示按 IDM 运动，static 表示静止充当障碍物",
+        help="主车运动模式：idm 表示按 IDM 运动，constant 表示按 main-start-speed 匀速沿路线行驶，static 表示静止充当障碍物",
     )
     parser.add_argument("--dt", type=float, default=0.1, help="离散仿真步长 s")
     parser.add_argument("--advance-index", type=int, default=1, help="每轮自车执行局部轨迹中的第几个点")

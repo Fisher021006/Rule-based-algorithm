@@ -2,7 +2,7 @@
 
 设计目标：
 - APPROACH 识别后方同向主车
-- PREPARE 维持当前车道，等待 TTC / 间距进入触发窗口
+- PREPARE 维持当前车道，等待后车满足精准 THW 触发窗口
 - ACTIVE_BRAKE 按平台减速度约束输出当前车道制动目标
 - STABILIZE 制动后短时低速稳定
 - COOLDOWN 场景失败或结束后冷却，避免连续重复触发
@@ -35,21 +35,16 @@ class VehicleLimits:
 CFG: dict[str, Any] = {
     "cruise_target_v": 5.0,
     "prepare_target_v": 4.5,
-    "prepare_wait_v_min": 2.0,
     "prepare_wait_v_max": 4.5,
-    "prepare_desired_trigger_time_s": 4.0,
-    "prepare_trigger_time_min_s": 1.5,
-    "prepare_trigger_gap_buffer_m": 1.0,
-    "prepare_min_closing_speed_mps": 0.8,
-    "prepare_max_closing_speed_mps": 4.0,
+    "target_thw_s": 2.0,
+    "thw_tol_s": 0.1,
     "prepare_plan_t_s": 1.5,
     "prepare_timeout_s": 8.0,
     "prepare_hard_timeout_s": 14.0,
-    "prepare_abort_predicted_trigger_time_s": 4.0,
-    "prepare_near_trigger_gap_margin_m": 8.0,
+    "prepare_abort_predicted_thw_time_s": 4.0,
+    "prepare_near_thw_margin_s": 0.3,
     "prepare_min_gap_progress_m": 2.0,
     "prepare_progress_min_closing_speed_mps": 0.3,
-    "prepare_pre_trigger_speed_recovery_mps": 0.0,
     "brake_plan_t_s": 1.2,
     "brake_duration_s": 2.5,
     "emergency_decel_mps2": 2.5,
@@ -57,18 +52,11 @@ CFG: dict[str, Any] = {
     "stabilize_target_v": 0.8,
     "stabilize_duration_s": 1.5,
     "abort_cooldown_s": 2.0,
-    "max_heading_diff_deg": 20.0,
-    "search_rel_s_min": -60.0,
-    "search_rel_s_max": 8.0,
     "max_main_d_on_ego_m": 1.5,
-    "behind_gap_min_m": 4.0,
     "behind_gap_max_m": 45.0,
-    "trigger_ttc_s": 3.0,
-    "trigger_gap_m": 12.0,
-    "trigger_closing_speed_mps": 0.5,
-    "release_gap_m": 35.0,
     "main_comfort_decel_mps2": 3.0,
-    "min_target_progress_m": 2.0,
+    "min_target_progress_floor_m": 0.3,
+    "target_progress_ratio": 0.5,
     "execute_complete_frames": 2,
 }
 
@@ -79,7 +67,6 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "prepare_start_time_s": -1.0,
     "prepare_initial_gap_m": float("inf"),
     "prepare_best_gap_m": float("inf"),
-    "prepare_last_target_v": float("inf"),
     "active_start_time_s": -1.0,
     "active_end_time_s": -1.0,
     "active_start_v": 0.0,
@@ -186,12 +173,28 @@ def _handle_approach(
         ), memory
 
     _enter_prepare_mode(memory, now, metrics)
+    prepare_result = _select_prepare_thw_wait_target(context, memory, metrics, _read_vehicle_limits(context))
+    activation_info = _evaluate_thw_activation(metrics)
+    debug = copy.deepcopy(metrics)
+    debug.update(copy.deepcopy(prepare_result.get("debug", {})))
+    debug.update(activation_info)
+    if bool(activation_info["thw_activation_ready"]):
+        _enter_active_brake_mode(memory, context, now)
+        activation_reason = str(activation_info["thw_activation_reason"])
+        return _build_brake_output(
+            context,
+            memory,
+            debug,
+            reason="braking_triggered" if activation_reason == "exact_thw_ready" else "braking_triggered_late",
+            scene_status="active_brake" if activation_reason == "exact_thw_ready" else "active_brake_late_thw",
+        ), memory
     return _build_prepare_output(
         context,
         memory,
-        metrics,
+        debug,
         reason="braking_prepare_enter",
         scene_status="prepare_wait_trigger",
+        prepare_result=prepare_result,
     ), memory
 
 
@@ -200,12 +203,16 @@ def _handle_prepare(
     memory: dict[str, Any],
     now: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """处理 PREPARE：等待 TTC / 间距进入紧急制动触发窗口。"""
+    """处理 PREPARE：稳定等待后车 THW 达标，并在 THW 达标时触发制动。"""
     metrics = _compute_brake_metrics(context)
     _update_prepare_progress(memory, metrics)
     timeout_info = _evaluate_prepare_timeout(memory, now, metrics)
+    prepare_result = _select_prepare_thw_wait_target(context, memory, metrics, _read_vehicle_limits(context))
+    activation_info = _evaluate_thw_activation(metrics)
     metrics_with_prepare_state = copy.deepcopy(metrics)
     metrics_with_prepare_state.update(timeout_info)
+    metrics_with_prepare_state.update(copy.deepcopy(prepare_result.get("debug", {})))
+    metrics_with_prepare_state.update(activation_info)
     memory["last_metrics"] = copy.deepcopy(metrics)
     if not _is_brake_candidate(metrics):
         memory["mode"] = "APPROACH"
@@ -217,14 +224,15 @@ def _handle_prepare(
             scene_debug=metrics_with_prepare_state,
         ), memory
 
-    if _brake_trigger_ready(metrics):
+    if bool(activation_info["thw_activation_ready"]):
         _enter_active_brake_mode(memory, context, now)
+        activation_reason = str(activation_info["thw_activation_reason"])
         return _build_brake_output(
             context,
             memory,
             metrics_with_prepare_state,
-            reason="braking_triggered",
-            scene_status="active_brake",
+            reason="braking_triggered" if activation_reason == "exact_thw_ready" else "braking_triggered_late",
+            scene_status="active_brake" if activation_reason == "exact_thw_ready" else "active_brake_late_thw",
         ), memory
 
     if bool(timeout_info["prepare_should_abort"]):
@@ -242,6 +250,7 @@ def _handle_prepare(
         metrics_with_prepare_state,
         reason="braking_prepare_wait",
         scene_status="prepare_wait_trigger",
+        prepare_result=prepare_result,
     ), memory
 
 
@@ -333,7 +342,6 @@ def _reset_prepare_memory(memory: dict[str, Any]) -> None:
     memory["prepare_start_time_s"] = -1.0
     memory["prepare_initial_gap_m"] = float("inf")
     memory["prepare_best_gap_m"] = float("inf")
-    memory["prepare_last_target_v"] = float("inf")
 
 
 def _reset_execute_memory(memory: dict[str, Any]) -> None:
@@ -377,77 +385,64 @@ def _build_keep_lane_output(
     )
 
 
-def _select_prepare_target_v(
+def _select_prepare_thw_wait_target(
     context: SceneContext,
     memory: dict[str, Any],
     metrics: dict[str, Any],
     limits: VehicleLimits,
-) -> tuple[float, dict[str, Any]]:
-    """根据后车距离、速度和剩余等待时间选择 PREPARE 等待速度。"""
-    wait_min = _clamp(float(CFG["prepare_wait_v_min"]), 0.0, limits.max_v)
-    wait_max = _clamp(float(CFG["prepare_wait_v_max"]), wait_min, limits.max_v)
-    fallback_v = _clamp(float(CFG["prepare_target_v"]), wait_min, wait_max)
-
-    gap = float(metrics.get("net_gap_m", float("inf")))
+) -> dict[str, Any]:
+    """按固定等待速度维持当前车道，等待后车 THW 进入触发窗口。"""
+    min_trigger_v, min_trigger_debug = _compute_prepare_min_trigger_v(limits)
+    wait_max = _clamp(float(CFG["prepare_wait_v_max"]), min_trigger_v, limits.max_v)
+    target_v = _clamp(float(CFG["prepare_target_v"]), min_trigger_v, wait_max)
+    target_thw = max(float(CFG["target_thw_s"]), 1e-3)
     main_v = float(metrics.get("main_v", 0.0))
     ego_v = float(metrics.get("ego_v", context.ego_vehicle.v))
     closing_speed = float(metrics.get("closing_speed_mps", 0.0))
-    if not np.isfinite(gap) or not np.isfinite(main_v):
-        return fallback_v, {
-            "prepare_speed_policy": "fallback_invalid_metrics",
-            "prepare_target_v": float(fallback_v),
-        }
+    current_thw = float(metrics.get("thw_s", float("inf")))
+    target_gap = target_thw * main_v - limits.ego_length if main_v > 1e-6 else float("inf")
 
     elapsed = max(0.0, float(context.time_s) - float(memory.get("prepare_start_time_s", context.time_s)))
-    remaining = max(0.0, float(CFG["prepare_timeout_s"]) - elapsed)
-    min_trigger_time = float(CFG["prepare_trigger_time_min_s"])
-    desired_trigger_time = min(
-        float(CFG["prepare_desired_trigger_time_s"]),
-        max(min_trigger_time, remaining * 0.7),
-    )
-
-    trigger_gap = float(CFG["trigger_gap_m"]) + float(CFG["prepare_trigger_gap_buffer_m"])
-    gap_to_close = max(0.0, gap - trigger_gap)
-    raw_required_closing = gap_to_close / max(desired_trigger_time, 1e-3)
-    if gap_to_close <= 1e-3:
-        required_closing = float(CFG["prepare_min_closing_speed_mps"])
-    else:
-        required_closing = _clamp(
-            raw_required_closing,
-            float(CFG["prepare_min_closing_speed_mps"]),
-            float(CFG["prepare_max_closing_speed_mps"]),
-        )
-
-    if closing_speed >= required_closing:
-        raw_target_v = min(ego_v, wait_max)
-        policy = "hold_sufficient_closing"
-    else:
-        raw_target_v = main_v - required_closing
-        policy = "slow_down_for_required_closing"
-
-    target_v = _clamp(raw_target_v, wait_min, wait_max)
-    previous_target_v = float(memory.get("prepare_last_target_v", float("inf")))
-    pre_trigger = bool(gap > float(CFG["trigger_gap_m"]))
-    if pre_trigger and np.isfinite(previous_target_v):
-        recovery_limit = previous_target_v + max(0.0, float(CFG["prepare_pre_trigger_speed_recovery_mps"])) * float(context.dt)
-        target_v = min(target_v, recovery_limit)
-        policy = f"{policy}_hold_pre_trigger_speed"
-    memory["prepare_last_target_v"] = float(target_v)
-    return target_v, {
-        "prepare_speed_policy": policy,
+    thw_error = current_thw - target_thw
+    debug = {
+        "prepare_speed_policy": "hold_thw_wait_speed",
+        "prepare_solve_status": "wait_for_target_thw",
         "prepare_target_v": float(target_v),
-        "prepare_previous_target_v": float(previous_target_v),
-        "prepare_pre_trigger_speed_recovery_mps": float(CFG["prepare_pre_trigger_speed_recovery_mps"]),
-        "prepare_wait_v_min": float(wait_min),
+        "prepare_raw_target_v": float(CFG["prepare_target_v"]),
+        "prepare_wait_v_min": float(min_trigger_v),
+        "prepare_min_trigger_v": float(min_trigger_v),
         "prepare_wait_v_max": float(wait_max),
         "prepare_elapsed_s": float(elapsed),
-        "prepare_remaining_s": float(remaining),
-        "prepare_desired_trigger_time_s": float(desired_trigger_time),
-        "prepare_trigger_gap_with_buffer_m": float(trigger_gap),
-        "prepare_gap_to_close_m": float(gap_to_close),
-        "prepare_raw_required_closing_mps": float(raw_required_closing),
-        "prepare_required_closing_mps": float(required_closing),
-        "prepare_raw_target_v": float(raw_target_v),
+        "target_thw_s": float(target_thw),
+        "thw_tol_s": float(CFG["thw_tol_s"]),
+        "current_thw_s": float(current_thw),
+        "current_thw_error_s": float(thw_error),
+        "target_thw_gap_m": float(target_gap),
+        "prepare_current_closing_speed_mps": float(closing_speed),
+        "prepare_current_ego_v": float(ego_v),
+        "prepare_current_main_v": float(main_v),
+    }
+    debug.update(min_trigger_debug)
+    return {
+        "target_v": float(target_v),
+        "target_thw_s": float(target_thw),
+        "solve_status": "wait_for_target_thw",
+        "debug": debug,
+    }
+
+
+def _compute_prepare_min_trigger_v(limits: VehicleLimits) -> tuple[float, dict[str, Any]]:
+    """根据制动能力自动推导 PREPARE 阶段允许的最低触发速度。"""
+    desired_acc = -abs(float(CFG["emergency_decel_mps2"]))
+    active_target_a = _clamp(desired_acc, limits.min_acc, limits.max_acc)
+    effective_decel = abs(min(active_target_a, 0.0))
+    raw_min_trigger_v = float(CFG["brake_target_v"]) + effective_decel * float(CFG["brake_plan_t_s"])
+    min_trigger_v = _clamp(raw_min_trigger_v, 0.0, limits.max_v)
+    return min_trigger_v, {
+        "prepare_min_trigger_v": float(min_trigger_v),
+        "prepare_raw_min_trigger_v": float(raw_min_trigger_v),
+        "prepare_effective_brake_decel_mps2": float(effective_decel),
+        "prepare_active_target_acc_mps2": float(active_target_a),
     }
 
 
@@ -457,10 +452,13 @@ def _build_prepare_output(
     metrics: dict[str, Any],
     reason: str,
     scene_status: str,
+    prepare_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 PREPARE 阶段当前车道目标。"""
     limits = _read_vehicle_limits(context)
-    target_v, prepare_debug = _select_prepare_target_v(context, memory, metrics, limits)
+    if prepare_result is None:
+        prepare_result = _select_prepare_thw_wait_target(context, memory, metrics, limits)
+    target_v = float(prepare_result["target_v"])
     plan_t = float(CFG["prepare_plan_t_s"])
     a_req = _clamp(
         (target_v - float(context.ego_vehicle.v)) / max(plan_t, 1e-3),
@@ -468,7 +466,7 @@ def _build_prepare_output(
         limits.max_acc,
     )
     debug = copy.deepcopy(metrics)
-    debug.update(prepare_debug)
+    debug.update(copy.deepcopy(prepare_result.get("debug", {})))
     debug["prepare_target_acc_mps2"] = float(a_req)
     return _build_line_target_output(
         context=context,
@@ -546,10 +544,14 @@ def _build_line_target_output(
 ) -> dict[str, Any]:
     """在当前参考线上按目标速度和规划时长构造终端点。"""
     line = context.ego_vehicle.current_ref_line
-    travel_s = max(float(CFG["min_target_progress_m"]), float(target_v) * float(plan_t) + 1.0)
+    min_progress = max(
+        float(CFG["min_target_progress_floor_m"]),
+        float(target_v) * float(plan_t) * float(CFG["target_progress_ratio"]),
+    )
+    travel_s = max(min_progress, float(target_v) * float(plan_t))
     target_s = _clamp(
         float(line.current_s) + float(travel_s),
-        float(line.current_s) + float(CFG["min_target_progress_m"]),
+        float(line.current_s) + float(min_progress),
         float(line.cumulative_s[-1]) - 0.5,
     )
     target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
@@ -582,22 +584,43 @@ def _is_brake_candidate(metrics: dict[str, Any]) -> bool:
     if float(metrics.get("relation_lateral_error_m", float("inf"))) > float(CFG["max_main_d_on_ego_m"]):
         return False
     gap = float(metrics.get("net_gap_m", float("inf")))
-    return bool(float(CFG["behind_gap_min_m"]) <= gap <= float(CFG["behind_gap_max_m"]))
+    return bool(0.0 < gap <= float(CFG["behind_gap_max_m"]))
 
 
-def _brake_trigger_ready(metrics: dict[str, Any]) -> bool:
-    """判断 TTC / 间距是否进入紧急制动触发窗口。"""
-    if not _is_brake_candidate(metrics):
-        return False
-    gap = float(metrics.get("net_gap_m", float("inf")))
+def _evaluate_thw_activation(metrics: dict[str, Any]) -> dict[str, Any]:
+    """判断当前 THW 是否达到精准触发窗口或已经越过目标 THW。"""
+    target_thw = float(CFG["target_thw_s"])
+    tolerance = float(CFG["thw_tol_s"])
+    lower = max(0.0, target_thw - tolerance)
+    upper = target_thw + tolerance
     closing_speed = float(metrics.get("closing_speed_mps", 0.0))
-    ttc = float(metrics.get("ttc_s", float("inf")))
-    if gap <= float(CFG["trigger_gap_m"]):
-        return True
-    return bool(
-        closing_speed >= float(CFG["trigger_closing_speed_mps"])
-        and ttc <= float(CFG["trigger_ttc_s"])
-    )
+    thw = float(metrics.get("thw_s", float("inf")))
+
+    ready = False
+    reason = "thw_not_ready"
+    if not _is_brake_candidate(metrics):
+        reason = "not_candidate"
+    elif not np.isfinite(thw):
+        reason = "invalid_thw"
+    elif closing_speed <= 1e-3:
+        reason = "no_closing_speed"
+    elif lower <= thw <= upper:
+        ready = True
+        reason = "exact_thw_ready"
+    elif thw < lower:
+        ready = True
+        reason = "late_thw_trigger"
+
+    return {
+        "thw_activation_ready": bool(ready),
+        "thw_activation_reason": str(reason),
+        "target_thw_s": float(target_thw),
+        "thw_tolerance_s": float(tolerance),
+        "thw_activation_lower_s": float(lower),
+        "thw_activation_upper_s": float(upper),
+        "current_thw_s": float(thw),
+        "current_thw_error_s": float(thw - target_thw),
+    }
 
 
 def _update_prepare_progress(memory: dict[str, Any], metrics: dict[str, Any]) -> None:
@@ -623,19 +646,19 @@ def _evaluate_prepare_timeout(
     hard_timeout = max(soft_timeout, float(CFG["prepare_hard_timeout_s"]))
     gap = float(metrics.get("net_gap_m", float("inf")))
     closing_speed = float(metrics.get("closing_speed_mps", 0.0))
-    trigger_gap = float(CFG["trigger_gap_m"])
-    gap_to_trigger = max(0.0, gap - trigger_gap) if np.isfinite(gap) else float("inf")
-    predicted_trigger_time = (
-        gap_to_trigger / closing_speed
-        if np.isfinite(gap_to_trigger) and closing_speed > 1e-3
-        else float("inf")
-    )
+    target_thw = float(CFG["target_thw_s"])
+    thw = float(metrics.get("thw_s", float("inf")))
+    main_v = float(metrics.get("main_v", 0.0))
+    ego_length = float(metrics.get("ego_length_m", 0.0))
+    target_gap = target_thw * main_v - ego_length if main_v > 1e-6 else float("inf")
+    gap_to_target = max(0.0, gap - target_gap) if np.isfinite(gap) and np.isfinite(target_gap) else float("inf")
+    predicted_trigger_time = gap_to_target / closing_speed if closing_speed > 1e-3 else float("inf")
     initial_gap = float(memory.get("prepare_initial_gap_m", float("inf")))
     best_gap = float(memory.get("prepare_best_gap_m", float("inf")))
     gap_progress = initial_gap - gap if np.isfinite(initial_gap) and np.isfinite(gap) else 0.0
     best_gap_progress = initial_gap - best_gap if np.isfinite(initial_gap) and np.isfinite(best_gap) else 0.0
-    near_trigger = bool(np.isfinite(gap) and gap <= trigger_gap + float(CFG["prepare_near_trigger_gap_margin_m"]))
-    predicted_ok = bool(predicted_trigger_time <= float(CFG["prepare_abort_predicted_trigger_time_s"]))
+    near_trigger = bool(np.isfinite(thw) and thw <= target_thw + float(CFG["prepare_near_thw_margin_s"]))
+    predicted_ok = bool(predicted_trigger_time <= float(CFG["prepare_abort_predicted_thw_time_s"]))
     making_progress = bool(
         best_gap_progress >= float(CFG["prepare_min_gap_progress_m"])
         and closing_speed >= float(CFG["prepare_progress_min_closing_speed_mps"])
@@ -644,13 +667,18 @@ def _evaluate_prepare_timeout(
     should_abort = False
     decision = "within_soft_timeout"
     if elapsed >= hard_timeout:
-        should_abort = True
-        decision = "hard_timeout"
+        if near_trigger:
+            decision = "extend_hard_near_target_thw"
+        elif predicted_ok:
+            decision = "extend_hard_predicted_target_thw"
+        else:
+            should_abort = True
+            decision = "hard_timeout"
     elif elapsed >= soft_timeout:
         if near_trigger:
-            decision = "extend_near_trigger"
+            decision = "extend_near_target_thw"
         elif predicted_ok:
-            decision = "extend_predicted_trigger"
+            decision = "extend_predicted_target_thw"
         elif making_progress:
             decision = "extend_gap_progress"
         else:
@@ -661,13 +689,14 @@ def _evaluate_prepare_timeout(
         "prepare_elapsed_s": float(elapsed),
         "prepare_soft_timeout_s": float(soft_timeout),
         "prepare_hard_timeout_s": float(hard_timeout),
-        "prepare_gap_to_trigger_m": float(gap_to_trigger),
+        "prepare_target_thw_gap_m": float(target_gap),
+        "prepare_gap_to_target_thw_m": float(gap_to_target),
         "prepare_predicted_trigger_time_s": float(predicted_trigger_time),
         "prepare_initial_gap_m": float(initial_gap),
         "prepare_best_gap_m": float(best_gap),
         "prepare_gap_progress_m": float(gap_progress),
         "prepare_best_gap_progress_m": float(best_gap_progress),
-        "prepare_near_trigger": bool(near_trigger),
+        "prepare_near_target_thw": bool(near_trigger),
         "prepare_predicted_trigger_ok": bool(predicted_ok),
         "prepare_making_progress": bool(making_progress),
         "prepare_timeout_decision": str(decision),
@@ -803,10 +832,13 @@ def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
             "main_valid": False,
             "main_is_behind": False,
             "net_gap_m": float("inf"),
+            "thw_effective_gap_m": float("inf"),
+            "thw_s": float("inf"),
             "closing_speed_mps": 0.0,
-            "ttc_s": float("inf"),
             "required_decel_mps2": 0.0,
             "stop_margin_m": float("inf"),
+            "ego_length_m": float(limits.ego_length),
+            "main_length_m": float(limits.main_length),
         }
 
     projection = _project_pair_on_braking_relation_line(context)
@@ -818,7 +850,8 @@ def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
     center_gap = -rel_s
     net_gap = center_gap - 0.5 * (limits.ego_length + limits.main_length)
     closing_speed = float(main.v) - float(ego.v)
-    ttc = net_gap / closing_speed if net_gap > 0.0 and closing_speed > 1e-3 else float("inf")
+    thw_effective_gap = net_gap + limits.ego_length
+    thw = thw_effective_gap / float(main.v) if thw_effective_gap > 0.0 and float(main.v) > 1e-6 else float("inf")
     required_decel = (closing_speed ** 2) / max(2.0 * net_gap, 1e-3) if net_gap > 0.0 and closing_speed > 0.0 else 0.0
     main_stop_dist = (float(main.v) ** 2) / max(2.0 * float(CFG["main_comfort_decel_mps2"]), 1e-3)
     ego_stop_dist = (float(ego.v) ** 2) / max(2.0 * abs(float(CFG["emergency_decel_mps2"])), 1e-3)
@@ -834,13 +867,16 @@ def _compute_brake_metrics(context: SceneContext) -> dict[str, Any]:
         "main_d_on_ego": float(main_d_on_ego),
         "relation_lateral_error_m": float(relation_lateral_error),
         "net_gap_m": float(net_gap),
+        "thw_effective_gap_m": float(thw_effective_gap),
+        "thw_s": float(thw),
         "closing_speed_mps": float(closing_speed),
-        "ttc_s": float(ttc),
         "required_decel_mps2": float(required_decel),
         "stop_margin_m": float(stop_margin),
         "heading_diff_deg": _heading_diff_deg(float(main.heading), float(ego.heading)),
         "ego_v": float(ego.v),
         "main_v": float(main.v),
+        "ego_length_m": float(limits.ego_length),
+        "main_length_m": float(limits.main_length),
     }
 
 
