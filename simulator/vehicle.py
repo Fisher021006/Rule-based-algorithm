@@ -6,6 +6,7 @@
 """
 
 import math
+import time
 from typing import Literal
 
 import numpy as np
@@ -277,7 +278,54 @@ class GVT:
                 )
             self.last_planning_frame = planning_frame
             self.last_planning_input = planning_input
-            trajectory = self.traj_planner.plan(planning_input=planning_input)
+            if self.planner_mode == "scene_target":
+                from planning_runtime.modes.emergency_stop import (
+                    build_emergency_stop_trajectory,
+                    is_emergency_stop_input,
+                )
+
+                if is_emergency_stop_input(planning_input):
+                    stop_start = time.perf_counter()
+                    trajectory = build_emergency_stop_trajectory(planning_input)
+                    elapsed_ms = (time.perf_counter() - stop_start) * 1000.0
+                    timings = {
+                        "context_ms": 0.0,
+                        "behavior_ms": 0.0,
+                        "sampling_ms": 0.0,
+                        "generator_ms": elapsed_ms,
+                        "evaluator_ms": 0.0,
+                        "refine_ms": 0.0,
+                        "plan_total_ms": elapsed_ms,
+                    }
+                    self.traj_planner._set_last_module_timing(timings)
+                    external_target = planning_input.external_target
+                    metadata = getattr(external_target, "metadata", {}) or {}
+                    self.traj_planner.attribute.update(
+                        {
+                            "plan_mode": "emergency_stop",
+                            "candidate_count": 1,
+                            "feasible_candidate_count": 0 if trajectory is None else 1,
+                            "target_point": None if trajectory is None else np.asarray(trajectory[-1, :2], dtype=float).tolist(),
+                            "selected_line_id": "",
+                            "selected_template": "emergency_stop",
+                            "selected_score": None,
+                            "failure_reason": "" if trajectory is not None else "emergency_stop_failed",
+                            "target_lane_id": "",
+                            "must_change": False,
+                            "deadline_margin_m": None,
+                            "reason": str(metadata.get("reason", "emergency_stop")),
+                            "best_mobil_incentive": 0.0,
+                            "current_front_ttc": None,
+                            "current_front_stop_margin": None,
+                            "current_front_gap": None,
+                            "is_arrive": False,
+                            "is_on_lane": True,
+                        }
+                    )
+                else:
+                    trajectory = self.traj_planner.plan(planning_input=planning_input)
+            else:
+                trajectory = self.traj_planner.plan(planning_input=planning_input)
         finally:
             self.scene_runtime_step_index += 1
 

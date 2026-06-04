@@ -3,9 +3,9 @@
 设计目标：
 - APPROACH 识别后方同向主车
 - PREPARE 维持当前车道，等待后车满足精准 THW 触发窗口
-- ACTIVE_BRAKE 按平台减速度约束输出当前车道制动目标
-- STABILIZE 制动后短时低速稳定
-- COOLDOWN 场景失败或结束后冷却，避免连续重复触发
+- ACTIVE_BRAKE 按平台最大减速度约束输出当前车道零速制动目标
+- STOPPED 制动完成后零速保持
+- COOLDOWN 场景失败后冷却，避免连续重复触发
 """
 
 from __future__ import annotations
@@ -34,9 +34,7 @@ class VehicleLimits:
 
 CFG: dict[str, Any] = {
     "cruise_target_v": 5.0,
-    "prepare_target_v": 4.5,
-    "prepare_wait_v_max": 4.5,
-    "target_thw_s": 2.0,
+    "target_thw_s": 4.0,
     "thw_tol_s": 0.1,
     "prepare_plan_t_s": 1.5,
     "prepare_timeout_s": 8.0,
@@ -46,11 +44,10 @@ CFG: dict[str, Any] = {
     "prepare_min_gap_progress_m": 2.0,
     "prepare_progress_min_closing_speed_mps": 0.3,
     "brake_plan_t_s": 1.2,
-    "brake_duration_s": 2.5,
     "emergency_decel_mps2": 2.5,
-    "brake_target_v": 0.5,
-    "stabilize_target_v": 0.8,
-    "stabilize_duration_s": 1.5,
+    "brake_target_v": 0.0,
+    "stop_complete_v": 0.05,
+    "stop_hold_s": 10.0,
     "abort_cooldown_s": 2.0,
     "max_main_d_on_ego_m": 1.5,
     "behind_gap_max_m": 45.0,
@@ -68,10 +65,9 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "prepare_initial_gap_m": float("inf"),
     "prepare_best_gap_m": float("inf"),
     "active_start_time_s": -1.0,
-    "active_end_time_s": -1.0,
     "active_start_v": 0.0,
+    "stopped_start_time_s": -1.0,
     "execute_complete_hits": 0,
-    "stable_until_time_s": -1.0,
     "last_metrics": None,
 }
 
@@ -111,7 +107,7 @@ def _scene_fsm_step(
         memory["mode"] = "APPROACH"
         mode = "APPROACH"
 
-    if mode not in {"ACTIVE_BRAKE", "STABILIZE"} and not _has_valid_main_vehicle(context):
+    if mode not in {"ACTIVE_BRAKE", "STOPPED"} and not _has_valid_main_vehicle(context):
         return _handle_no_valid_main(context, memory)
 
     if mode == "APPROACH":
@@ -120,8 +116,8 @@ def _scene_fsm_step(
         return _handle_prepare(context, memory, now)
     if mode == "ACTIVE_BRAKE":
         return _handle_active_brake(context, memory, now)
-    if mode == "STABILIZE":
-        return _handle_stabilize(context, memory, now)
+    if mode == "STOPPED":
+        return _handle_stopped(context, memory, now)
     return _handle_unknown_mode(context, memory)
 
 
@@ -263,9 +259,15 @@ def _handle_active_brake(
     metrics = _compute_brake_metrics(context)
     memory["last_metrics"] = copy.deepcopy(metrics)
     if _brake_execution_completed(context, memory, now):
-        memory["mode"] = "STABILIZE"
-        memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
-        return _build_stabilize_output(context, metrics), memory
+        memory["mode"] = "STOPPED"
+        memory["stopped_start_time_s"] = float(now)
+        return _build_stopped_output(
+            context,
+            metrics,
+            reason="braking_stop_hold",
+            scene_status="brake_hold_stop",
+            hold_elapsed_s=0.0,
+        ), memory
 
     return _build_brake_output(
         context,
@@ -276,17 +278,32 @@ def _handle_active_brake(
     ), memory
 
 
-def _handle_stabilize(
+def _handle_stopped(
     context: SceneContext,
     memory: dict[str, Any],
     now: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """处理 STABILIZE：紧急制动后短时低速稳定。"""
+    """处理 STOPPED：制动完成后持续零速保持。"""
     metrics = _compute_brake_metrics(context)
-    output = _build_stabilize_output(context, metrics)
-    if now >= float(memory["stable_until_time_s"]):
-        _enter_cooldown(memory, now)
-    return output, memory
+    memory["last_metrics"] = copy.deepcopy(metrics)
+    stopped_start = float(memory.get("stopped_start_time_s", -1.0))
+    if stopped_start < 0.0:
+        stopped_start = float(now)
+        memory["stopped_start_time_s"] = stopped_start
+    hold_elapsed = max(0.0, float(now) - stopped_start)
+    if hold_elapsed >= float(CFG["stop_hold_s"]):
+        reason = "braking_completed_stop"
+        scene_status = "brake_completed_stop"
+    else:
+        reason = "braking_stop_hold"
+        scene_status = "brake_hold_stop"
+    return _build_stopped_output(
+        context,
+        metrics,
+        reason=reason,
+        scene_status=scene_status,
+        hold_elapsed_s=hold_elapsed,
+    ), memory
 
 
 def _handle_unknown_mode(
@@ -323,8 +340,8 @@ def _enter_active_brake_mode(
     """进入 ACTIVE_BRAKE，并记录制动起始状态。"""
     memory["mode"] = "ACTIVE_BRAKE"
     memory["active_start_time_s"] = float(now)
-    memory["active_end_time_s"] = float(now) + float(CFG["brake_duration_s"])
     memory["active_start_v"] = float(context.ego_vehicle.v)
+    memory["stopped_start_time_s"] = -1.0
     memory["execute_complete_hits"] = 0
     _reset_prepare_memory(memory)
 
@@ -345,12 +362,11 @@ def _reset_prepare_memory(memory: dict[str, Any]) -> None:
 
 
 def _reset_execute_memory(memory: dict[str, Any]) -> None:
-    """清空 ACTIVE_BRAKE / STABILIZE 执行缓存。"""
+    """清空 ACTIVE_BRAKE / STOPPED 执行缓存。"""
     memory["active_start_time_s"] = -1.0
-    memory["active_end_time_s"] = -1.0
     memory["active_start_v"] = 0.0
+    memory["stopped_start_time_s"] = -1.0
     memory["execute_complete_hits"] = 0
-    memory["stable_until_time_s"] = -1.0
     memory["last_metrics"] = None
 
 
@@ -391,10 +407,9 @@ def _select_prepare_thw_wait_target(
     metrics: dict[str, Any],
     limits: VehicleLimits,
 ) -> dict[str, Any]:
-    """按固定等待速度维持当前车道，等待后车 THW 进入触发窗口。"""
+    """按制动前最小速度维持当前车道，等待后车 THW 进入触发窗口。"""
     min_trigger_v, min_trigger_debug = _compute_prepare_min_trigger_v(limits)
-    wait_max = _clamp(float(CFG["prepare_wait_v_max"]), min_trigger_v, limits.max_v)
-    target_v = _clamp(float(CFG["prepare_target_v"]), min_trigger_v, wait_max)
+    target_v = float(min_trigger_v)
     target_thw = max(float(CFG["target_thw_s"]), 1e-3)
     main_v = float(metrics.get("main_v", 0.0))
     ego_v = float(metrics.get("ego_v", context.ego_vehicle.v))
@@ -405,13 +420,11 @@ def _select_prepare_thw_wait_target(
     elapsed = max(0.0, float(context.time_s) - float(memory.get("prepare_start_time_s", context.time_s)))
     thw_error = current_thw - target_thw
     debug = {
-        "prepare_speed_policy": "hold_thw_wait_speed",
+        "prepare_speed_policy": "hold_min_trigger_speed",
         "prepare_solve_status": "wait_for_target_thw",
         "prepare_target_v": float(target_v),
-        "prepare_raw_target_v": float(CFG["prepare_target_v"]),
-        "prepare_wait_v_min": float(min_trigger_v),
+        "prepare_wait_v": float(target_v),
         "prepare_min_trigger_v": float(min_trigger_v),
-        "prepare_wait_v_max": float(wait_max),
         "prepare_elapsed_s": float(elapsed),
         "target_thw_s": float(target_thw),
         "thw_tol_s": float(CFG["thw_tol_s"]),
@@ -488,47 +501,86 @@ def _build_brake_output(
 ) -> dict[str, Any]:
     """构造 ACTIVE_BRAKE 阶段的当前车道制动目标。"""
     limits = _read_vehicle_limits(context)
-    plan_t = float(CFG["brake_plan_t_s"])
     desired_acc = -abs(float(CFG["emergency_decel_mps2"]))
     target_a = _clamp(desired_acc, limits.min_acc, limits.max_acc)
-    target_v = max(float(CFG["brake_target_v"]), float(context.ego_vehicle.v) + target_a * plan_t)
-    target_v = _clamp(target_v, 0.0, limits.max_v)
+    effective_decel = abs(min(target_a, 0.0))
+    ego_v = max(0.0, float(context.ego_vehicle.v))
+    if effective_decel > 1e-6:
+        plan_t = max(float(context.dt), ego_v / effective_decel)
+        stop_distance = (ego_v ** 2) / (2.0 * effective_decel)
+    else:
+        plan_t = max(float(context.dt), float(CFG["brake_plan_t_s"]))
+        stop_distance = ego_v * plan_t
+    target_v = 0.0
     debug = copy.deepcopy(metrics)
     debug.update(
         {
             "brake_target_acc": float(target_a),
             "brake_target_v": float(target_v),
+            "brake_stop_target_v": float(CFG["brake_target_v"]),
+            "stop_complete_v": float(CFG["stop_complete_v"]),
+            "stop_hold_s": float(CFG["stop_hold_s"]),
+            "brake_stop_plan_t_s": float(plan_t),
+            "brake_stop_distance_m": float(stop_distance),
             "active_elapsed_s": max(0.0, float(context.time_s) - float(memory.get("active_start_time_s", context.time_s))),
-            "active_remaining_s": max(0.0, float(memory.get("active_end_time_s", context.time_s)) - float(context.time_s)),
         }
     )
-    return _build_line_target_output(
+    output = _build_line_target_output(
         context=context,
         target_v=target_v,
         target_a=target_a,
         plan_t=plan_t,
+        travel_s_override=stop_distance,
         reason=reason,
         scene_status=scene_status,
         scene_debug=debug,
     )
+    output.update(
+        {
+            "control_mode": "emergency_stop",
+            "emergency_decel_mps2": abs(float(target_a)),
+            "stop_hold_s": float(CFG["stop_hold_s"]),
+        }
+    )
+    return output
 
 
-def _build_stabilize_output(
+def _build_stopped_output(
     context: SceneContext,
     metrics: dict[str, Any],
+    reason: str,
+    scene_status: str,
+    hold_elapsed_s: float | None = None,
 ) -> dict[str, Any]:
-    """构造制动后的短时低速稳定目标。"""
-    limits = _read_vehicle_limits(context)
-    target_v = _clamp(float(CFG["stabilize_target_v"]), 0.0, limits.max_v)
-    return _build_line_target_output(
+    """构造制动完成后的零速保持目标。"""
+    debug = copy.deepcopy(metrics)
+    debug.update(
+        {
+            "brake_target_v": float(CFG["brake_target_v"]),
+            "stop_complete_v": float(CFG["stop_complete_v"]),
+            "stop_hold_s": float(CFG["stop_hold_s"]),
+        }
+    )
+    if hold_elapsed_s is not None:
+        debug["stop_hold_elapsed_s"] = float(hold_elapsed_s)
+        debug["stop_hold_remaining_s"] = max(0.0, float(CFG["stop_hold_s"]) - float(hold_elapsed_s))
+    output = _build_line_target_output(
         context=context,
-        target_v=target_v,
+        target_v=0.0,
         target_a=0.0,
         plan_t=1.5,
-        reason="braking_stabilize",
-        scene_status="stabilize_low_speed",
-        scene_debug=metrics,
+        reason=reason,
+        scene_status=scene_status,
+        scene_debug=debug,
     )
+    output.update(
+        {
+            "control_mode": "emergency_stop",
+            "emergency_decel_mps2": abs(float(CFG["emergency_decel_mps2"])),
+            "stop_hold_s": float(CFG["stop_hold_s"]),
+        }
+    )
+    return output
 
 
 def _build_line_target_output(
@@ -541,6 +593,7 @@ def _build_line_target_output(
     scene_status: str,
     scene_detail: str | None = None,
     scene_debug: dict[str, Any] | None = None,
+    travel_s_override: float | None = None,
 ) -> dict[str, Any]:
     """在当前参考线上按目标速度和规划时长构造终端点。"""
     line = context.ego_vehicle.current_ref_line
@@ -548,7 +601,10 @@ def _build_line_target_output(
         float(CFG["min_target_progress_floor_m"]),
         float(target_v) * float(plan_t) * float(CFG["target_progress_ratio"]),
     )
-    travel_s = max(min_progress, float(target_v) * float(plan_t))
+    if travel_s_override is None:
+        travel_s = max(min_progress, float(target_v) * float(plan_t))
+    else:
+        travel_s = max(min_progress, float(travel_s_override))
     target_s = _clamp(
         float(line.current_s) + float(travel_s),
         float(line.current_s) + float(min_progress),
@@ -709,10 +765,8 @@ def _brake_execution_completed(
     memory: dict[str, Any],
     now: float,
 ) -> bool:
-    """判断主动制动是否完成。"""
-    if float(now) >= float(memory.get("active_end_time_s", -1.0)):
-        return True
-    if float(context.ego_vehicle.v) <= float(CFG["brake_target_v"]) + 0.2:
+    """判断主动制动是否已经把自车降到零速完成阈值。"""
+    if float(context.ego_vehicle.v) <= float(CFG["stop_complete_v"]):
         memory["execute_complete_hits"] += 1
     else:
         memory["execute_complete_hits"] = 0

@@ -271,6 +271,19 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     f"wall={time.perf_counter() - step_wall_start:.2f}s"
                 )
 
+            latest_scene_status = (
+                str(provider.history[-1].get("scene_status", ""))
+                if provider.history
+                else ""
+            )
+            if latest_scene_status == "brake_completed_stop":
+                status = "scene_completed"
+                log_status(
+                    f"[sim] scene completed at step {step_index + 1}/{max_steps} "
+                    f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
+                )
+                break
+
             if remain_dist <= float(args.arrive_dist) and ego_vehicle.v <= float(args.arrive_speed):
                 status = "arrived"
                 log_status(

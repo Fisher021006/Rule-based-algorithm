@@ -114,9 +114,14 @@ def normalize_scene_algorithm_output(
     return output
 
 
-def scene_output_to_external_target(output: SceneAlgorithmOutput) -> ExternalTarget:
+def scene_output_to_external_target(
+    output: SceneAlgorithmOutput,
+    metadata: dict[str, Any] | None = None,
+) -> ExternalTarget:
     """把场景输出转换成规划器消费的 `ExternalTarget`。"""
 
+    target_metadata = copy.deepcopy(metadata) if metadata is not None else {}
+    target_metadata["reason"] = output.reason
     return ExternalTarget(
         point_xy=np.array([output.x, output.y], dtype=float),
         target_line_index=int(0 if output.target_line_index is None else output.target_line_index),
@@ -126,7 +131,7 @@ def scene_output_to_external_target(output: SceneAlgorithmOutput) -> ExternalTar
         plan_T=max(0.5, float(output.t)),
         hold_t=max(0.0, float(output.hold_t)),
         source="scene_algorithm",
-        metadata={"reason": output.reason},
+        metadata=target_metadata,
     )
 
 
@@ -505,6 +510,7 @@ class SceneTargetProvider:
                 "main_lane_id": "" if main_vehicle is None else main_vehicle.lane_id,
                 "main_relative_s_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_s_to_ego,
                 "main_relative_d_to_ego": 0.0 if main_vehicle is None else main_vehicle.relative_d_to_ego,
+                "control_mode": str(scene_metadata.get("control_mode", "trajectory_target")),
                 "scene_status": str(scene_metadata.get("scene_status", "")),
                 "scene_detail": str(scene_metadata.get("scene_detail", "")),
                 "scene_debug": copy.deepcopy(scene_metadata.get("scene_debug", {})),
@@ -513,7 +519,7 @@ class SceneTargetProvider:
             }
         )
 
-        return scene_output_to_external_target(output)
+        return scene_output_to_external_target(output, metadata=scene_metadata)
 
     # Compatibility alias for the current transition period.
     build_simulation_view_context = build_scene_context

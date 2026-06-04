@@ -49,15 +49,11 @@ info.npy
 
 # Large source GIS attachments not used by runtime
 xodr_parser/data/nongan_v5_1202（农安地图完整版）/nongan_v5_1202/shp/
-紧急制动/braking_trigger_check/braking_trigger_check_timing.json
-紧急制动/braking_trigger_check/braking_trigger_check.json
-.gitignore
-紧急制动/braking_trigger_check/braking_trigger_check.png
-紧急制动/braking_trigger_check/braking_trigger_check.live.png
-紧急制动/braking_constant_check/braking_constant_check_timing.json
-.gitignore
-紧急制动/braking_constant_check/braking_constant_check.json
-紧急制动/braking_constant_check/braking_constant_check.gif
-紧急制动/braking_constant_check/braking_constant_check.live.png
-紧急制动/braking_constant_check/braking_constant_check.png
-紧急制动/braking_trigger_check/braking_trigger_check.gif
+
+# Emergency braking check outputs
+紧急制动/braking_trigger_check/braking_trigger_check*.json
+紧急制动/braking_trigger_check/braking_trigger_check*.png
+紧急制动/braking_trigger_check/braking_trigger_check*.gif
+紧急制动/braking_constant_check/braking_constant_check*.json
+紧急制动/braking_constant_check/braking_constant_check*.png
+紧急制动/braking_constant_check/braking_constant_check*.gif
