@@ -109,6 +109,7 @@ def _render_single_frame(
     ego_goal_xy: np.ndarray,
     planner_mode: str,
     frame_idx: int,
+    exposed_trace: np.ndarray | None = None,
     planned_trajectory: np.ndarray | None = None,
     status_text: str | None = None,
 ) -> Image.Image:
@@ -123,8 +124,12 @@ def _render_single_frame(
 
     ego_end = min(frame_idx + 1, len(ego_trace))
     main_end = min(frame_idx + 1, len(main_trace))
+    exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
+    exposed_end = 0 if exposed_arr is None else min(frame_idx + 1, len(exposed_arr))
     ax.plot(ego_trace[:ego_end, 0], ego_trace[:ego_end, 1], color="#D62728", linewidth=2.0, label="ego trajectory")
     ax.plot(main_trace[:main_end, 0], main_trace[:main_end, 1], color="#111111", linewidth=2.0, label="main trajectory")
+    if exposed_arr is not None and exposed_end > 0:
+        ax.plot(exposed_arr[:exposed_end, 0], exposed_arr[:exposed_end, 1], color="#C2185B", linewidth=2.0, label="exposed trajectory")
     if planned_trajectory is not None and len(planned_trajectory) >= 2:
         ax.plot(
             planned_trajectory[:, 0],
@@ -138,6 +143,8 @@ def _render_single_frame(
     ax.scatter(ego_trace[0, 0], ego_trace[0, 1], color="#D62728", s=30, marker="o", label="ego start")
     ax.scatter(ego_goal_xy[0], ego_goal_xy[1], color="#D62728", s=50, marker="*", label="ego goal")
     ax.scatter(main_trace[0, 0], main_trace[0, 1], color="#111111", s=30, marker="o", label="main start")
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        ax.scatter(exposed_arr[0, 0], exposed_arr[0, 1], color="#C2185B", s=30, marker="o", label="exposed start")
 
     if provider.last_scene_context is not None:
         ego_ctx = provider.last_scene_context.ego_vehicle
@@ -175,8 +182,22 @@ def _render_single_frame(
         color="#111111",
         label="main",
     )
+    if exposed_arr is not None and exposed_end > 0:
+        draw_vehicle(
+            ax,
+            x=float(exposed_arr[exposed_end - 1, 0]),
+            y=float(exposed_arr[exposed_end - 1, 1]),
+            heading=float(exposed_arr[exposed_end - 1, 2]),
+            length=4.6,
+            width=1.8,
+            color="#C2185B",
+            label="exposed",
+        )
 
-    all_xy = np.vstack([ego_trace[:, :2], main_trace[:, :2]])
+    all_xy_parts = [ego_trace[:, :2], main_trace[:, :2]]
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        all_xy_parts.append(exposed_arr[:, :2])
+    all_xy = np.vstack(all_xy_parts)
     min_xy = np.min(all_xy, axis=0) - 15.0
     max_xy = np.max(all_xy, axis=0) + 15.0
     ax.set_xlim(min_xy[0], max_xy[0])
@@ -236,6 +257,7 @@ class LiveSimulationViewer:
         ego_trace: list[list[float]],
         main_trace: list[list[float]],
         step_index: int,
+        exposed_trace: list[list[float]] | None = None,
         planned_trajectory: list[list[float]] | np.ndarray | None = None,
         status_text: str | None = None,
         force: bool = False,
@@ -249,6 +271,7 @@ class LiveSimulationViewer:
         main_arr = np.asarray(main_trace, dtype=float)
         if len(ego_arr) == 0 or len(main_arr) == 0:
             return
+        exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
         planned_arr = None if planned_trajectory is None else np.asarray(planned_trajectory, dtype=float)
         image = _render_single_frame(
             xodr_parser=self.xodr_parser,
@@ -258,6 +281,7 @@ class LiveSimulationViewer:
             ego_goal_xy=self.ego_goal_xy,
             planner_mode=self.planner_mode,
             frame_idx=len(ego_arr) - 1,
+            exposed_trace=exposed_arr,
             planned_trajectory=planned_arr,
             status_text=status_text,
         )
@@ -300,12 +324,14 @@ def save_animation_gif(
     dt: float,
     output_gif: Path,
     log_every: int = 10,
+    exposed_trace: list[list[float]] | None = None,
 ) -> None:
     """把完整仿真过程保存成 GIF。"""
 
     ego_arr = np.asarray(ego_trace, dtype=float)
     main_arr = np.asarray(main_trace, dtype=float)
-    frame_count = max(len(ego_arr), len(main_arr))
+    exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
+    frame_count = max(len(ego_arr), len(main_arr), 0 if exposed_arr is None else len(exposed_arr))
     if frame_count == 0:
         raise ValueError("轨迹为空，无法生成 GIF")
 
@@ -323,6 +349,7 @@ def save_animation_gif(
                 ego_goal_xy=ego_goal_xy,
                 planner_mode=planner_mode,
                 frame_idx=frame_idx,
+                exposed_trace=exposed_arr,
             )
         )
     frame_duration_ms = max(int(round(dt * 1000.0)), 50)
@@ -345,6 +372,7 @@ def plot_results(
     output_png: Path,
     show: bool,
     planner_mode: str,
+    exposed_trace: list[list[float]] | None = None,
 ) -> None:
     """渲染静态 PNG 汇总图。"""
 
@@ -357,11 +385,16 @@ def plot_results(
 
     ego_arr = np.asarray(ego_trace, dtype=float)
     main_arr = np.asarray(main_trace, dtype=float)
+    exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
     ax.plot(ego_arr[:, 0], ego_arr[:, 1], color="#D62728", linewidth=2.0, label="ego trajectory")
     ax.plot(main_arr[:, 0], main_arr[:, 1], color="#111111", linewidth=2.0, label="main trajectory")
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        ax.plot(exposed_arr[:, 0], exposed_arr[:, 1], color="#C2185B", linewidth=2.0, label="exposed trajectory")
     ax.scatter(ego_arr[0, 0], ego_arr[0, 1], color="#D62728", s=30, marker="o", label="ego start")
     ax.scatter(ego_goal_xy[0], ego_goal_xy[1], color="#D62728", s=50, marker="*", label="ego goal")
     ax.scatter(main_arr[0, 0], main_arr[0, 1], color="#111111", s=30, marker="o", label="main start")
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        ax.scatter(exposed_arr[0, 0], exposed_arr[0, 1], color="#C2185B", s=30, marker="o", label="exposed start")
 
     if provider.last_scene_context is not None:
         ego_ctx = provider.last_scene_context.ego_vehicle
@@ -399,8 +432,22 @@ def plot_results(
         color="#111111",
         label="main",
     )
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        draw_vehicle(
+            ax,
+            x=float(exposed_arr[-1, 0]),
+            y=float(exposed_arr[-1, 1]),
+            heading=float(exposed_arr[-1, 2]),
+            length=4.6,
+            width=1.8,
+            color="#C2185B",
+            label="exposed",
+        )
 
-    all_xy = np.vstack([ego_arr[:, :2], main_arr[:, :2]])
+    all_xy_parts = [ego_arr[:, :2], main_arr[:, :2]]
+    if exposed_arr is not None and len(exposed_arr) > 0:
+        all_xy_parts.append(exposed_arr[:, :2])
+    all_xy = np.vstack(all_xy_parts)
     min_xy = np.min(all_xy, axis=0) - 15.0
     max_xy = np.max(all_xy, axis=0) + 15.0
     ax.set_xlim(min_xy[0], max_xy[0])
