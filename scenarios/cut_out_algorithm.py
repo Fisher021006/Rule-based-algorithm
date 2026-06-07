@@ -549,7 +549,7 @@ def _build_cutout_scene(
     if target_line is None:
         return _scene_failure("no_cutout_target_line", {"cutout_side": str(CFG["cutout_side"])})
 
-    source_line = _build_source_relation_line(context)
+    source_line = _extend_source_relation_line_to_exposed(_build_source_relation_line(context), exposed)
     geometry = _compute_source_geometry(context, exposed, limits, source_line)
     if not bool(geometry["same_source_lane"]):
         return _scene_failure("not_same_source_lane", geometry)
@@ -597,7 +597,8 @@ def _build_source_relation_line(context: SceneContext) -> ReferenceLineView:
 
     cut-out 的 VUT 通常位于 GVT 后方，而 GVT 当前参考线是从 GVT 当前位置向前截取的。
     如果直接用当前前向参考线投影，后方 VUT 可能被压到线起点，三车顺序会失真。
-    因此优先使用 ego 的完整车道中心线，只在完整中心线不可用时才回退到当前参考线。
+    因此优先使用 ego 的完整车道中心线；若当前参考线包含后继车道段，则把后继段拼到
+    完整当前车道后方，使暴露目标可以位于“当前车道 + 后继车道”的源车道走廊上。
     """
 
     ego = context.ego_vehicle
@@ -610,6 +611,19 @@ def _build_source_relation_line(context: SceneContext) -> ReferenceLineView:
         return ego.current_ref_line
 
     line_xy = np.asarray(line[:, :2], dtype=float)
+    forward_line = np.asarray(ego.current_ref_line.line, dtype=float)
+    if forward_line.ndim == 2 and len(forward_line) >= 2 and len(_normalize_lane_sequence(ego.current_ref_line.lane_sequence)) > 1:
+        current_lane_end = line_xy[-1, :2]
+        distances = np.linalg.norm(forward_line[:, :2] - current_lane_end, axis=1)
+        append_start_idx = int(np.argmin(distances))
+        if float(distances[append_start_idx]) < float(CFG["source_lane_match_d_thresh_m"]):
+            successor_points = np.asarray(forward_line[append_start_idx:, :2], dtype=float)
+            if len(successor_points) >= 2:
+                if np.linalg.norm(successor_points[0, :2] - current_lane_end) < 1e-6:
+                    successor_points = successor_points[1:, :2]
+                if len(successor_points) > 0:
+                    line_xy = np.vstack([line_xy, successor_points])
+
     cumulative_s = calculate_path_cumulative_distance(line_xy)
     _, current_s, current_d = project_point_to_path(np.array([ego.x, ego.y], dtype=float), line_xy)
     return ReferenceLineView(
@@ -621,6 +635,54 @@ def _build_source_relation_line(context: SceneContext) -> ReferenceLineView:
         cumulative_s=cumulative_s,
         current_s=float(current_s),
         current_d=float(current_d),
+    )
+
+
+def _extend_source_relation_line_to_exposed(
+    source_line: ReferenceLineView,
+    exposed: PlanningActorState,
+) -> ReferenceLineView:
+    """必要时把源车道关系线延伸到后继段上的暴露目标。
+
+    当前源线可能已经拼了后继段，但在后继段末端附近仍会出现投影被夹到线尾的情况。
+    只有暴露目标位于线尾前方、且相对线尾切线横向偏差仍很小时，才追加该点。
+    """
+
+    line_xy = np.asarray(source_line.line, dtype=float)
+    if line_xy.ndim != 2 or len(line_xy) < 2:
+        return source_line
+
+    exposed_xy = np.array([exposed.x, exposed.y], dtype=float)
+    _, _exposed_s, exposed_d = project_point_to_path(exposed_xy, line_xy)
+    if abs(float(exposed_d)) <= float(CFG["source_lane_match_d_thresh_m"]):
+        return source_line
+
+    tail = line_xy[-1, :2]
+    prev = line_xy[-2, :2]
+    tail_vec = tail - prev
+    tail_len = float(np.linalg.norm(tail_vec))
+    if tail_len < 1e-6:
+        return source_line
+
+    tail_dir = tail_vec / tail_len
+    exposed_vec = exposed_xy - tail
+    forward_dist = float(np.dot(exposed_vec, tail_dir))
+    lateral_vec = exposed_vec - forward_dist * tail_dir
+    lateral_dist = float(np.linalg.norm(lateral_vec))
+    if forward_dist <= 0.0 or lateral_dist > float(CFG["source_lane_match_d_thresh_m"]):
+        return source_line
+
+    extended_line = np.vstack([line_xy, exposed_xy.reshape(1, 2)])
+    cumulative_s = calculate_path_cumulative_distance(extended_line)
+    return ReferenceLineView(
+        line_index=int(source_line.line_index),
+        lane_id=str(source_line.lane_id),
+        lane_sequence=_normalize_lane_sequence(source_line.lane_sequence),
+        lateral_step=int(source_line.lateral_step),
+        line=extended_line,
+        cumulative_s=cumulative_s,
+        current_s=float(source_line.current_s),
+        current_d=float(source_line.current_d),
     )
 
 
