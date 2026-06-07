@@ -72,6 +72,8 @@ CFG: dict[str, Any] = {
     "vut_metric_min_speed_mps": 0.3,
     # 切出时序。PREPARE 中搜索 hold_t；进入 ACTIVE 后只执行固定 lane_change_time_s。
     "lane_change_time_s": _env_float("ROS_SCENE_CUTOUT_LANE_CHANGE_TIME_S", 4.0),
+    # VUT->暴露目标指标评估时刻。0.5 表示换道时间过半时评估，换道执行时间仍保持不变。
+    "metric_eval_time_ratio": 0.5,
     "hold_t_grid": [round(0.05 * i, 2) for i in range(0, 161)],
     "activation_hold_t_max_s": 0.05,
     "prepare_plan_t_s": 1.5,
@@ -116,6 +118,8 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "prepare_locked_target_lane_sequence": [],
     "active_start_time_s": -1.0,
     "active_end_time_s": -1.0,
+    "active_metric_eval_time_s": -1.0,
+    "metric_eval_recorded": False,
     "locked_target_line_index": None,
     "locked_target_lane_id": "",
     "locked_target_lane_sequence": [],
@@ -347,8 +351,33 @@ def _handle_active(
             scene_debug=copy.deepcopy(memory.get("last_debug")),
         ), memory
 
+    if not bool(memory.get("metric_eval_recorded", False)) and float(now) >= float(memory.get("active_metric_eval_time_s", float("inf"))):
+        metric_at_eval = _compute_finish_metric_from_memory(context, memory)
+        metric_debug = copy.deepcopy(metric_at_eval.get("debug", {}))
+        metric_debug.update(
+            {
+                "finish_metric_eval_phase": "mid_lane_change",
+                "finish_metric_eval_time_s": _metric_eval_time_s(),
+                "finish_metric_eval_actual_elapsed_s": float(now) - float(memory.get("active_start_time_s", now)),
+            }
+        )
+        metric_at_eval["debug"] = metric_debug
+        memory["actual_finish_metric"] = copy.deepcopy(metric_at_eval)
+        memory["metric_eval_recorded"] = True
+
     if _is_cutout_completed(context, memory, target_line, now):
-        finish_metric = _compute_finish_metric_from_memory(context, memory)
+        finish_metric = copy.deepcopy(memory.get("actual_finish_metric"))
+        if not finish_metric:
+            finish_metric = _compute_finish_metric_from_memory(context, memory)
+            finish_debug = copy.deepcopy(finish_metric.get("debug", {}))
+            finish_debug.update(
+                {
+                    "finish_metric_eval_phase": "completion_fallback",
+                    "finish_metric_eval_time_s": _metric_eval_time_s(),
+                    "finish_metric_eval_actual_elapsed_s": float(now) - float(memory.get("active_start_time_s", now)),
+                }
+            )
+            finish_metric["debug"] = finish_debug
         memory["actual_finish_metric"] = copy.deepcopy(finish_metric)
         memory["mode"] = "STABILIZE"
         memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
@@ -444,6 +473,8 @@ def _enter_active_mode(
     memory["mode"] = "ACTIVE"
     memory["active_start_time_s"] = float(now)
     memory["active_end_time_s"] = float(now) + float(CFG["lane_change_time_s"])
+    memory["active_metric_eval_time_s"] = float(now) + _metric_eval_time_s()
+    memory["metric_eval_recorded"] = False
     memory["locked_target_line_index"] = int(target_line.line_index)
     memory["locked_target_lane_id"] = str(target_line.lane_id)
     memory["locked_target_lane_sequence"] = _normalize_lane_sequence(target_line.lane_sequence)
@@ -486,6 +517,8 @@ def _reset_execute_memory(memory: dict[str, Any]) -> None:
 
     memory["active_start_time_s"] = -1.0
     memory["active_end_time_s"] = -1.0
+    memory["active_metric_eval_time_s"] = -1.0
+    memory["metric_eval_recorded"] = False
     memory["locked_target_line_index"] = None
     memory["locked_target_lane_id"] = ""
     memory["locked_target_lane_sequence"] = []
@@ -936,8 +969,9 @@ def _evaluate_cutout_trigger(context: SceneContext, scene: dict[str, Any]) -> di
     best_candidate = None
     best_cost = float("inf")
     first_metric = None
+    metric_eval_time = _metric_eval_time_s()
     for hold_t in CFG["hold_t_grid"]:
-        total_t = float(hold_t) + float(CFG["lane_change_time_s"])
+        total_t = float(hold_t) + float(metric_eval_time)
         metric = _compute_vut_exposed_metric_from_base(metric_base, total_t)
         if first_metric is None:
             first_metric = metric
@@ -985,6 +1019,7 @@ def _evaluate_cutout_trigger(context: SceneContext, scene: dict[str, Any]) -> di
         "trigger_target_metric_s": float(target_metric),
         "trigger_tolerance_s": float(tolerance),
         "trigger_hard_min_s": float(hard_min),
+        "trigger_metric_eval_time_s": float(metric_eval_time),
         "trigger_activation_ready": bool(activation_ready),
         "trigger_late_abort": bool(late_abort),
         "trigger_best_hold_t_s": float("inf") if best_candidate is None else float(best_candidate["hold_t"]),
@@ -1243,7 +1278,7 @@ def _evaluate_cutout_safety(context: SceneContext, scene: dict[str, Any]) -> dic
             "metric_value": float("inf"),
             "target_metric": float("inf"),
             "hold_t": 0.0,
-            "total_t": float(CFG["lane_change_time_s"]),
+            "total_t": _metric_eval_time_s(),
         },
         debug={},
         dry_run=True,
@@ -1308,6 +1343,13 @@ def _compute_source_release_time_s() -> float:
         float(CFG["source_release_time_max_s"]),
     )
     return max(float(CFG["source_release_time_min_s"]), float(release_t))
+
+
+def _metric_eval_time_s() -> float:
+    """返回 ACTIVE 开始后 VUT->暴露目标指标的评估时刻。"""
+
+    ratio = max(0.0, min(float(CFG["metric_eval_time_ratio"]), 1.0))
+    return float(CFG["lane_change_time_s"]) * float(ratio)
 
 
 def _compute_finish_metric(context: SceneContext, scene: dict[str, Any]) -> dict[str, Any]:
