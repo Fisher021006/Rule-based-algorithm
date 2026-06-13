@@ -343,6 +343,7 @@ def _enter_active_brake_mode(
     memory["active_start_v"] = float(context.ego_vehicle.v)
     memory["stopped_start_time_s"] = -1.0
     memory["execute_complete_hits"] = 0
+    print(f"触发紧急制动，THW：{float(_compute_brake_metrics(context).get('thw_s', float('nan'))):.3f}s，已下发刹车命令", flush=True)
     _reset_prepare_memory(memory)
 
 

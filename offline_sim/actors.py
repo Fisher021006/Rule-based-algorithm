@@ -15,11 +15,11 @@ from traj_planner.tools import calculate_path_cumulative_distance, get_path_poin
 from xodr_parser.xodr_parser import XODRParser
 
 
-def instantiate_ego_vehicle(xodr_parser: XODRParser) -> GVT:
+def instantiate_ego_vehicle(xodr_parser: XODRParser, max_speed_kph: float = 25.0) -> GVT:
     """创建离线仿真自车，并补齐可视化所需字段。"""
 
     outline = {"height": 4640.0, "width": 1780.0, "wheelbase": 2700.0}
-    sport_params = {"maxSpeed": 25.0, "maxAcc": 3.0, "minAcc": 3.0}
+    sport_params = {"maxSpeed": float(max_speed_kph), "maxAcc": 3.0, "minAcc": 3.0}
     ego = GVT("ego", outline, sport_params, xodr_parser)
     ego.length = ego.config["size"]["L"]
     ego.width = ego.config["size"]["W"]
@@ -46,10 +46,12 @@ class IDMRouteVehicle:
         self.width = 1.8
         self.height = 1.5
         self.desired_speed = float(desired_speed)
-        self.max_acc = 2.0
-        self.comfort_decel = 2.5
-        self.min_gap = 2.0
-        self.time_headway = 1.5
+        # 离线场景测试使用偏不保守的基础 IDM，避免主车过早消解 cut-out 风险。
+        self.max_acc = 2.5
+        self.comfort_decel = 3.5
+        self.min_gap = 1.0
+        self.time_headway = 0.6
+        self.max_decel = 4.0
         self.delta = 4.0
         self.lateral_threshold = 2.5
         self.timestamp_ms = 0
@@ -136,7 +138,7 @@ class IDMRouteVehicle:
             braking_term = self.v * delta_v / (2.0 * math.sqrt(self.max_acc * self.comfort_decel))
             s_star = self.min_gap + max(0.0, self.v * self.time_headway + braking_term)
             acc = self.max_acc * (free_term - (s_star / max(gap, 0.1)) ** 2)
-        return float(np.clip(acc, -2.0, self.max_acc))
+        return float(np.clip(acc, -float(self.max_decel), self.max_acc))
 
     def step(self, obstacles: list[Any], dt: float, time_s: float) -> None:
         if self.motion_mode == "static":

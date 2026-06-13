@@ -116,7 +116,10 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     )
     xodr_parser = XODRParser.load_cache(str(args.map_cache))
 
-    ego_vehicle = instantiate_ego_vehicle(xodr_parser)
+    ego_vehicle = instantiate_ego_vehicle(
+        xodr_parser,
+        max_speed_kph=float(getattr(args, "ego_max_speed_kph", 25.0)),
+    )
     ego_start_xy = np.asarray(args.ego_start_xy, dtype=float)
     ego_goal_xy = np.asarray(args.ego_goal_xy, dtype=float)
     ego_vehicle.global_planning(ego_start_xy, ego_goal_xy, s_v=float(args.ego_start_speed))
@@ -418,6 +421,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         "map_cache": str(args.map_cache),
         "ego_start_xy": list(map(float, args.ego_start_xy)),
         "ego_goal_xy": list(map(float, args.ego_goal_xy)),
+        "ego_max_speed_kph": float(getattr(args, "ego_max_speed_kph", 25.0)),
         "main_start_xy": None if main_start_xy is None else list(map(float, np.asarray(main_start_xy, dtype=float))),
         "main_goal_xy": None if main_goal_xy is None else list(map(float, np.asarray(main_goal_xy, dtype=float))),
         "main_static_xy": None if str(args.main_motion) != "static" else list(map(float, args.main_static_xy)),

@@ -63,19 +63,22 @@ CFG: dict[str, Any] = {
     # 核心场景指标：静止暴露目标用 THW，低速暴露目标用 TTC。
     "target_thw_s": _env_float("ROS_SCENE_CUTOUT_TARGET_THW_S", 2.0),
     "target_ttc_s": _env_float("ROS_SCENE_CUTOUT_TARGET_TTC_S", 2.0),
-    "thw_tol_s": _env_float("ROS_SCENE_CUTOUT_THW_TOL_S", 0.15),
-    "ttc_tol_s": _env_float("ROS_SCENE_CUTOUT_TTC_TOL_S", 0.2),
+    "thw_tol_s": _env_float("ROS_SCENE_CUTOUT_THW_TOL_S", 0.25),
+    "ttc_tol_s": _env_float("ROS_SCENE_CUTOUT_TTC_TOL_S", 0.35),
     "hard_min_thw_s": _env_float("ROS_SCENE_CUTOUT_HARD_MIN_THW_S", 0.8),
     "hard_min_ttc_s": _env_float("ROS_SCENE_CUTOUT_HARD_MIN_TTC_S", 1.0),
     # 暴露目标速度小于该阈值时按静止目标处理，避免浮点噪声造成误判。
     "static_speed_eps_mps": 0.05,
     "vut_metric_min_speed_mps": 0.3,
-    # 切出时序。PREPARE 中搜索 hold_t；进入 ACTIVE 后只执行固定 lane_change_time_s。
+    # 切出时序。PREPARE 中搜索 hold_t；进入 ACTIVE 后锁定本次动态换道时间。
     "lane_change_time_s": _env_float("ROS_SCENE_CUTOUT_LANE_CHANGE_TIME_S", 4.0),
+    "lane_change_time_min_s": _env_float("ROS_SCENE_CUTOUT_LANE_CHANGE_TIME_MIN_S", 3.0),
+    "lane_change_time_low_speed_mps": _env_float("ROS_SCENE_CUTOUT_LANE_CHANGE_TIME_LOW_SPEED_MPS", 5.0),
+    "lane_change_time_high_speed_mps": _env_float("ROS_SCENE_CUTOUT_LANE_CHANGE_TIME_HIGH_SPEED_MPS", 15.0),
     # VUT->暴露目标指标评估时刻。0.5 表示换道时间过半时评估，换道执行时间仍保持不变。
     "metric_eval_time_ratio": 0.5,
     "hold_t_grid": [round(0.05 * i, 2) for i in range(0, 161)],
-    "activation_hold_t_max_s": 0.05,
+    "activation_hold_t_max_s": 0.3,
     "prepare_plan_t_s": 1.5,
     "prepare_wait_time_buffer_s": 0.5,
     "prepare_target_extra_progress_m": 0.0,
@@ -93,7 +96,6 @@ CFG: dict[str, Any] = {
     "enter_target_d_thresh_m": 0.65,
     "execute_complete_frames": 2,
     # GVT 等待和切出自身的硬安全。第一版不用 THW/TTC 约束这些关系。
-    "min_vut_to_gvt_gap_m": 4.0,
     "min_gvt_to_exposed_gap_m": 5.0,
     "source_abort_gap_m": 2.0,
     "source_release_time_ratio": 0.5,
@@ -119,6 +121,7 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "active_start_time_s": -1.0,
     "active_end_time_s": -1.0,
     "active_metric_eval_time_s": -1.0,
+    "locked_lane_change_time_s": -1.0,
     "metric_eval_recorded": False,
     "locked_target_line_index": None,
     "locked_target_lane_id": "",
@@ -354,10 +357,12 @@ def _handle_active(
     if not bool(memory.get("metric_eval_recorded", False)) and float(now) >= float(memory.get("active_metric_eval_time_s", float("inf"))):
         metric_at_eval = _compute_finish_metric_from_memory(context, memory)
         metric_debug = copy.deepcopy(metric_at_eval.get("debug", {}))
+        locked_lane_change_time = float(memory.get("locked_lane_change_time_s", CFG["lane_change_time_s"]))
         metric_debug.update(
             {
                 "finish_metric_eval_phase": "mid_lane_change",
-                "finish_metric_eval_time_s": _metric_eval_time_s(),
+                "finish_metric_eval_time_s": _metric_eval_time_s(locked_lane_change_time),
+                "finish_metric_lane_change_time_s": float(locked_lane_change_time),
                 "finish_metric_eval_actual_elapsed_s": float(now) - float(memory.get("active_start_time_s", now)),
             }
         )
@@ -370,10 +375,12 @@ def _handle_active(
         if not finish_metric:
             finish_metric = _compute_finish_metric_from_memory(context, memory)
             finish_debug = copy.deepcopy(finish_metric.get("debug", {}))
+            locked_lane_change_time = float(memory.get("locked_lane_change_time_s", CFG["lane_change_time_s"]))
             finish_debug.update(
                 {
                     "finish_metric_eval_phase": "completion_fallback",
-                    "finish_metric_eval_time_s": _metric_eval_time_s(),
+                    "finish_metric_eval_time_s": _metric_eval_time_s(locked_lane_change_time),
+                    "finish_metric_lane_change_time_s": float(locked_lane_change_time),
                     "finish_metric_eval_actual_elapsed_s": float(now) - float(memory.get("active_start_time_s", now)),
                 }
             )
@@ -472,8 +479,10 @@ def _enter_active_mode(
     source_line: ReferenceLineView = scene["source_line"]
     memory["mode"] = "ACTIVE"
     memory["active_start_time_s"] = float(now)
-    memory["active_end_time_s"] = float(now) + float(CFG["lane_change_time_s"])
-    memory["active_metric_eval_time_s"] = float(now) + _metric_eval_time_s()
+    lane_change_time = float(active_solution["t"])
+    memory["active_end_time_s"] = float(now) + lane_change_time
+    memory["active_metric_eval_time_s"] = float(now) + _metric_eval_time_s(lane_change_time)
+    memory["locked_lane_change_time_s"] = lane_change_time
     memory["metric_eval_recorded"] = False
     memory["locked_target_line_index"] = int(target_line.line_index)
     memory["locked_target_lane_id"] = str(target_line.lane_id)
@@ -518,6 +527,7 @@ def _reset_execute_memory(memory: dict[str, Any]) -> None:
     memory["active_start_time_s"] = -1.0
     memory["active_end_time_s"] = -1.0
     memory["active_metric_eval_time_s"] = -1.0
+    memory["locked_lane_change_time_s"] = -1.0
     memory["metric_eval_recorded"] = False
     memory["locked_target_line_index"] = None
     memory["locked_target_lane_id"] = ""
@@ -588,8 +598,6 @@ def _build_cutout_scene(
         return _scene_failure("not_same_source_lane", geometry)
     if not bool(geometry["ordering_ok"]):
         return _scene_failure("invalid_cutout_order", geometry)
-    if float(geometry["vut_to_gvt_gap_m"]) < float(CFG["min_vut_to_gvt_gap_m"]):
-        return _scene_failure("vut_too_close_to_gvt", geometry)
     if float(geometry["gvt_to_exposed_gap_m"]) < float(CFG["source_abort_gap_m"]):
         return _scene_failure("gvt_too_close_to_exposed", geometry)
 
@@ -969,7 +977,8 @@ def _evaluate_cutout_trigger(context: SceneContext, scene: dict[str, Any]) -> di
     best_candidate = None
     best_cost = float("inf")
     first_metric = None
-    metric_eval_time = _metric_eval_time_s()
+    lane_change_time = _dynamic_lane_change_time_s(context, scene["limits"])
+    metric_eval_time = _metric_eval_time_s(lane_change_time)
     for hold_t in CFG["hold_t_grid"]:
         total_t = float(hold_t) + float(metric_eval_time)
         metric = _compute_vut_exposed_metric_from_base(metric_base, total_t)
@@ -1019,6 +1028,7 @@ def _evaluate_cutout_trigger(context: SceneContext, scene: dict[str, Any]) -> di
         "trigger_target_metric_s": float(target_metric),
         "trigger_tolerance_s": float(tolerance),
         "trigger_hard_min_s": float(hard_min),
+        "trigger_lane_change_time_s": float(lane_change_time),
         "trigger_metric_eval_time_s": float(metric_eval_time),
         "trigger_activation_ready": bool(activation_ready),
         "trigger_late_abort": bool(late_abort),
@@ -1045,6 +1055,8 @@ def _evaluate_cutout_trigger(context: SceneContext, scene: dict[str, Any]) -> di
         "metric_value": float("inf") if best_candidate is None else float(best_candidate["metric_value"]),
         "hold_t": float("inf") if best_candidate is None else float(best_candidate["hold_t"]),
         "total_t": float("inf") if best_candidate is None else float(best_candidate["total_t"]),
+        "lane_change_time_s": float(lane_change_time),
+        "metric_eval_time_s": float(metric_eval_time),
         "debug": debug,
     }
 
@@ -1269,6 +1281,7 @@ def _evaluate_cutout_safety(context: SceneContext, scene: dict[str, Any]) -> dic
     target_lane_check = scene["target_lane_check"]
     source_gap_ok = bool(float(geometry["gvt_to_exposed_gap_m"]) >= float(CFG["min_gvt_to_exposed_gap_m"]))
     target_lane_ok = bool(target_lane_check["ok"])
+    lane_change_time = _dynamic_lane_change_time_s(context, scene["limits"])
     release_check = _check_pre_active_source_clearance(context, scene)
     output_feasible = _build_active_solution(
         context,
@@ -1278,7 +1291,8 @@ def _evaluate_cutout_safety(context: SceneContext, scene: dict[str, Any]) -> dic
             "metric_value": float("inf"),
             "target_metric": float("inf"),
             "hold_t": 0.0,
-            "total_t": _metric_eval_time_s(),
+            "total_t": _metric_eval_time_s(lane_change_time),
+            "lane_change_time_s": float(lane_change_time),
         },
         debug={},
         dry_run=True,
@@ -1316,7 +1330,8 @@ def _check_pre_active_source_clearance(context: SceneContext, scene: dict[str, A
             },
         }
 
-    release_t = _compute_source_release_time_s()
+    lane_change_time = _dynamic_lane_change_time_s(context, scene["limits"])
+    release_t = _compute_source_release_time_s(lane_change_time)
     closing_speed = max(0.0, float(ego.v) - max(0.0, float(exposed.v)))
     predicted_min_gap = float(gap_now) - float(closing_speed) * float(release_t)
     min_gap = float(CFG["source_abort_gap_m"])
@@ -1325,6 +1340,7 @@ def _check_pre_active_source_clearance(context: SceneContext, scene: dict[str, A
         "ok": bool(ok),
         "debug": {
             "safety_source_release_ok": bool(ok),
+            "safety_lane_change_time_s": float(lane_change_time),
             "safety_source_release_time_s": float(release_t),
             "safety_source_release_gap_now_m": float(gap_now),
             "safety_source_release_predicted_min_gap_m": float(predicted_min_gap),
@@ -1335,21 +1351,46 @@ def _check_pre_active_source_clearance(context: SceneContext, scene: dict[str, A
     }
 
 
-def _compute_source_release_time_s() -> float:
-    """按固定换道时间估算 GVT 基本脱离源车道追尾风险区的时间。"""
+def _scene_cruise_target_v(context: SceneContext, limits: VehicleLimits) -> float:
+    """返回场景巡航速度上限，优先跟随 VUT 主车当前速度。"""
 
+    main = context.main_vehicle
+    if main is None:
+        return _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
+    return _clamp(float(main.v), 0.0, limits.max_v)
+
+
+def _dynamic_lane_change_time_s(context: SceneContext, limits: VehicleLimits) -> float:
+    """按场景巡航速度计算本帧换道时间，低速长、高速短。"""
+
+    cruise_v = _scene_cruise_target_v(context, limits)
+    low_speed = float(CFG["lane_change_time_low_speed_mps"])
+    high_speed = float(CFG["lane_change_time_high_speed_mps"])
+    low_time = max(float(CFG["lane_change_time_s"]), float(CFG["lane_change_time_min_s"]))
+    high_time = min(float(CFG["lane_change_time_s"]), float(CFG["lane_change_time_min_s"]))
+    if high_speed <= low_speed + 1e-6:
+        return high_time if cruise_v >= high_speed else low_time
+    ratio = _clamp((float(cruise_v) - low_speed) / (high_speed - low_speed), 0.0, 1.0)
+    return low_time + ratio * (high_time - low_time)
+
+
+def _compute_source_release_time_s(lane_change_time_s: float | None = None) -> float:
+    """按换道时间估算 GVT 基本脱离源车道追尾风险区的时间。"""
+
+    lane_change_time = float(CFG["lane_change_time_s"] if lane_change_time_s is None else lane_change_time_s)
     release_t = min(
-        float(CFG["lane_change_time_s"]) * float(CFG["source_release_time_ratio"]),
+        lane_change_time * float(CFG["source_release_time_ratio"]),
         float(CFG["source_release_time_max_s"]),
     )
     return max(float(CFG["source_release_time_min_s"]), float(release_t))
 
 
-def _metric_eval_time_s() -> float:
+def _metric_eval_time_s(lane_change_time_s: float | None = None) -> float:
     """返回 ACTIVE 开始后 VUT->暴露目标指标的评估时刻。"""
 
     ratio = max(0.0, min(float(CFG["metric_eval_time_ratio"]), 1.0))
-    return float(CFG["lane_change_time_s"]) * float(ratio)
+    lane_change_time = float(CFG["lane_change_time_s"] if lane_change_time_s is None else lane_change_time_s)
+    return lane_change_time * float(ratio)
 
 
 def _compute_finish_metric(context: SceneContext, scene: dict[str, Any]) -> dict[str, Any]:
@@ -1510,19 +1551,17 @@ def _build_active_solution(
     debug: dict[str, Any],
     dry_run: bool = False,
 ) -> dict[str, Any] | None:
-    """根据当前 GVT 状态和目标车道生成固定时长切出终端点。"""
-
-    del trigger
+    """根据当前 GVT 状态和目标车道生成本次切出的锁定终端点。"""
 
     target_line: ReferenceLineView = scene["target_line"]
     limits: VehicleLimits = scene["limits"]
-    plan_t = float(CFG["lane_change_time_s"])
+    plan_t = float(trigger.get("lane_change_time_s", _dynamic_lane_change_time_s(context, limits)))
     ego = context.ego_vehicle
     _, ego_s_on_target, ego_d_on_target = project_point_to_path(np.array([ego.x, ego.y], dtype=float), target_line.line)
     if abs(float(ego_d_on_target)) > float(CFG["max_ego_to_target_line_d_m"]):
         return None
 
-    target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
+    target_v = _scene_cruise_target_v(context, limits)
     target_a = _clamp((target_v - float(ego.v)) / max(plan_t, 1e-3), limits.min_acc, limits.max_acc)
     travel_s = max(float(CFG["min_target_progress_m"]), 0.5 * (float(ego.v) + target_v) * plan_t)
     target_s = float(ego_s_on_target) + float(travel_s)
@@ -1780,10 +1819,14 @@ def _compute_prepare_target_v(
 
     gap = float(geometry.get("gvt_to_exposed_gap_m", float("inf")))
     exposed_v = max(0.0, float(exposed.v))
+    lane_change_time = _dynamic_lane_change_time_s(context, limits)
+    prepare_cruise_v = _scene_cruise_target_v(context, limits)
     if not np.isfinite(gap):
-        target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
+        target_v = _clamp(float(prepare_cruise_v), 0.0, limits.max_v)
         return target_v, {
             "prepare_speed_reason": "invalid_gap",
+            "prepare_cruise_v_mps": float(prepare_cruise_v),
+            "prepare_lane_change_time_s": float(lane_change_time),
             "prepare_speed_wait_t_s": float("inf"),
             "prepare_speed_horizon_s": float(CFG["prepare_plan_t_s"]),
             "prepare_allowed_closing_mps": float("inf"),
@@ -1792,6 +1835,8 @@ def _compute_prepare_target_v(
     if gap <= float(CFG["source_abort_gap_m"]):
         return 0.0, {
             "prepare_speed_reason": "source_abort_gap",
+            "prepare_cruise_v_mps": float(prepare_cruise_v),
+            "prepare_lane_change_time_s": float(lane_change_time),
             "prepare_speed_wait_t_s": 0.0,
             "prepare_speed_horizon_s": float(CFG["prepare_plan_t_s"]),
             "prepare_allowed_closing_mps": 0.0,
@@ -1800,7 +1845,7 @@ def _compute_prepare_target_v(
     wait_t = _extract_trigger_hold_t_s(trigger)
     if np.isfinite(wait_t):
         wait_buffer = float(CFG["prepare_wait_time_buffer_s"])
-        release_t = _compute_source_release_time_s()
+        release_t = _compute_source_release_time_s(lane_change_time)
         activation_horizon = max(float(CFG["prepare_plan_t_s"]), float(wait_t) + wait_buffer)
         release_horizon = max(float(CFG["prepare_plan_t_s"]), float(wait_t) + release_t + wait_buffer)
         activation_allowed_closing = max(0.0, gap - float(CFG["min_gvt_to_exposed_gap_m"])) / max(activation_horizon, 1e-3)
@@ -1808,15 +1853,17 @@ def _compute_prepare_target_v(
         allowed_closing = min(activation_allowed_closing, release_allowed_closing)
         speed_horizon = max(activation_horizon, release_horizon)
     else:
-        release_t = _compute_source_release_time_s()
+        release_t = _compute_source_release_time_s(lane_change_time)
         speed_horizon = max(float(CFG["prepare_plan_t_s"]), release_t)
         activation_allowed_closing = max(0.0, gap - float(CFG["min_gvt_to_exposed_gap_m"])) / max(speed_horizon, 1e-3)
         release_allowed_closing = max(0.0, gap - float(CFG["source_abort_gap_m"])) / max(speed_horizon, 1e-3)
         allowed_closing = min(activation_allowed_closing, release_allowed_closing)
-    target_v = min(float(CFG["cruise_target_v"]), exposed_v + allowed_closing)
+    target_v = min(float(prepare_cruise_v), exposed_v + allowed_closing)
     target_v = _clamp(target_v, 0.0, limits.max_v)
     return target_v, {
         "prepare_speed_reason": "wait_time_limited" if np.isfinite(wait_t) else "gap_limited",
+        "prepare_cruise_v_mps": float(prepare_cruise_v),
+        "prepare_lane_change_time_s": float(lane_change_time),
         "prepare_speed_wait_t_s": float(wait_t),
         "prepare_speed_horizon_s": float(speed_horizon),
         "prepare_allowed_closing_mps": float(allowed_closing),
