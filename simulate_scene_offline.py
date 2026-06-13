@@ -61,9 +61,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-main-obstacle", action="store_true", help="不向局部规划器注入主车障碍物，用于无障碍基线测试")
     parser.add_argument(
         "--main-motion",
-        choices=["idm", "constant", "static"],
+        choices=["idm", "constant", "static", "scripted_lane_change"],
         default="idm",
-        help="主车运动模式：idm 表示按 IDM 运动，constant 表示按 main-start-speed 匀速沿路线行驶，static 表示静止充当障碍物",
+        help="主车运动模式：idm/constant 沿固定路线，scripted_lane_change 按指定距离触发平滑换道且纵向使用 IDM，static 表示静止障碍物",
+    )
+    parser.add_argument(
+        "--main-lane-change-side",
+        choices=["left", "right"],
+        default="left",
+        help="scripted_lane_change 模式下主车换道方向",
+    )
+    parser.add_argument(
+        "--main-lane-change-start-s",
+        type=float,
+        default=10.0,
+        help="scripted_lane_change 模式下主车从起点沿原车道行驶多少米后开始换道",
+    )
+    parser.add_argument(
+        "--main-lane-change-duration-s",
+        type=float,
+        default=4.0,
+        help="scripted_lane_change 模式下主车换道持续时间，单位 s",
     )
     parser.add_argument("--enable-exposed-obstacle", action="store_true", help="启用 cut-out 暴露目标障碍车")
     parser.add_argument("--exposed-ptc-id", default="exposed", help="离线仿真中暴露目标 ptc_id，默认 exposed")

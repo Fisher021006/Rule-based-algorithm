@@ -122,13 +122,14 @@ def scene_output_to_external_target(
 
     target_metadata = copy.deepcopy(metadata) if metadata is not None else {}
     target_metadata["reason"] = output.reason
+    min_plan_t = max(0.0, float(target_metadata.get("min_external_plan_t_s", 0.5)))
     return ExternalTarget(
         point_xy=np.array([output.x, output.y], dtype=float),
         target_line_index=int(0 if output.target_line_index is None else output.target_line_index),
         target_v=float(output.v),
         target_a=float(output.a),
         target_heading=float(output.theta),
-        plan_T=max(0.5, float(output.t)),
+        plan_T=max(min_plan_t, float(output.t)),
         hold_t=max(0.0, float(output.hold_t)),
         source="scene_algorithm",
         metadata=target_metadata,

@@ -49,6 +49,9 @@ def _build_route_actor(
     static_xy: np.ndarray,
     start_speed: float,
     desired_speed: float,
+    lane_change_side: str = "left",
+    lane_change_start_s: float = 10.0,
+    lane_change_duration_s: float = 4.0,
 ) -> tuple[IDMRouteVehicle, np.ndarray, np.ndarray | None]:
     """按离线仿真参数创建一辆路线/静止障碍车。"""
 
@@ -62,6 +65,9 @@ def _build_route_actor(
             start_speed=0.0,
             desired_speed=0.0,
             motion_mode="static",
+            lane_change_side=lane_change_side,
+            lane_change_start_s=lane_change_start_s,
+            lane_change_duration_s=lane_change_duration_s,
         )
     else:
         actor_start_xy = np.asarray(start_xy, dtype=float)
@@ -76,6 +82,9 @@ def _build_route_actor(
             start_speed=float(start_speed),
             desired_speed=resolved_desired_speed,
             motion_mode=str(motion_mode),
+            lane_change_side=lane_change_side,
+            lane_change_start_s=lane_change_start_s,
+            lane_change_duration_s=lane_change_duration_s,
         )
     actor.ptc_id = str(ptc_id)
     return actor, actor_start_xy, actor_goal_xy
@@ -139,6 +148,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         static_xy=np.asarray(args.main_static_xy, dtype=float),
         start_speed=float(args.main_start_speed),
         desired_speed=float(args.main_desired_speed),
+        lane_change_side=str(getattr(args, "main_lane_change_side", "left")),
+        lane_change_start_s=float(getattr(args, "main_lane_change_start_s", 10.0)),
+        lane_change_duration_s=float(getattr(args, "main_lane_change_duration_s", 4.0)),
     )
     main_lane_extender = _build_route_extender(
         xodr_parser=xodr_parser,
@@ -381,6 +393,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
+            latest_control_mode = (
+                str(provider.history[-1].get("control_mode", ""))
+                if provider.history
+                else ""
+            )
+            if (
+                latest_scene_status == "complete"
+                and latest_control_mode == "emergency_stop"
+                and ego_vehicle.v <= float(args.arrive_speed)
+            ):
+                status = "scene_completed"
+                log_status(
+                    f"[sim] blind-spot scene completed at step {step_index + 1}/{max_steps} "
+                    f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
+                )
+                break
 
             if remain_dist <= float(args.arrive_dist) and ego_vehicle.v <= float(args.arrive_speed):
                 status = "arrived"
@@ -426,6 +454,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         "main_goal_xy": None if main_goal_xy is None else list(map(float, np.asarray(main_goal_xy, dtype=float))),
         "main_static_xy": None if str(args.main_motion) != "static" else list(map(float, args.main_static_xy)),
         "main_motion": str(args.main_motion),
+        "main_lane_change_side": str(getattr(args, "main_lane_change_side", "left")),
+        "main_lane_change_start_s": float(getattr(args, "main_lane_change_start_s", 10.0)),
+        "main_lane_change_duration_s": float(getattr(args, "main_lane_change_duration_s", 4.0)),
         "main_ptc_id": str(getattr(args, "main_ptc_id", "main")),
         "enable_exposed_obstacle": bool(exposed_vehicle is not None),
         "exposed_ptc_id": str(getattr(args, "exposed_ptc_id", "")) if exposed_vehicle is not None else "",

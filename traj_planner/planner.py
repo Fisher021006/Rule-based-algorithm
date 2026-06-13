@@ -232,9 +232,12 @@ class LocalPlanner:
             return None
 
         target_line = context.line_contexts[target_line_index]
+        metadata = dict(getattr(external_target, "metadata", {}) or {})
+        min_target_progress = max(0.0, float(metadata.get("min_external_target_progress_m", 1.0)))
+        min_plan_t = max(0.0, float(metadata.get("min_external_plan_t_s", 0.5)))
         target_xy = np.asarray(external_target.point_xy, dtype=float)
         _, target_s, _ = project_point_to_path(target_xy, target_line.line)
-        target_s = max(float(target_s), float(target_line.current_s) + 1.0)
+        target_s = max(float(target_s), float(target_line.current_s) + min_target_progress)
 
         generator_start = time.perf_counter()
         terminal = TerminalCandidate(
@@ -242,7 +245,7 @@ class LocalPlanner:
             line_id=target_line.line_id,
             target_s=float(target_s),
             target_v=float(external_target.target_v),
-            plan_T=max(0.5, float(external_target.plan_T)),
+            plan_T=max(min_plan_t, float(external_target.plan_T)),
             hold_t=max(0.0, float(external_target.hold_t)),
             template_name="external_target",
         )
