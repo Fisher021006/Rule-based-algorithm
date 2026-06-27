@@ -57,11 +57,12 @@ def persist_simulation_artifacts(
     args: argparse.Namespace,
     xodr_parser: XODRParser,
     ego_trace: list[list[float]],
-    main_trace: list[list[float]],
+    main_trace: list[list[float]] | None,
     provider: "SceneTargetProvider",
     ego_goal_xy: np.ndarray,
     summary: dict[str, Any],
     exposed_trace: list[list[float]] | None = None,
+    show_main_vehicle: bool = True,
 ) -> dict[str, Any]:
     """为一次仿真运行落盘 PNG / GIF / JSON 产物。"""
 
@@ -89,6 +90,7 @@ def persist_simulation_artifacts(
         show=bool(args.show),
         planner_mode=str(args.planner_mode),
         exposed_trace=exposed_trace,
+        show_main_vehicle=show_main_vehicle,
     )
     write_summary_json(output_json, summary)
     write_timing_json(output_timing_json, summary)
@@ -112,6 +114,7 @@ def persist_simulation_artifacts(
             output_gif=output_gif,
             log_every=int(args.log_every),
             exposed_trace=exposed_trace,
+            show_main_vehicle=show_main_vehicle,
         )
         summary["gif_saved"] = True
         summary["gif_skipped"] = False

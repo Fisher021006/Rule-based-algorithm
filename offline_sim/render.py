@@ -46,6 +46,26 @@ if TYPE_CHECKING:
     from planning_runtime.scene.provider import SceneTargetProvider
 
 
+def _scene_main_vehicle(provider: "SceneTargetProvider") -> Any | None:
+    """返回最近一帧算法上下文里的主车；没有上下文或主车时返回 None。"""
+
+    context = getattr(provider, "last_scene_context", None)
+    if context is None:
+        return None
+    return getattr(context, "main_vehicle", None)
+
+
+def _trace_array(trace: Any) -> np.ndarray | None:
+    """把可选轨迹转成二维数组；空轨迹返回 None。"""
+
+    if trace is None:
+        return None
+    arr = np.asarray(trace, dtype=float)
+    if arr.ndim != 2 or len(arr) == 0:
+        return None
+    return arr
+
+
 def _is_interactive_backend() -> bool:
     """判断当前 matplotlib backend 是否支持交互窗口。"""
 
@@ -104,7 +124,7 @@ def draw_vehicle(ax: Any, x: float, y: float, heading: float, length: float, wid
 def _render_single_frame(
     xodr_parser: XODRParser,
     ego_trace: np.ndarray,
-    main_trace: np.ndarray,
+    main_trace: np.ndarray | None,
     provider: "SceneTargetProvider",
     ego_goal_xy: np.ndarray,
     planner_mode: str,
@@ -112,6 +132,7 @@ def _render_single_frame(
     exposed_trace: np.ndarray | None = None,
     planned_trajectory: np.ndarray | None = None,
     status_text: str | None = None,
+    show_main_vehicle: bool = True,
 ) -> Image.Image:
     """渲染输出 GIF 的单帧画面。"""
 
@@ -123,11 +144,19 @@ def _render_single_frame(
             ax.plot(lane[:, 0], lane[:, 1], color="#D0D6DB", linewidth=0.6)
 
     ego_end = min(frame_idx + 1, len(ego_trace))
-    main_end = min(frame_idx + 1, len(main_trace))
+    main_arr = _trace_array(main_trace)
+    main_ctx = _scene_main_vehicle(provider)
+    draw_main = bool(
+        show_main_vehicle
+        and main_arr is not None
+        and (getattr(provider, "last_scene_context", None) is None or main_ctx is not None)
+    )
+    main_end = 0 if not draw_main or main_arr is None else min(frame_idx + 1, len(main_arr))
     exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
     exposed_end = 0 if exposed_arr is None else min(frame_idx + 1, len(exposed_arr))
     ax.plot(ego_trace[:ego_end, 0], ego_trace[:ego_end, 1], color="#D62728", linewidth=2.0, label="ego trajectory")
-    ax.plot(main_trace[:main_end, 0], main_trace[:main_end, 1], color="#111111", linewidth=2.0, label="main trajectory")
+    if draw_main and main_arr is not None and main_end > 0:
+        ax.plot(main_arr[:main_end, 0], main_arr[:main_end, 1], color="#111111", linewidth=2.0, label="main trajectory")
     if exposed_arr is not None and exposed_end > 0:
         ax.plot(exposed_arr[:exposed_end, 0], exposed_arr[:exposed_end, 1], color="#C2185B", linewidth=2.0, label="exposed trajectory")
     if planned_trajectory is not None and len(planned_trajectory) >= 2:
@@ -142,21 +171,22 @@ def _render_single_frame(
         )
     ax.scatter(ego_trace[0, 0], ego_trace[0, 1], color="#D62728", s=30, marker="o", label="ego start")
     ax.scatter(ego_goal_xy[0], ego_goal_xy[1], color="#D62728", s=50, marker="*", label="ego goal")
-    ax.scatter(main_trace[0, 0], main_trace[0, 1], color="#111111", s=30, marker="o", label="main start")
+    if draw_main and main_arr is not None:
+        ax.scatter(main_arr[0, 0], main_arr[0, 1], color="#111111", s=30, marker="o", label="main start")
     if exposed_arr is not None and len(exposed_arr) > 0:
         ax.scatter(exposed_arr[0, 0], exposed_arr[0, 1], color="#C2185B", s=30, marker="o", label="exposed start")
 
     if provider.last_scene_context is not None:
         ego_ctx = provider.last_scene_context.ego_vehicle
-        main_ctx = provider.last_scene_context.main_vehicle
         for line in ego_ctx.candidate_ref_lines:
             style = "-" if line.line_index == 0 else "--"
             color = "#1F77B4" if line.line_index == 0 else "#7FB3D5"
             ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.2)
-        for line in main_ctx.candidate_ref_lines:
-            style = "-" if line.line_index == 0 else "--"
-            color = "#FF7F0E" if line.line_index == 0 else "#F5B041"
-            ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.0)
+        if draw_main and main_ctx is not None:
+            for line in main_ctx.candidate_ref_lines:
+                style = "-" if line.line_index == 0 else "--"
+                color = "#FF7F0E" if line.line_index == 0 else "#F5B041"
+                ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.0)
 
     for marker in provider.history[: min(frame_idx + 1, len(provider.history))]:
         target = marker["target"]
@@ -172,16 +202,17 @@ def _render_single_frame(
         color="#D62728",
         label="ego",
     )
-    draw_vehicle(
-        ax,
-        x=float(main_trace[main_end - 1, 0]),
-        y=float(main_trace[main_end - 1, 1]),
-        heading=float(main_trace[main_end - 1, 2]),
-        length=4.6,
-        width=1.8,
-        color="#111111",
-        label="main",
-    )
+    if draw_main and main_arr is not None and main_end > 0:
+        draw_vehicle(
+            ax,
+            x=float(main_arr[main_end - 1, 0]),
+            y=float(main_arr[main_end - 1, 1]),
+            heading=float(main_arr[main_end - 1, 2]),
+            length=4.6,
+            width=1.8,
+            color="#111111",
+            label="main",
+        )
     if exposed_arr is not None and exposed_end > 0:
         draw_vehicle(
             ax,
@@ -194,7 +225,9 @@ def _render_single_frame(
             label="exposed",
         )
 
-    all_xy_parts = [ego_trace[:, :2], main_trace[:, :2]]
+    all_xy_parts = [ego_trace[:, :2]]
+    if draw_main and main_arr is not None:
+        all_xy_parts.append(main_arr[:, :2])
     if exposed_arr is not None and len(exposed_arr) > 0:
         all_xy_parts.append(exposed_arr[:, :2])
     all_xy = np.vstack(all_xy_parts)
@@ -226,6 +259,7 @@ class LiveSimulationViewer:
         planner_mode: str,
         output_png: Path | None,
         refresh_every: int = 1,
+        show_main_vehicle: bool = True,
     ) -> None:
         self.xodr_parser = xodr_parser
         self.provider = provider
@@ -233,6 +267,7 @@ class LiveSimulationViewer:
         self.planner_mode = planner_mode
         self.output_png = output_png
         self.refresh_every = max(int(refresh_every), 1)
+        self.show_main_vehicle = bool(show_main_vehicle)
         self.figure = None
         self.axis = None
         self.image_artist = None
@@ -255,7 +290,7 @@ class LiveSimulationViewer:
     def update(
         self,
         ego_trace: list[list[float]],
-        main_trace: list[list[float]],
+        main_trace: list[list[float]] | None,
         step_index: int,
         exposed_trace: list[list[float]] | None = None,
         planned_trajectory: list[list[float]] | np.ndarray | None = None,
@@ -268,8 +303,8 @@ class LiveSimulationViewer:
             return
 
         ego_arr = np.asarray(ego_trace, dtype=float)
-        main_arr = np.asarray(main_trace, dtype=float)
-        if len(ego_arr) == 0 or len(main_arr) == 0:
+        main_arr = _trace_array(main_trace)
+        if len(ego_arr) == 0:
             return
         exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
         planned_arr = None if planned_trajectory is None else np.asarray(planned_trajectory, dtype=float)
@@ -284,6 +319,7 @@ class LiveSimulationViewer:
             exposed_trace=exposed_arr,
             planned_trajectory=planned_arr,
             status_text=status_text,
+            show_main_vehicle=self.show_main_vehicle,
         )
         if self.output_png is not None:
             self.output_png.parent.mkdir(parents=True, exist_ok=True)
@@ -317,7 +353,7 @@ class LiveSimulationViewer:
 def save_animation_gif(
     xodr_parser: XODRParser,
     ego_trace: list[list[float]],
-    main_trace: list[list[float]],
+    main_trace: list[list[float]] | None,
     provider: "SceneTargetProvider",
     ego_goal_xy: np.ndarray,
     planner_mode: str,
@@ -325,13 +361,15 @@ def save_animation_gif(
     output_gif: Path,
     log_every: int = 10,
     exposed_trace: list[list[float]] | None = None,
+    show_main_vehicle: bool = True,
 ) -> None:
     """把完整仿真过程保存成 GIF。"""
 
     ego_arr = np.asarray(ego_trace, dtype=float)
-    main_arr = np.asarray(main_trace, dtype=float)
+    main_arr = _trace_array(main_trace)
     exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
-    frame_count = max(len(ego_arr), len(main_arr), 0 if exposed_arr is None else len(exposed_arr))
+    main_count = 0 if main_arr is None or not show_main_vehicle else len(main_arr)
+    frame_count = max(len(ego_arr), main_count, 0 if exposed_arr is None else len(exposed_arr))
     if frame_count == 0:
         raise ValueError("轨迹为空，无法生成 GIF")
 
@@ -350,6 +388,7 @@ def save_animation_gif(
                 planner_mode=planner_mode,
                 frame_idx=frame_idx,
                 exposed_trace=exposed_arr,
+                show_main_vehicle=show_main_vehicle,
             )
         )
     frame_duration_ms = max(int(round(dt * 1000.0)), 50)
@@ -366,13 +405,14 @@ def save_animation_gif(
 def plot_results(
     xodr_parser: XODRParser,
     ego_trace: list[list[float]],
-    main_trace: list[list[float]],
+    main_trace: list[list[float]] | None,
     provider: "SceneTargetProvider",
     ego_goal_xy: np.ndarray,
     output_png: Path,
     show: bool,
     planner_mode: str,
     exposed_trace: list[list[float]] | None = None,
+    show_main_vehicle: bool = True,
 ) -> None:
     """渲染静态 PNG 汇总图。"""
 
@@ -384,29 +424,33 @@ def plot_results(
             ax.plot(lane[:, 0], lane[:, 1], color="#D0D6DB", linewidth=0.6)
 
     ego_arr = np.asarray(ego_trace, dtype=float)
-    main_arr = np.asarray(main_trace, dtype=float)
+    main_arr = _trace_array(main_trace)
+    main_ctx = _scene_main_vehicle(provider)
+    draw_main = bool(show_main_vehicle and main_arr is not None and main_ctx is not None)
     exposed_arr = None if exposed_trace is None else np.asarray(exposed_trace, dtype=float)
     ax.plot(ego_arr[:, 0], ego_arr[:, 1], color="#D62728", linewidth=2.0, label="ego trajectory")
-    ax.plot(main_arr[:, 0], main_arr[:, 1], color="#111111", linewidth=2.0, label="main trajectory")
+    if draw_main and main_arr is not None:
+        ax.plot(main_arr[:, 0], main_arr[:, 1], color="#111111", linewidth=2.0, label="main trajectory")
     if exposed_arr is not None and len(exposed_arr) > 0:
         ax.plot(exposed_arr[:, 0], exposed_arr[:, 1], color="#C2185B", linewidth=2.0, label="exposed trajectory")
     ax.scatter(ego_arr[0, 0], ego_arr[0, 1], color="#D62728", s=30, marker="o", label="ego start")
     ax.scatter(ego_goal_xy[0], ego_goal_xy[1], color="#D62728", s=50, marker="*", label="ego goal")
-    ax.scatter(main_arr[0, 0], main_arr[0, 1], color="#111111", s=30, marker="o", label="main start")
+    if draw_main and main_arr is not None:
+        ax.scatter(main_arr[0, 0], main_arr[0, 1], color="#111111", s=30, marker="o", label="main start")
     if exposed_arr is not None and len(exposed_arr) > 0:
         ax.scatter(exposed_arr[0, 0], exposed_arr[0, 1], color="#C2185B", s=30, marker="o", label="exposed start")
 
     if provider.last_scene_context is not None:
         ego_ctx = provider.last_scene_context.ego_vehicle
-        main_ctx = provider.last_scene_context.main_vehicle
         for line in ego_ctx.candidate_ref_lines:
             style = "-" if line.line_index == 0 else "--"
             color = "#1F77B4" if line.line_index == 0 else "#7FB3D5"
             ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.2)
-        for line in main_ctx.candidate_ref_lines:
-            style = "-" if line.line_index == 0 else "--"
-            color = "#FF7F0E" if line.line_index == 0 else "#F5B041"
-            ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.0)
+        if draw_main and main_ctx is not None:
+            for line in main_ctx.candidate_ref_lines:
+                style = "-" if line.line_index == 0 else "--"
+                color = "#FF7F0E" if line.line_index == 0 else "#F5B041"
+                ax.plot(line.line[:, 0], line.line[:, 1], linestyle=style, color=color, linewidth=1.0)
 
     for item in provider.history:
         target = item["target"]
@@ -422,16 +466,17 @@ def plot_results(
         color="#D62728",
         label="ego",
     )
-    draw_vehicle(
-        ax,
-        x=float(main_arr[-1, 0]),
-        y=float(main_arr[-1, 1]),
-        heading=float(main_arr[-1, 2]),
-        length=4.6,
-        width=1.8,
-        color="#111111",
-        label="main",
-    )
+    if draw_main and main_arr is not None:
+        draw_vehicle(
+            ax,
+            x=float(main_arr[-1, 0]),
+            y=float(main_arr[-1, 1]),
+            heading=float(main_arr[-1, 2]),
+            length=4.6,
+            width=1.8,
+            color="#111111",
+            label="main",
+        )
     if exposed_arr is not None and len(exposed_arr) > 0:
         draw_vehicle(
             ax,
@@ -444,7 +489,9 @@ def plot_results(
             label="exposed",
         )
 
-    all_xy_parts = [ego_arr[:, :2], main_arr[:, :2]]
+    all_xy_parts = [ego_arr[:, :2]]
+    if draw_main and main_arr is not None:
+        all_xy_parts.append(main_arr[:, :2])
     if exposed_arr is not None and len(exposed_arr) > 0:
         all_xy_parts.append(exposed_arr[:, :2])
     all_xy = np.vstack(all_xy_parts)

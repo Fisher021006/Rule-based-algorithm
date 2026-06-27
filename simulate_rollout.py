@@ -382,17 +382,50 @@ def infer_turnlight(trajectory):
     return 0
 
 
-def trajectory_to_control_cmd(gvt, trajectory):
+def trajectory_to_control_cmd(gvt, trajectory, segment_dt=0.1):
     traj = np.asarray(trajectory, dtype=float)
-    preview_idx = min(5, len(traj) - 1)
-    preview = traj[preview_idx]
+    if traj.ndim != 2 or len(traj) < 2:
+        return {
+            "acceleration": 0.0,
+            "wheel_angle": 0.0,
+            "gear": 4,
+            "turnlight": 0,
+            "brkreq": 1,
+            "target_speed": 0.0,
+        }
+
+    current = traj[0]
+    base_dt = max(float(segment_dt), 1e-3)
+    max_segment_index = min(5, len(traj) - 1)
+    target_index = max_segment_index
+    min_command_speed = 0.1 / 3.6
+    for candidate_index in range(1, max_segment_index + 1):
+        candidate = traj[candidate_index]
+        candidate_dt = candidate_index * base_dt
+        candidate_ds = float(np.hypot(candidate[0] - current[0], candidate[1] - current[1]))
+        candidate_speed = candidate_ds / max(candidate_dt, 1e-3)
+        if candidate_speed >= min_command_speed:
+            target_index = candidate_index
+            break
+
+    next_point = traj[target_index]
+    dt = max(float(target_index) * base_dt, 1e-3)
+    dx = float(next_point[0] - current[0])
+    dy = float(next_point[1] - current[1])
+    ds = float(np.hypot(dx, dy))
+    heading_delta = float((next_point[2] - current[2] + np.pi) % (2 * np.pi) - np.pi)
+    target_speed = float(max(ds / dt, 0.0))
+    kappa_cmd = heading_delta / max(ds, 1e-3)
 
     acceleration = float(
-        np.clip(preview[4], gvt.config["constrain"]["min_acc"], gvt.config["constrain"]["max_acc"])
+        np.clip(
+            (target_speed - float(current[3])) / dt,
+            gvt.config["constrain"]["min_acc"],
+            gvt.config["constrain"]["max_acc"],
+        )
     )
-    wheel_angle_rad = float(np.arctan(gvt.wheelbase * preview[5]))
+    wheel_angle_rad = float(np.arctan(gvt.wheelbase * kappa_cmd))
     wheel_angle_deg = float(np.degrees(wheel_angle_rad))
-    target_speed = float(max(preview[3], 0.0))
     brkreq = 1 if target_speed < 0.05 and acceleration <= 0.0 else 0
 
     return {
@@ -487,7 +520,7 @@ def rollout(
             break
 
         traj = np.asarray(trajectory, dtype=float)
-        command = trajectory_to_control_cmd(gvt, traj)
+        command = trajectory_to_control_cmd(gvt, traj, segment_dt=replan_dt)
         command.update(
             {
                 "step": step_idx,

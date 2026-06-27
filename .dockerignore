@@ -1,0 +1,13 @@
+# Git 元数据不需要进入 Docker 构建上下文。
+.git
+
+# 本地 Python 虚拟环境和缓存会拖慢构建，也可能带入宿主机依赖。
+.venv
+__pycache__
+**/__pycache__
+.cache
+.mplcache
+
+# 仿真输出和临时文件不参与镜像构建。
+outputs
+tmp

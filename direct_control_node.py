@@ -9,6 +9,7 @@
 """
 
 import argparse
+import json
 from dataclasses import dataclass
 import importlib
 import os
@@ -106,7 +107,12 @@ def resolve_ros_types():
         "ROS_OBU_MSG",
         ["common_msgs.msg.obupants", "obupants.msg.obupants", "vehicle_msgs.msg.obupants"],
     )
-    return rospy, control_msg_cls, gps_msg_cls, actuator_msg_cls, obu_msg_cls
+    trajectory_msg_cls = resolve_message_type(
+        "ROS_TRAJECTORY_MSG",
+        ["std_msgs.msg.String"],
+        "planned trajectory",
+    )
+    return rospy, control_msg_cls, gps_msg_cls, actuator_msg_cls, obu_msg_cls, trajectory_msg_cls
 
 
 def build_arg_parser():
@@ -145,6 +151,11 @@ def build_arg_parser():
         dest="controlcmd_topic",
         default=_get_env("ROS_CONTROLCMD_TOPIC", "ROS_CONTROL_TOPIC", default="/controlcmd"),
         help="控车指令话题",
+    )
+    parser.add_argument(
+        "--trajectory-topic",
+        default=_get_env("ROS_TRAJECTORY_TOPIC", default="/planning/trajectory"),
+        help="规划轨迹话题；本地平台推演用 std_msgs/String(JSON) 发布完整轨迹",
     )
     parser.add_argument("--node-name", default=_get_env("ROS_NODE_NAME", default="direct_control_node"))
 
@@ -299,7 +310,14 @@ class ObstacleState:
 class DirectControlNode:
     def __init__(self, args):
         self.args = args
-        self.rospy, self.ControlCmdMsg, self.SensorGpsMsg, self.ActuatorMsg, self.ObuMsg = resolve_ros_types()
+        (
+            self.rospy,
+            self.ControlCmdMsg,
+            self.SensorGpsMsg,
+            self.ActuatorMsg,
+            self.ObuMsg,
+            self.TrajectoryMsg,
+        ) = resolve_ros_types()
         self.rospy.init_node(self.args.node_name)
 
         self.xodr_parser, self.cache_path = load_or_build_map(args.map_path, args.cache_path, args.rebuild_cache)
@@ -317,6 +335,7 @@ class DirectControlNode:
         self.latest_obstacles = {}
         self.latest_command = self.build_hold_command()
         self._last_valid_plan_ts = 0.0
+        self._last_plan_failure_log_ts = 0.0
 
         self.goal_xy = parse_point_args("goal", args.goal_xy, args.goal_latlon, self.transformer_to_proj)
         self.start_xy = None
@@ -343,6 +362,9 @@ class DirectControlNode:
         self.gvt.config["local_fsm"]["arrive_complete_speed"] = float(self.args.arrive_speed)
 
         self.control_pub = self.rospy.Publisher(args.controlcmd_topic, self.ControlCmdMsg, queue_size=10)
+        self.trajectory_pub = None
+        if self.args.trajectory_topic:
+            self.trajectory_pub = self.rospy.Publisher(args.trajectory_topic, self.TrajectoryMsg, queue_size=10)
         self.rospy.Subscriber(args.sensorgps_topic, self.SensorGpsMsg, self._gps_callback, queue_size=50)
         self.rospy.Subscriber(args.actuator_topic, self.ActuatorMsg, self._actuator_callback, queue_size=50)
         if self.ObuMsg is not None and self.args.obu_topic:
@@ -551,6 +573,7 @@ class DirectControlNode:
             "y": float(y),
             "heading": float(heading),
             "speed": float(gps["speed"]),
+            "acc": float(gps["accx"]),
             "timestamp": int(gps["timestamp"]),
         }
 
@@ -582,6 +605,7 @@ class DirectControlNode:
         self.gvt.y = pose["y"]
         self.gvt.heading = pose["heading"]
         self.gvt.v = pose["speed"]
+        self.gvt.a = pose["acc"]
         return True
 
     def build_obstacle_list(self):
@@ -629,11 +653,34 @@ class DirectControlNode:
 
     def trajectory_to_control_cmd(self, trajectory):
         traj = np.asarray(trajectory, dtype=float)
-        preview_idx = min(5, len(traj) - 1)
-        preview = traj[preview_idx]
+        if traj.ndim != 2 or len(traj) < 2:
+            return self.build_hold_command()
 
-        speed_kph = float(np.clip(max(preview[3], 0.0) * 3.6, 0.0, self.args.max_speed_kph))
-        wheel_angle_rad = float(np.arctan(self.gvt.wheelbase * preview[5]))
+        current = traj[0]
+        plan_hz = max(float(self.args.plan_hz), 1e-3)
+        max_segment_index = min(5, len(traj) - 1)
+        target_index = max_segment_index
+        min_command_speed_mps = 0.1 / 3.6
+        for candidate_index in range(1, max_segment_index + 1):
+            candidate = traj[candidate_index]
+            candidate_dt = candidate_index / plan_hz
+            candidate_ds = float(np.hypot(candidate[0] - current[0], candidate[1] - current[1]))
+            candidate_speed = candidate_ds / max(candidate_dt, 1e-3)
+            if candidate_speed >= min_command_speed_mps:
+                target_index = candidate_index
+                break
+
+        next_point = traj[target_index]
+        segment_dt = target_index / plan_hz
+        dx = float(next_point[0] - current[0])
+        dy = float(next_point[1] - current[1])
+        ds = float(np.hypot(dx, dy))
+        heading_delta = float((next_point[2] - current[2] + np.pi) % (2 * np.pi) - np.pi)
+        speed_mps = ds / segment_dt
+        kappa_cmd = heading_delta / max(ds, 1e-3)
+
+        speed_kph = float(np.clip(max(speed_mps, 0.0) * 3.6, 0.0, self.args.max_speed_kph))
+        wheel_angle_rad = float(np.arctan(self.gvt.wheelbase * kappa_cmd))
         wheel_angle_deg = float(np.clip(np.degrees(wheel_angle_rad), -26.0, 26.0))
         brkreq = 1 if speed_kph < 0.1 else 0
 
@@ -645,6 +692,34 @@ class DirectControlNode:
             "turnlight": self.infer_turnlight(traj),
             "brkreq": brkreq,
         }
+
+    def publish_planned_trajectory(self, trajectory, command=None):
+        """发布完整规划轨迹，供本地平台推演的轨迹一致车辆模型使用。"""
+
+        if self.trajectory_pub is None:
+            return
+        traj = np.asarray(trajectory, dtype=float)
+        if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[1] < 6:
+            return
+
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "frame": "map",
+            "point_fields": ["x", "y", "heading", "v", "a", "kappa"],
+            "points": traj[:, :6].tolist(),
+        }
+        if command is not None:
+            payload["control_command"] = {
+                "timestamp": int(command["timestamp"]),
+                "speed_kph": float(command["speed_kph"]),
+                "front_wheel_angle_deg": float(command["front_wheel_angle_deg"]),
+                "gear": int(command["gear"]),
+                "turnlight": int(command["turnlight"]),
+                "brkreq": int(command["brkreq"]),
+            }
+        msg = self.TrajectoryMsg()
+        msg.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self.trajectory_pub.publish(msg)
 
     def is_arrived(self):
         if self.gvt.x is None or self.gvt.y is None:
@@ -694,6 +769,23 @@ class DirectControlNode:
                     print("✅ 状态机判定已到达终点，切换为安全停车命令。")
                     time.sleep(interval)
                     continue
+                if start_time - self._last_plan_failure_log_ts >= 1.0:
+                    attr = self.gvt.traj_planner.attribute
+                    obstacle_ids = ",".join(str(getattr(obstacle, "ptc_id", "")) for obstacle in obstacles[:8])
+                    if len(obstacles) > 8:
+                        obstacle_ids = f"{obstacle_ids},..."
+                    print(
+                        "⚠ 规划未输出轨迹："
+                        f"obstacle_count={len(obstacles)} "
+                        f"obstacle_ids=[{obstacle_ids or '-'}] "
+                        f"plan_mode={attr.get('plan_mode', '')} "
+                        f"candidate_count={attr.get('candidate_count', '')} "
+                        f"feasible_candidate_count={attr.get('feasible_candidate_count', '')} "
+                        f"failure_reason={attr.get('failure_reason', '')} "
+                        f"decision_reason={attr.get('reason', '')}",
+                        flush=True,
+                    )
+                    self._last_plan_failure_log_ts = start_time
                 if self._last_valid_plan_ts > 0.0:
                     time_since_last_valid = time.time() - self._last_valid_plan_ts
                     if time_since_last_valid < PLANNING_FAILURE_GRACE_S:
@@ -705,6 +797,7 @@ class DirectControlNode:
                 continue
 
             command = self.trajectory_to_control_cmd(trajectory)
+            self.publish_planned_trajectory(trajectory, command)
             with self.command_lock:
                 self.latest_command = command
             self._last_valid_plan_ts = time.time()

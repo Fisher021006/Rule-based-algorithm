@@ -1,0 +1,54 @@
+# 真实平台 Redis 与设备信息。
+# 这些值来自平台“编辑设备”页面和平台工程师给出的 Redis 连接信息。
+platform:
+  redis_host: 192.168.177.163
+  redis_port: 5010
+  redis_db: 0
+  redis_password: "Wanji@300552!"
+  device_id: 3710
+  device_name: lxy
+  control_channel: control0621channel
+  data_channel_hint: data0621channel
+  status_channel: STATUSResult
+
+adapter:
+  # 真实平台推演模式：监听平台 Redis，收到任务开始后启动 ROS 算法，并把虚拟主车轨迹回传平台。
+  mode: virtual_simulation
+  heartbeat_hz: 1
+  # 与离线仿真器保持一致：每次规划后执行轨迹中的第 1 个未来点。
+  trajectory_advance_index: 1
+  duration_s: 0
+  log_dir: /workspace/direct_control_bundle/platform_integration/logs/platform_redis_ros_adapter
+
+# 平台回传车辆的显示信息。
+# 当前默认用设备 ID 作为平台车辆 ID，避免手工维护两套编号。
+vehicle:
+  id_from_device_id: true
+  name: lxy
+  length_cm: 464
+  width_cm: 178
+  height_cm: 150
+
+# Adapter 向算法发布/订阅的 ROS topic 和地图缓存配置。
+# `map_path` 必须与平台场景使用的地图一致，否则起终点投影和平台显示会偏移。
+ros:
+  map_path: xodr_parser/data/同济测试场.xodr
+  adapter_cache_path: /tmp/platform_adapter_xodr_cache.pkl
+  direct_cache_path: /tmp/platform_direct_xodr_cache.pkl
+  rebuild_cache: false
+  sensorgps_topic: /sensorgps
+  actuator_topic: /actuator
+  controlcmd_topic: /controlcmd
+  trajectory_topic: /planning/trajectory
+  obu_topic: /obu/source
+
+# direct_control_node.py 的算法启动参数。
+# A-B 自由行驶先用 local_sampling；后续接场景算法时再切到 scene_target 并配置 symbol。
+direct_control:
+  planner_mode: local_sampling
+  scene_algorithm_symbol: ""
+  scene_main_ptc_id: ""
+  scene_exposed_ptc_id: ""
+  plan_hz: 10
+  control_hz: 20
+  max_speed_kph: 25

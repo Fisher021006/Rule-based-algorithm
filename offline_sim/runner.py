@@ -190,6 +190,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     live_output_png = output_dir / f"{args.output_prefix}.live.png" if bool(args.live_show) else None
+    show_main_vehicle = not bool(args.disable_main_obstacle)
     viewer = LiveSimulationViewer(
         xodr_parser=xodr_parser,
         provider=provider,
@@ -197,6 +198,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         planner_mode=str(args.planner_mode),
         output_png=live_output_png,
         refresh_every=int(args.live_refresh_every),
+        show_main_vehicle=show_main_vehicle,
     )
     if live_output_png is not None:
         log_status(f"[render] live view enabled -> {live_output_png}")
@@ -362,8 +364,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                 status_text=(
                     f"step {step_index + 1}/{max_steps}  "
                     f"remain={remain_dist:.2f}m  "
-                    f"ego_v={ego_vehicle.v:.2f}m/s  "
-                    f"main_v={main_vehicle.v:.2f}m/s"
+                    f"ego_v={ego_vehicle.v:.2f}m/s"
+                    + (f"  main_v={main_vehicle.v:.2f}m/s" if show_main_vehicle else "")
                 ),
             )
 
@@ -465,6 +467,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         "exposed_static_xy": None if exposed_vehicle is None or str(getattr(args, "exposed_motion", "")) != "static" else list(map(float, args.exposed_static_xy)),
         "exposed_motion": "" if exposed_vehicle is None else str(getattr(args, "exposed_motion", "")),
         "disable_main_obstacle": bool(args.disable_main_obstacle),
+        "main_visualization_enabled": bool(show_main_vehicle),
         "max_steps": max_steps,
         "completed_steps": max(len(ego_trace) - 1, 0),
         "elapsed_wall_time_s": round(time.perf_counter() - wall_start, 3),
@@ -488,6 +491,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             ego_goal_xy=ego_goal_xy,
             summary=summary,
             exposed_trace=exposed_trace if exposed_vehicle is not None else None,
+            show_main_vehicle=show_main_vehicle,
         )
     finally:
         viewer.close(block=False)
