@@ -47,6 +47,7 @@ class PlanningFrame:
     refer_line_lane_ids: list[str]
     refer_line_lane_sequences: list[list[str]]
     refer_line_lateral_steps: list[int]
+    refer_line_first_lane_remaining_lengths: list[float]
     current_road_id: str | None
     planned_path: list[str]
     planned_actions: list[dict]
@@ -70,17 +71,23 @@ def refresh_ego_refer_lines(ego_vehicle: "GVT") -> None:
         refreshed_lines = []
         refreshed_lane_sequences = []
         refreshed_lane_ids = []
-        for line, lane_seq in zip(result.extended_centerlines, result.extended_lane_ids):
+        refreshed_first_lane_remaining_lengths = []
+        for idx, (line, lane_seq) in enumerate(zip(result.extended_centerlines, result.extended_lane_ids)):
             if line is None or len(line) <= 1:
                 continue
             refreshed_lines.append(line)
             refreshed_lane_sequences.append(list(lane_seq))
             refreshed_lane_ids.append(lane_seq[0] if lane_seq else "")
+            if idx < len(result.first_lane_remaining_lengths):
+                refreshed_first_lane_remaining_lengths.append(float(result.first_lane_remaining_lengths[idx]))
+            else:
+                refreshed_first_lane_remaining_lengths.append(0.0)
         if refreshed_lines:
             ego_vehicle.refer_lines = refreshed_lines
             ego_vehicle.refer_line_lane_sequences = refreshed_lane_sequences
             ego_vehicle.refer_line_lane_ids = refreshed_lane_ids
             ego_vehicle.refer_line_lateral_steps = ego_vehicle._compute_lateral_steps(ego_vehicle.refer_line_lane_ids)
+            ego_vehicle.refer_line_first_lane_remaining_lengths = refreshed_first_lane_remaining_lengths
             ego_vehicle.current_road_id = result.query_road_id
 
     if not ego_vehicle.refer_lines:
@@ -150,6 +157,7 @@ def build_planning_frame(
         refer_line_lane_ids=list(ego_vehicle.refer_line_lane_ids),
         refer_line_lane_sequences=[list(seq) for seq in ego_vehicle.refer_line_lane_sequences],
         refer_line_lateral_steps=list(ego_vehicle.refer_line_lateral_steps),
+        refer_line_first_lane_remaining_lengths=list(ego_vehicle.refer_line_first_lane_remaining_lengths),
         current_road_id=ego_vehicle.current_road_id,
         planned_path=list(ego_vehicle.lanePlanner.planner.planned_path),
         planned_actions=list(ego_vehicle.lanePlanner.planner.planned_actions),
@@ -173,6 +181,7 @@ def build_planning_input_from_frame(
         refer_line_lane_ids=list(planning_frame.refer_line_lane_ids),
         refer_line_lane_sequences=[list(seq) for seq in planning_frame.refer_line_lane_sequences],
         refer_line_lateral_steps=list(planning_frame.refer_line_lateral_steps),
+        refer_line_first_lane_remaining_lengths=list(planning_frame.refer_line_first_lane_remaining_lengths),
         current_road_id=planning_frame.current_road_id,
         planned_path=list(planning_frame.planned_path),
         planned_actions=list(planning_frame.planned_actions),

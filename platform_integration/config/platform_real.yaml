@@ -45,8 +45,8 @@ ros:
 # direct_control_node.py 的算法启动参数。
 # A-B 自由行驶先用 local_sampling；后续接场景算法时再切到 scene_target 并配置 symbol。
 direct_control:
-  planner_mode: local_sampling
-  scene_algorithm_symbol: ""
+  planner_mode: scene_target
+  scene_algorithm_symbol: scenarios.blind_spot_algorithm.blind_spot_algorithm
   scene_main_ptc_id: ""
   scene_exposed_ptc_id: ""
   plan_hz: 10

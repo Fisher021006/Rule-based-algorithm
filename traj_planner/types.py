@@ -133,6 +133,7 @@ class LineContext:
     current_s: float
     current_d: float
     remaining_length: float
+    first_lane_remaining_length: float
     front_obstacle: Optional[ProjectedObstacle] = None
     rear_obstacle: Optional[ProjectedObstacle] = None
 
@@ -157,6 +158,10 @@ class RouteIntent:
     deadline_margin_m: float
     distance_to_goal: float
     current_road_planned_lanes: list[str] = field(default_factory=list)
+    route_lookahead_required: bool = False
+    route_lookahead_reason: str = ""
+    current_route_progress_index: int = -1
+    target_route_progress_index: int = -1
 
 
 @dataclass
@@ -181,6 +186,7 @@ class PlanningInput:
     refer_line_lane_ids: list[str]
     refer_line_lane_sequences: list[list[str]]
     refer_line_lateral_steps: list[int]
+    refer_line_first_lane_remaining_lengths: list[float]
     current_road_id: Optional[str]
     planned_path: list[str]
     planned_actions: list[dict]

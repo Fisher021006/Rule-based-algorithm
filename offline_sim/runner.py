@@ -39,6 +39,24 @@ def install_interrupt_handlers() -> None:
         signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
 
+def _normalise_max_steps(raw_value: Any) -> int | None:
+    """把 CLI 最大步数转换成内部语义；None 表示不限制步数。"""
+
+    if raw_value is None:
+        return None
+    value = int(raw_value)
+    return value if value > 0 else None
+
+
+def _format_step_label(step_index: int, max_steps: int | None) -> str:
+    """生成日志里的 step 标签。"""
+
+    current_step = step_index + 1
+    if max_steps is None:
+        return str(current_step)
+    return f"{current_step}/{max_steps}"
+
+
 def _build_route_actor(
     *,
     xodr_parser: XODRParser,
@@ -116,12 +134,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
 
     install_interrupt_handlers()
     wall_start = time.perf_counter()
-    max_steps = int(args.max_steps)
+    max_steps = _normalise_max_steps(getattr(args, "max_steps", None))
+    step_limit_label = str(max_steps) if max_steps is not None else "no-limit"
     log_every = max(int(args.log_every), 1)
     log_status(
         f"[sim] start planner_mode={args.planner_mode} scene_algorithm={getattr(args, 'scene_algorithm_symbol', '-')} "
         f"main_motion={args.main_motion} exposed_enabled={bool(getattr(args, 'enable_exposed_obstacle', False))} "
-        f"max_steps={max_steps} dt={float(args.dt):.2f}s"
+        f"step_limit={step_limit_label} dt={float(args.dt):.2f}s"
     )
     xodr_parser = XODRParser.load_cache(str(args.map_cache))
 
@@ -178,8 +197,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
 
     provider = SceneTargetProvider(
         xodr_parser=xodr_parser,
-        main_vehicle=main_vehicle,
-        main_lane_extender=main_lane_extender,
+        main_vehicle=None if bool(args.disable_main_obstacle) else main_vehicle,
+        main_lane_extender=None if bool(args.disable_main_obstacle) else main_lane_extender,
         dt=float(args.dt),
         max_lane_segments=int(args.ref_lane_count),
         scene_algorithm_symbol=str(getattr(args, "scene_algorithm_symbol", "scenarios.scene_algorithm.scene_algorithm")),
@@ -221,11 +240,17 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         force=True,
     )
     try:
-        for step_index in range(max_steps):
+        step_index = 0
+        while True:
+            if max_steps is not None and step_index >= max_steps:
+                status = "max_steps_reached"
+                log_status(f"[sim] reached explicit max_steps={max_steps}")
+                break
+            step_label = _format_step_label(step_index, max_steps)
             time_s = step_index * float(args.dt)
             provider.set_runtime(step_index=step_index, time_s=time_s)
             log_status(
-                f"[sim] step {step_index + 1}/{max_steps} planning "
+                f"[sim] step {step_label} planning "
                 f"t={time_s:.1f}s ego_v={ego_vehicle.v:.2f} main_v={main_vehicle.v:.2f}"
             )
             step_wall_start = time.perf_counter()
@@ -253,7 +278,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     else "local_sampling_failed"
                 )
                 log_status(
-                    f"[sim] step {step_index + 1}/{max_steps} failed "
+                    f"[sim] step {step_label} failed "
                     f"status={status} reason={failure_reason or '-'}"
                 )
                 local_timing = dict(getattr(ego_vehicle.traj_planner, "last_module_timing_ms", {}) or {})
@@ -362,7 +387,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                 step_index=step_index,
                 planned_trajectory=traj.tolist(),
                 status_text=(
-                    f"step {step_index + 1}/{max_steps}  "
+                    f"step {step_label}  "
                     f"remain={remain_dist:.2f}m  "
                     f"ego_v={ego_vehicle.v:.2f}m/s"
                     + (f"  main_v={main_vehicle.v:.2f}m/s" if show_main_vehicle else "")
@@ -371,7 +396,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
 
             if step_index == 0 or (step_index + 1) % log_every == 0:
                 log_status(
-                    f"[sim] step {step_index + 1}/{max_steps} done "
+                    f"[sim] step {step_label} done "
                     f"remain={remain_dist:.2f}m ego_v={ego_vehicle.v:.2f} "
                     f"wall={time.perf_counter() - step_wall_start:.2f}s"
                 )
@@ -384,14 +409,14 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             if latest_scene_status == "brake_completed_stop":
                 status = "scene_completed"
                 log_status(
-                    f"[sim] scene completed at step {step_index + 1}/{max_steps} "
+                    f"[sim] scene completed at step {step_label} "
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
             if latest_scene_status in {"cutout_success", "cutout_metric_miss", "cutout_hard_metric_fail"}:
                 status = "scene_completed" if latest_scene_status == "cutout_success" else latest_scene_status
                 log_status(
-                    f"[sim] cut-out scene finished at step {step_index + 1}/{max_steps} "
+                    f"[sim] cut-out scene finished at step {step_label} "
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
@@ -407,7 +432,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             ):
                 status = "scene_completed"
                 log_status(
-                    f"[sim] blind-spot scene completed at step {step_index + 1}/{max_steps} "
+                    f"[sim] blind-spot scene completed at step {step_label} "
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
@@ -415,13 +440,11 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             if remain_dist <= float(args.arrive_dist) and ego_vehicle.v <= float(args.arrive_speed):
                 status = "arrived"
                 log_status(
-                    f"[sim] arrived at step {step_index + 1}/{max_steps} "
+                    f"[sim] arrived at step {step_label} "
                     f"remain={remain_dist:.2f}m ego_v={ego_vehicle.v:.2f}"
                 )
                 break
-        else:
-            status = "max_steps_reached"
-            log_status(f"[sim] reached max_steps={max_steps}")
+            step_index += 1
     except KeyboardInterrupt as exc:
         status = "interrupted"
         failure_reason = str(exc) or "keyboard_interrupt"

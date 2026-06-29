@@ -98,7 +98,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dt", type=float, default=0.1, help="离散仿真步长 s")
     parser.add_argument("--advance-index", type=int, default=1, help="每轮自车执行局部轨迹中的第几个点")
-    parser.add_argument("--max-steps", type=int, default=300, help="最大离散步数")
+    parser.add_argument("--max-steps", type=int, default=0, help="最大离散步数；<=0 表示不限步数，只按到达/任务完成/失败停止")
     parser.add_argument("--arrive-dist", type=float, default=1.5, help="自车到达阈值 m")
     parser.add_argument("--arrive-speed", type=float, default=0.3, help="自车到达速度阈值 m/s")
     parser.add_argument("--ref-lane-count", type=int, default=5, help="暴露给场景算法的前向 lane 段数量")

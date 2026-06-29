@@ -29,6 +29,7 @@ DEFAULT_MAP_PATH = str((Path(__file__).resolve().parent / "xodr_parser" / "data"
 OBU_SELF_FILTER_DIST_M = 1.0
 GPS_TO_VEHICLE_CENTER_OFFSET_M = 0.5
 PLANNING_FAILURE_GRACE_S = 0.5
+CONTROL_PREVIEW_INDEX = 5
 
 
 def import_symbol(symbol_path):
@@ -658,28 +659,17 @@ class DirectControlNode:
 
         current = traj[0]
         plan_hz = max(float(self.args.plan_hz), 1e-3)
-        max_segment_index = min(5, len(traj) - 1)
-        target_index = max_segment_index
-        min_command_speed_mps = 0.1 / 3.6
-        for candidate_index in range(1, max_segment_index + 1):
-            candidate = traj[candidate_index]
-            candidate_dt = candidate_index / plan_hz
-            candidate_ds = float(np.hypot(candidate[0] - current[0], candidate[1] - current[1]))
-            candidate_speed = candidate_ds / max(candidate_dt, 1e-3)
-            if candidate_speed >= min_command_speed_mps:
-                target_index = candidate_index
-                break
-
+        target_index = min(CONTROL_PREVIEW_INDEX, len(traj) - 1)
         next_point = traj[target_index]
         segment_dt = target_index / plan_hz
         dx = float(next_point[0] - current[0])
         dy = float(next_point[1] - current[1])
         ds = float(np.hypot(dx, dy))
         heading_delta = float((next_point[2] - current[2] + np.pi) % (2 * np.pi) - np.pi)
-        speed_mps = ds / segment_dt
+        speed_mps = float(max(next_point[3], 0.0))
         kappa_cmd = heading_delta / max(ds, 1e-3)
 
-        speed_kph = float(np.clip(max(speed_mps, 0.0) * 3.6, 0.0, self.args.max_speed_kph))
+        speed_kph = float(np.clip(speed_mps * 3.6, 0.0, self.args.max_speed_kph))
         wheel_angle_rad = float(np.arctan(self.gvt.wheelbase * kappa_cmd))
         wheel_angle_deg = float(np.clip(np.degrees(wheel_angle_rad), -26.0, 26.0))
         brkreq = 1 if speed_kph < 0.1 else 0
@@ -815,7 +805,12 @@ class DirectControlNode:
             command["timestamp"] = int(time.time() * 1000)
             msg = self.ControlCmdMsg()
             self._apply_control_command(msg, command)
-            self.control_pub.publish(msg)
+            try:
+                self.control_pub.publish(msg)
+            except Exception as exc:
+                if self.rospy.is_shutdown() or "closed topic" in str(exc):
+                    break
+                print(f"⚠ 控制命令发布失败：{exc}", flush=True)
             time.sleep(interval)
 
     def stop(self):
@@ -823,7 +818,11 @@ class DirectControlNode:
         hold = self.build_hold_command()
         msg = self.ControlCmdMsg()
         self._apply_control_command(msg, hold)
-        self.control_pub.publish(msg)
+        try:
+            self.control_pub.publish(msg)
+        except Exception as exc:
+            if not (self.rospy.is_shutdown() or "closed topic" in str(exc)):
+                print(f"⚠ 停车命令发布失败：{exc}", flush=True)
         print("⏹️  节点退出，已下发一次安全停车命令。")
 
     def _apply_control_command(self, msg, command):

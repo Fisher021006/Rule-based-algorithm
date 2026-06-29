@@ -301,7 +301,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-prefix", default="cutout_design")
     parser.add_argument("--verify-output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "切出参数反解验证")
-    parser.add_argument("--max-steps", type=int, default=180)
+    parser.add_argument("--max-steps", type=int, default=0, help="传给离线仿真的最大步数；<=0 表示不限步数")
     parser.add_argument("--log-every", type=int, default=20)
     return parser
 

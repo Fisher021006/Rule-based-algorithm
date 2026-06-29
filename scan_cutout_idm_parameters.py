@@ -43,6 +43,13 @@ def _parse_float_list(raw: str) -> list[float]:
     return [float(item.strip()) for item in str(raw).split(",") if item.strip()]
 
 
+def _normalise_subprocess_timeout(raw_value: float) -> float | None:
+    """subprocess timeout 语义；None 表示不按墙钟时间截断。"""
+
+    value = float(raw_value)
+    return value if value > 0.0 else None
+
+
 def _fmt_token(value: float) -> str:
     """把浮点数转成适合文件名的短 token。"""
 
@@ -261,10 +268,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exposed-speeds", default="0.0", help="暴露车速度列表 m/s；0 表示静止车")
     parser.add_argument("--main-gvt-gaps", default="30,35,40,45", help="VUT 到 GVT 的初始纵向净距列表 m")
     parser.add_argument("--gvt-exposed-gaps", default="25,30,35,40", help="GVT 到暴露车的初始纵向净距列表 m")
-    parser.add_argument("--max-steps", type=int, default=180)
+    parser.add_argument("--max-steps", type=int, default=0, help="传给离线仿真的最大步数；<=0 表示不限步数")
     parser.add_argument("--log-every", type=int, default=9999)
     parser.add_argument("--limit", type=int, default=0, help="最多运行多少个组合；0 表示不限制")
-    parser.add_argument("--timeout-s", type=float, default=180.0, help="单次仿真超时时间")
+    parser.add_argument("--timeout-s", type=float, default=0.0, help="单次仿真墙钟超时时间；<=0 表示不限时间")
     parser.add_argument("--dry-run", action="store_true", help="只打印待运行组合，不执行仿真")
     parser.add_argument("--verbose", action="store_true", help="显示每次仿真的完整 stdout/stderr")
     parser.add_argument("--generate-gif-on-success", type=int, default=0, help="对前 N 个成功样本补生成 GIF")
@@ -374,7 +381,7 @@ def main() -> None:
                     text=True,
                     capture_output=not bool(args.verbose),
                     check=False,
-                    timeout=float(args.timeout_s),
+                    timeout=_normalise_subprocess_timeout(float(args.timeout_s)),
                 )
                 json_path = args.output_dir / f"{prefix}.json"
                 if completed.returncode != 0 or not json_path.exists():
@@ -424,7 +431,7 @@ def main() -> None:
             text=True,
             capture_output=not bool(args.verbose),
             check=False,
-            timeout=float(args.timeout_s),
+            timeout=_normalise_subprocess_timeout(float(args.timeout_s)),
         )
 
     _write_summary(args.output_dir, rows, str(args.output_prefix))

@@ -51,9 +51,9 @@ CFG: dict[str, Any] = {
     "active_terminal_speed_ignore_acc_limit": True,
     "search_rel_s_min_m": -35.0,
     "search_rel_s_max_m": -1.0,
-    "blind_rel_s_min_m": -8.0,
-    "blind_rel_s_max_m": -1.0,
-    "blind_rel_s_target_m": -4.5,
+    "blind_rel_s_min_m": -8.6,
+    "blind_rel_s_max_m": -5.1,
+    "blind_rel_s_target_m": -6.1,
     "rel_s_control_gain": 0.35,
     "active_rel_s_control_gain": 0.28,
     "completion_prediction_gain": 0.45,
@@ -348,6 +348,14 @@ def _handle_hold_blind_zone(
             ), memory
 
     if bool(metrics["lane_change_started"]):
+        print(
+            "主车开始换道 "
+            f"rel_s={float(metrics.get('rel_s_m', float('nan'))):.3f}m "
+            f"progress={float(metrics.get('lane_change_progress_ratio', 0.0)):.3f} "
+            f"main_abs_d={float(metrics.get('main_abs_d_on_target_line_m', float('nan'))):.3f}m "
+            f"lateral_v={float(metrics.get('main_lateral_v_toward_target_mps', float('nan'))):.3f}m/s",
+            flush=True,
+        )
         _enter_lane_change_active(memory, now)
         return _build_active_output(
             context,
@@ -1060,13 +1068,14 @@ def _print_lane_change_completion_thw(metrics: dict[str, Any], completion_succes
     thw = float(metrics.get("completion_thw_s", float("nan")))
     target_thw = float(CFG["completion_target_thw_s"])
     rel_s = float(metrics.get("rel_s_m", float("nan")))
+    headway_gap = float(metrics.get("completion_headway_gap_m", float("nan")))
     net_gap = float(metrics.get("completion_net_gap_m", float("nan")))
     ego_v = float(metrics.get("ego_v_mps", float("nan")))
     print(
         "[blind_spot] lane_change_complete "
         f"thw={thw:.3f}s target={target_thw:.3f}s "
         f"error={thw - target_thw:.3f}s "
-        f"rel_s={rel_s:.3f}m net_gap={net_gap:.3f}m "
+        f"rel_s={rel_s:.3f}m headway_gap={headway_gap:.3f}m net_gap={net_gap:.3f}m "
         f"gvt_v={ego_v:.3f}m/s success={bool(completion_success)}",
         flush=True,
     )
@@ -1120,7 +1129,7 @@ def _solve_completion_thw_terminal(
     在常加速度假设下：
 
     ``s_gvt_end = s_gvt + 0.5 * (v0 + v_end) * T``
-    ``s_gvt_end = s_vut_end - half_len_sum - target_thw * v_end``
+    ``s_vut_front_end - s_gvt_front_end = target_thw * v_end``
 
     由此直接解出 ``v_end``，再按平台速度/加速度约束裁剪。
     """
@@ -1146,23 +1155,23 @@ def _solve_completion_thw_terminal(
         vut_s_complete = float(metrics.get("main_s_on_target_line_m", 0.0)) + float(metrics.get("main_v_mps", 0.0)) * plan_t
 
     target_thw = max(0.0, float(CFG["completion_target_thw_s"]))
-    half_len_sum = 0.5 * (
-        float(metrics.get("ego_length_m", limits.ego_length))
-        + float(metrics.get("main_length_m", limits.main_length))
-    )
+    ego_length = float(metrics.get("ego_length_m", limits.ego_length))
+    main_length = float(metrics.get("main_length_m", limits.main_length))
+    half_len_sum = 0.5 * (ego_length + main_length)
+    headway_center_offset = 0.5 * (main_length - ego_length)
     denominator = target_thw + 0.5 * plan_t
     if denominator <= 1e-6:
         return {"valid": False, "reason": "invalid_completion_thw_denominator"}
 
     raw_target_v = (
         float(vut_s_complete)
-        - half_len_sum
+        + headway_center_offset
         - float(gvt_s)
         - 0.5 * float(gvt_v) * plan_t
     ) / denominator
 
     min_net_gap = float(CFG["completion_min_net_gap_m"])
-    if target_thw * max(raw_target_v, 0.0) < min_net_gap:
+    if target_thw * max(raw_target_v, 0.0) - main_length < min_net_gap:
         raw_target_v = 2.0 * (
             float(vut_s_complete)
             - half_len_sum
@@ -1178,10 +1187,14 @@ def _solve_completion_thw_terminal(
         target_v = _clamp(raw_target_v, reachable_v_min, reachable_v_max)
     target_acc = (target_v - float(gvt_v)) / plan_t
     target_s = float(gvt_s) + 0.5 * (float(gvt_v) + target_v) * plan_t
-    target_net_gap = float(vut_s_complete) - target_s - half_len_sum
+    target_headway_gap = (
+        float(vut_s_complete) + 0.5 * main_length
+        - (target_s + 0.5 * ego_length)
+    )
+    target_net_gap = target_headway_gap - main_length
     achieved_thw = (
-        target_net_gap / max(target_v, float(CFG["thw_v_floor_mps"]))
-        if target_net_gap > 0.0
+        target_headway_gap / max(target_v, float(CFG["thw_v_floor_mps"]))
+        if target_headway_gap > 0.0
         else 0.0
     )
     thw_error = achieved_thw - target_thw
@@ -1189,6 +1202,7 @@ def _solve_completion_thw_terminal(
         np.isfinite(raw_target_v)
         and abs(target_v - raw_target_v) <= 1e-3
         and abs(thw_error) <= float(CFG["completion_thw_tol_s"])
+        and target_net_gap >= min_net_gap - 1e-3
     )
     acc_within_limit = bool(limits.min_acc <= target_acc <= limits.max_acc)
 
@@ -1210,6 +1224,7 @@ def _solve_completion_thw_terminal(
         "reachable_v_max_mps": float(reachable_v_max),
         "predicted_vut_s_complete_m": float(vut_s_complete),
         "predicted_gvt_s_complete_m": float(target_s),
+        "predicted_completion_headway_gap_m": float(target_headway_gap),
         "predicted_completion_net_gap_m": float(target_net_gap),
         "predicted_completion_thw_s": float(achieved_thw),
         "predicted_completion_thw_error_s": float(thw_error),
@@ -1221,12 +1236,13 @@ def _solve_completion_thw_terminal(
 
 def _compute_active_target_rel_s(metrics: dict[str, Any]) -> dict[str, Any]:
     """VUT 换道过程中，将盲区目标 ``rel_s`` 平滑过渡到完成时 THW 对应 ``rel_s``。"""
-    limits_half_sum = 0.5 * (
-        float(metrics.get("ego_length_m", 4.5)) + float(metrics.get("main_length_m", 4.5))
-    )
+    ego_length = float(metrics.get("ego_length_m", 4.5))
+    main_length = float(metrics.get("main_length_m", 4.5))
+    limits_half_sum = 0.5 * (ego_length + main_length)
     follower_v = max(float(metrics.get("ego_v_mps", 0.0)), float(CFG["thw_v_floor_mps"]))
+    target_headway_gap = float(CFG["completion_target_thw_s"]) * follower_v
     target_net_gap = max(
-        float(CFG["completion_target_thw_s"]) * follower_v,
+        target_headway_gap - main_length,
         float(CFG["completion_min_net_gap_m"]),
     )
     completion_rel_s_target = -(target_net_gap + limits_half_sum)
@@ -1247,6 +1263,7 @@ def _compute_active_target_rel_s(metrics: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "active_blend_to_completion": float(blend),
+        "target_headway_gap_from_thw_m": float(target_headway_gap),
         "target_net_gap_from_thw_m": float(target_net_gap),
         "completion_rel_s_target_m": float(completion_rel_s_target),
         "target_rel_s_m": float(target_rel_s),
@@ -1318,7 +1335,8 @@ def _compute_blind_spot_metrics(
 
     center_gap = -rel_s
     net_gap = center_gap - 0.5 * (limits.ego_length + limits.main_length)
-    completion_thw = net_gap / max(float(ego.v), float(CFG["thw_v_floor_mps"])) if net_gap > 0.0 else 0.0
+    headway_gap = center_gap + 0.5 * (limits.main_length - limits.ego_length)
+    completion_thw = headway_gap / max(float(ego.v), float(CFG["thw_v_floor_mps"])) if headway_gap > 0.0 else 0.0
     closing_speed = float(ego.v) - float(main.v)
     ttc_debug = net_gap / closing_speed if net_gap > 0.0 and closing_speed > 1e-6 else float("inf")
     baseline_abs_d = float(memory.get("baseline_main_abs_d_on_target", -1.0))
@@ -1368,6 +1386,7 @@ def _compute_blind_spot_metrics(
         "road_remaining_m": float(road_remaining),
         "road_remaining_ok": bool(road_remaining_ok),
         "center_gap_m": float(center_gap),
+        "completion_headway_gap_m": float(headway_gap),
         "completion_net_gap_m": float(net_gap),
         "completion_thw_s": float(completion_thw),
         "completion_target_thw_s": float(CFG["completion_target_thw_s"]),

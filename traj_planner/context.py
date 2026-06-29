@@ -34,6 +34,12 @@ from traj_planner.types import (
 )
 
 
+ROUTE_LOOKAHEAD_MIN_TRIGGER_M = 18.0
+ROUTE_LOOKAHEAD_SPEED_TIME_S = 3.0
+ROUTE_LOOKAHEAD_BUFFER_M = 10.0
+ROUTE_LOOKAHEAD_MIN_REMAIN_GAIN_M = 5.0
+
+
 def _normalize_obstacle(obstacle: Any) -> ObstacleSnapshot | None:
     """把一个“障碍物样对象”转换成 :class:`ObstacleSnapshot`。
 
@@ -157,6 +163,12 @@ def _build_line_contexts(planning_input: PlanningInput, obstacle_snapshots: list
         cumulative_s = calculate_path_cumulative_distance(line)
         _, current_s, current_d = project_point_to_path(ego_pos, line)
         remaining_length = max(float(cumulative_s[-1] - current_s), 0.0)
+        first_lane_remaining_length = remaining_length
+        if line_index < len(planning_input.refer_line_first_lane_remaining_lengths):
+            first_lane_remaining_length = max(
+                0.0,
+                float(planning_input.refer_line_first_lane_remaining_lengths[line_index]),
+            )
 
         front_obstacle, rear_obstacle = _project_front_rear_obstacles(
             ego_pos=ego_pos,
@@ -179,6 +191,7 @@ def _build_line_contexts(planning_input: PlanningInput, obstacle_snapshots: list
                 current_s=float(current_s),
                 current_d=float(current_d),
                 remaining_length=remaining_length,
+                first_lane_remaining_length=first_lane_remaining_length,
                 front_obstacle=front_obstacle,
                 rear_obstacle=rear_obstacle,
             )
@@ -188,6 +201,107 @@ def _build_line_contexts(planning_input: PlanningInput, obstacle_snapshots: list
         raise ValueError("No valid refer lines available for planning context.")
 
     return line_contexts
+
+
+def _road_id(lane_id: str) -> str:
+    """从 lane_id 中提取 road id。"""
+
+    return str(lane_id).split(".")[0]
+
+
+def _route_lookahead_trigger_distance(planning_input: PlanningInput) -> float:
+    """返回开始为未来路线换道预留窗口的距离阈值。"""
+
+    local_fsm_cfg = planning_input.config.get("local_fsm", {})
+    configured = local_fsm_cfg.get("route_lookahead_trigger_m")
+    if configured is not None:
+        return max(0.0, float(configured))
+    return max(
+        ROUTE_LOOKAHEAD_MIN_TRIGGER_M,
+        ROUTE_LOOKAHEAD_SPEED_TIME_S * max(float(planning_input.ego_state.v), 0.0) + ROUTE_LOOKAHEAD_BUFFER_M,
+    )
+
+
+def _current_planned_index(planned_path: list[str], current_lane_id: str, current_road_id: str) -> int:
+    """找到当前局部判断应从全局路径的哪个位置开始看未来。"""
+
+    if not planned_path:
+        return 0
+    for idx, lane_id in enumerate(planned_path):
+        if lane_id == current_lane_id:
+            return idx
+    for idx, lane_id in enumerate(planned_path):
+        if _road_id(lane_id) == current_road_id:
+            return idx
+    return 0
+
+
+def _line_route_progress_index(
+    line_context: LineContext,
+    planned_path: list[str],
+    start_idx: int,
+    *,
+    max_initial_skip: int = 0,
+) -> int:
+    """返回该候选线能连续覆盖到全局路径的哪个 lane 下标。"""
+
+    if not planned_path:
+        return start_idx - 1
+    lane_sequence = list(line_context.lane_sequence)
+    last_start_idx = min(len(planned_path) - 1, start_idx + max(0, int(max_initial_skip)))
+    for route_idx in range(start_idx, last_start_idx + 1):
+        route_lane_id = planned_path[route_idx]
+        try:
+            sequence_idx = lane_sequence.index(route_lane_id)
+        except ValueError:
+            continue
+
+        best_idx = route_idx
+        for next_route_idx in range(route_idx + 1, len(planned_path)):
+            next_lane_id = planned_path[next_route_idx]
+            try:
+                sequence_idx = lane_sequence.index(next_lane_id, sequence_idx + 1)
+            except ValueError:
+                break
+            best_idx = next_route_idx
+        return best_idx
+    return start_idx - 1
+
+
+def _select_route_lookahead_target(
+    planning_input: PlanningInput,
+    line_contexts: list[LineContext],
+    current_route_progress_index: int,
+    planned_start_idx: int,
+) -> tuple[LineContext | None, int, str]:
+    """在当前线即将无法继续覆盖全局路径时，选择一阶相邻的续接线。"""
+
+    current_line = line_contexts[0]
+    trigger_distance = _route_lookahead_trigger_distance(planning_input)
+    if float(current_line.remaining_length) > trigger_distance:
+        return None, current_route_progress_index, ""
+
+    best_line: LineContext | None = None
+    best_progress = current_route_progress_index
+    for line_context in line_contexts[1:]:
+        if abs(int(line_context.lateral_step)) != 1:
+            continue
+        if float(line_context.remaining_length) <= float(current_line.remaining_length) + ROUTE_LOOKAHEAD_MIN_REMAIN_GAIN_M:
+            continue
+        progress_idx = _line_route_progress_index(
+            line_context,
+            planning_input.planned_path,
+            planned_start_idx,
+            max_initial_skip=1,
+        )
+        if progress_idx <= best_progress:
+            continue
+        best_line = line_context
+        best_progress = progress_idx
+
+    if best_line is None:
+        return None, current_route_progress_index, ""
+    return best_line, best_progress, "future_route_window"
 
 
 def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[LineContext]) -> RouteIntent:
@@ -204,6 +318,12 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
     current_line = line_contexts[0]
     current_lane_id = current_line.line_id
     current_road_id = planning_input.current_road_id or current_lane_id.split(".")[0]
+    planned_start_idx = _current_planned_index(planning_input.planned_path, current_lane_id, current_road_id)
+    current_route_progress_index = _line_route_progress_index(
+        current_line,
+        planning_input.planned_path,
+        planned_start_idx,
+    )
     current_road_planned_lanes = [
         lane_id for lane_id in planning_input.planned_path if lane_id.split(".")[0] == current_road_id
     ]
@@ -234,6 +354,38 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
             target_lane_id = adjacent.line_id
             target_line_index = adjacent.line_index
 
+    route_lookahead_required = False
+    route_lookahead_reason = ""
+    if 0 <= target_line_index < len(line_contexts):
+        target_route_progress_index = _line_route_progress_index(
+            line_contexts[target_line_index],
+            planning_input.planned_path,
+            planned_start_idx,
+        )
+    else:
+        target_route_progress_index = current_route_progress_index
+    if (
+        target_line_index != 0
+        and current_route_progress_index > target_route_progress_index
+    ):
+        target_lane_id = current_lane_id
+        target_line_index = 0
+        target_route_progress_index = current_route_progress_index
+        route_lookahead_reason = "current_line_preserves_future_route"
+
+    lookahead_line, lookahead_progress_index, lookahead_reason = _select_route_lookahead_target(
+        planning_input=planning_input,
+        line_contexts=line_contexts,
+        current_route_progress_index=max(current_route_progress_index, target_route_progress_index),
+        planned_start_idx=planned_start_idx,
+    )
+    if lookahead_line is not None:
+        target_lane_id = lookahead_line.line_id
+        target_line_index = lookahead_line.line_index
+        target_route_progress_index = lookahead_progress_index
+        route_lookahead_required = True
+        route_lookahead_reason = lookahead_reason
+
     lane_change_centering_incomplete = (
         planning_input.planner_memory.lane_change_committed
         and is_lane_change_centering_incomplete(
@@ -244,6 +396,14 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
         )
     )
     must_change = (target_lane_id != current_lane_id and target_line_index != 0) or lane_change_centering_incomplete
+    if route_lookahead_required:
+        must_change = True
+    deadline_margin_m = float(current_line.first_lane_remaining_length)
+    if target_line_index != 0 and 0 <= target_line_index < len(line_contexts):
+        deadline_margin_m = min(
+            deadline_margin_m,
+            float(line_contexts[target_line_index].first_lane_remaining_length),
+        )
     distance_to_goal = float(
         np.linalg.norm(np.asarray(planning_input.goal_xy, dtype=float) - np.array([planning_input.ego_state.x, planning_input.ego_state.y], dtype=float))
     )
@@ -255,9 +415,13 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
         target_lane_id=target_lane_id,
         target_line_index=target_line_index,
         must_change=must_change,
-        deadline_margin_m=float(current_line.remaining_length),
+        deadline_margin_m=deadline_margin_m,
         distance_to_goal=distance_to_goal,
         current_road_planned_lanes=current_road_planned_lanes,
+        route_lookahead_required=route_lookahead_required,
+        route_lookahead_reason=route_lookahead_reason,
+        current_route_progress_index=current_route_progress_index,
+        target_route_progress_index=target_route_progress_index,
     )
 
 

@@ -55,3 +55,6 @@ class DrivableLanesResult:
     # 延伸车道的ID列表（与extended_centerlines一一对应）
     extended_lane_ids: List[List[str]] = field(default_factory=list)
 
+    # 每条延伸线第一段 lane 的剩余长度（与extended_centerlines一一对应）
+    first_lane_remaining_lengths: List[float] = field(default_factory=list)
+

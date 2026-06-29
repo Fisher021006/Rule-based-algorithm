@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 
 from traj_planner.state_rules import is_goal_reached, is_lane_change_complete
+from traj_planner.tools import project_point_to_path
 from traj_planner.types import BehaviorDecision, BehaviorMemory, BehaviorMode, CandidateTrajectory, PlanningContext
 
 
@@ -41,6 +42,19 @@ def _approach_goal_entry_distance(config: dict, current_v: float) -> float:
     stop_dist = float(current_v) * float(current_v) / (2.0 * soft_decel)
     one_cycle_travel = float(current_v) * cycle_dt
     return max(min_entry_dist, stop_dist + one_cycle_travel + buffer_dist, _approach_goal_trigger_distance(current_v))
+
+
+def _near_goal_along_route(context: PlanningContext, current_v: float) -> bool:
+    """只有沿当前候选走廊也接近终点时才进入终点模式。"""
+
+    entry_distance = _approach_goal_entry_distance(context.config, current_v)
+    lateral_window = max(2.5, float(context.config.get("local_fsm", {}).get("approach_goal_lateral_window", 2.0)))
+    for line_context in context.line_contexts:
+        _, goal_s, goal_d = project_point_to_path(context.goal_xy, line_context.line)
+        route_delta_s = float(goal_s) - float(line_context.current_s)
+        if -0.5 <= route_delta_s <= entry_distance and abs(float(goal_d)) <= lateral_window:
+            return True
+    return False
 
 
 def _approach_goal_target(context: PlanningContext) -> tuple[int, str]:
@@ -377,9 +391,108 @@ def _find_line_index_by_lane_id(context: PlanningContext, lane_id: str) -> int:
     return -1
 
 
+def _lane_number(lane_id: str) -> str:
+    """返回 lane_id 的车道编号部分，用于跨 road 承诺继承的兜底匹配。"""
+
+    return str(lane_id).split(".")[-1]
+
+
+def _resolve_committed_target_line(context: PlanningContext, target_lane_id: str) -> tuple[int, str] | None:
+    """把上一帧承诺的目标 lane 映射到当前候选线集合。"""
+
+    target_line_index = _find_line_index_by_lane_id(context, target_lane_id)
+    if target_line_index >= 0:
+        return target_line_index, target_lane_id
+
+    planned_path = list(context.planned_path)
+    if target_lane_id in planned_path:
+        target_path_idx = planned_path.index(target_lane_id)
+        for planned_lane_id in planned_path[target_path_idx + 1 :]:
+            mapped_index = _find_line_index_by_lane_id(context, planned_lane_id)
+            if mapped_index >= 0:
+                return mapped_index, planned_lane_id
+
+    target_lane_number = _lane_number(target_lane_id)
+    for line_context in context.line_contexts:
+        if _lane_number(line_context.line_id) == target_lane_number:
+            return line_context.line_index, line_context.line_id
+    return None
+
+
+def _planned_start_index(context: PlanningContext) -> int:
+    """找到当前帧比较候选路线覆盖度时的全局路径起点。"""
+
+    planned_path = list(context.planned_path)
+    if not planned_path:
+        return 0
+    current_lane_id = context.current_line.line_id
+    current_road_id = context.route_intent.current_road_id
+    for idx, lane_id in enumerate(planned_path):
+        if lane_id == current_lane_id:
+            return idx
+    for idx, lane_id in enumerate(planned_path):
+        if str(lane_id).split(".")[0] == current_road_id:
+            return idx
+    return 0
+
+
+def _line_route_progress_index(
+    context: PlanningContext,
+    line_index: int,
+    *,
+    max_initial_skip: int = 0,
+) -> int:
+    """返回候选线能连续覆盖到全局路径的哪个 lane 下标。"""
+
+    if line_index < 0 or line_index >= len(context.line_contexts):
+        return -1
+    planned_path = list(context.planned_path)
+    if not planned_path:
+        return -1
+    start_idx = _planned_start_index(context)
+    lane_sequence = list(context.line_contexts[line_index].lane_sequence)
+    last_start_idx = min(len(planned_path) - 1, start_idx + max(0, int(max_initial_skip)))
+    for route_idx in range(start_idx, last_start_idx + 1):
+        route_lane_id = planned_path[route_idx]
+        try:
+            sequence_idx = lane_sequence.index(route_lane_id)
+        except ValueError:
+            continue
+
+        best_idx = route_idx
+        for next_route_idx in range(route_idx + 1, len(planned_path)):
+            next_lane_id = planned_path[next_route_idx]
+            try:
+                sequence_idx = lane_sequence.index(next_lane_id, sequence_idx + 1)
+            except ValueError:
+                break
+            best_idx = next_route_idx
+        return best_idx
+    return start_idx - 1
+
+
+def _discretionary_preserves_route_window(context: PlanningContext, line_index: int) -> bool:
+    """自由换道不能把即将收紧的全局路线窗口变差。"""
+
+    if bool(getattr(context.route_intent, "route_lookahead_required", False)):
+        return line_index == int(context.route_intent.target_line_index)
+
+    current_progress = _line_route_progress_index(context, 0)
+    target_progress = _line_route_progress_index(context, line_index)
+    if target_progress >= current_progress:
+        return True
+
+    route_guard_m = max(35.0, 4.0 * max(float(context.ego_state.v), 0.0) + 12.0)
+    return float(context.current_line.remaining_length) > route_guard_m
+
+
 def _committed_lane_change_incomplete(context: PlanningContext, target_lane_id: str) -> bool:
     """统一判断一个已承诺换道是否仍处于未完成状态。"""
 
+    resolved = _resolve_committed_target_line(context, target_lane_id)
+    if resolved is None:
+        return True
+    _, target_lane_id = resolved
     return not is_lane_change_complete(
         current_lane_id=context.current_line.line_id,
         target_lane_id=target_lane_id,
@@ -394,9 +507,13 @@ def _committed_lane_change_completed_this_cycle(context: PlanningContext) -> boo
     memory = context.planner_memory
     if not memory.lane_change_committed or not memory.target_lane_id:
         return False
+    resolved = _resolve_committed_target_line(context, memory.target_lane_id)
+    if resolved is None:
+        return False
+    _, target_lane_id = resolved
     return is_lane_change_complete(
         current_lane_id=context.current_line.line_id,
-        target_lane_id=memory.target_lane_id,
+        target_lane_id=target_lane_id,
         current_d=context.current_line.current_d,
         config=context.config,
     )
@@ -411,9 +528,10 @@ def _continue_committed_lane_change(context: PlanningContext) -> BehaviorDecisio
     if not _committed_lane_change_incomplete(context, memory.target_lane_id):
         return None
 
-    target_line_index = _find_line_index_by_lane_id(context, memory.target_lane_id)
-    if target_line_index < 0:
+    resolved = _resolve_committed_target_line(context, memory.target_lane_id)
+    if resolved is None:
         return None
+    target_line_index, target_lane_id = resolved
 
     if context.route_intent.must_change or memory.mode in (BehaviorMode.PREPARE_MLC, BehaviorMode.EXECUTE_MLC):
         return _make_decision(
@@ -421,7 +539,7 @@ def _continue_committed_lane_change(context: PlanningContext) -> BehaviorDecisio
             mode=BehaviorMode.EXECUTE_MLC,
             allowed_line_indices=[target_line_index],
             target_line_index=target_line_index,
-            target_lane_id=memory.target_lane_id,
+            target_lane_id=target_lane_id,
             must_change=context.route_intent.must_change,
             deadline_margin_m=context.route_intent.deadline_margin_m,
             reason="lane_change_already_committed",
@@ -433,7 +551,7 @@ def _continue_committed_lane_change(context: PlanningContext) -> BehaviorDecisio
             mode=BehaviorMode.EXECUTE_DLC,
             allowed_line_indices=[target_line_index],
             target_line_index=target_line_index,
-            target_lane_id=memory.target_lane_id,
+            target_lane_id=target_lane_id,
             must_change=False,
             deadline_margin_m=context.route_intent.deadline_margin_m,
             reason="lane_change_already_committed",
@@ -491,6 +609,8 @@ def _select_discretionary_target(context: PlanningContext) -> tuple[int, float]:
             continue
         if not _line_merge_feasible(context, line_context.line_index):
             continue
+        if not _discretionary_preserves_route_window(context, line_context.line_index):
+            continue
 
         incentive = _mobil_incentive_for_line(context, line_context.line_index)
         if incentive > best_incentive:
@@ -540,7 +660,10 @@ def decide_behavior(context: PlanningContext) -> BehaviorDecision:
     route_intent = context.route_intent
     current_line = context.current_line
     current_v = float(context.ego_state.v)
-    near_goal = route_intent.distance_to_goal <= _approach_goal_entry_distance(context.config, current_v)
+    near_goal = (
+        route_intent.distance_to_goal <= _approach_goal_entry_distance(context.config, current_v)
+        and _near_goal_along_route(context, current_v)
+    )
     mobil_cfg = context.config["MOBIL"]
     ttc_cfg = context.config["TTC"]
     current_front_ttc, current_front_stop_margin, _ = _front_risk_metrics(context)
@@ -570,13 +693,15 @@ def decide_behavior(context: PlanningContext) -> BehaviorDecision:
             reason="goal_near_prioritize_arrival",
         )
 
-    committed_decision = _continue_committed_lane_change(context)
-    if committed_decision is not None:
-        return committed_decision
-
     if route_intent.must_change:
         urgency_margin = max(12.0, 2.5 * current_v + 6.0)
-        if route_intent.deadline_margin_m <= urgency_margin or _immediate_merge_feasible(context):
+        route_window_urgent = route_intent.deadline_margin_m <= urgency_margin
+        mlc_reason = (
+            "mandatory_route_lookahead_execute"
+            if bool(getattr(route_intent, "route_lookahead_required", False))
+            else "mandatory_lane_change_execute"
+        )
+        if route_window_urgent:
             return _make_decision(
                 context,
                 mode=BehaviorMode.EXECUTE_MLC,
@@ -585,8 +710,15 @@ def decide_behavior(context: PlanningContext) -> BehaviorDecision:
                 target_lane_id=route_intent.target_lane_id,
                 must_change=True,
                 deadline_margin_m=route_intent.deadline_margin_m,
-                reason="mandatory_lane_change_execute",
+                reason=mlc_reason,
             )
+
+        committed_decision = _continue_committed_lane_change(context)
+        if committed_decision is not None and committed_decision.mode in (
+            BehaviorMode.PREPARE_MLC,
+            BehaviorMode.EXECUTE_MLC,
+        ):
+            return committed_decision
 
         return _make_decision(
             context,
@@ -596,8 +728,16 @@ def decide_behavior(context: PlanningContext) -> BehaviorDecision:
             target_lane_id=route_intent.target_lane_id,
             must_change=True,
             deadline_margin_m=route_intent.deadline_margin_m,
-            reason="mandatory_lane_change_prepare",
+            reason=(
+                "mandatory_route_lookahead_prepare"
+                if bool(getattr(route_intent, "route_lookahead_required", False))
+                else "mandatory_lane_change_prepare"
+            ),
         )
+
+    committed_decision = _continue_committed_lane_change(context)
+    if committed_decision is not None:
+        return committed_decision
 
     dlc_cooldown_active = _dlc_cooldown_active(context, current_front_ttc, current_front_stop_margin)
     discretionary_target_idx, best_incentive = _select_discretionary_target(context)

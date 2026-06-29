@@ -21,6 +21,18 @@ from .config import LaneChangeConfig, DrivableLanesResult
 from global_planner.planner import GlobalPlanner
 
 
+GOAL_TRUNCATE_MAX_DISTANCE_M = 3.0
+
+
+def _polyline_length(points: List[List[float]]) -> float:
+    """计算折线长度。"""
+
+    if len(points) < 2:
+        return 0.0
+    arr = np.asarray(points, dtype=float)
+    return float(np.sum(np.linalg.norm(np.diff(arr[:, :2], axis=0), axis=1)))
+
+
 def _truncate_at_goal(centerline: List[List[float]], goal_point: np.ndarray) -> List[List[float]]:
     """
     在终点处截断中心线
@@ -38,6 +50,8 @@ def _truncate_at_goal(centerline: List[List[float]], goal_point: np.ndarray) -> 
     centerline_array = np.array(centerline)
     distances = np.linalg.norm(centerline_array[:, :2] - goal_point, axis=1)
     closest_idx = int(np.argmin(distances))
+    if float(distances[closest_idx]) > GOAL_TRUNCATE_MAX_DISTANCE_M:
+        return centerline
 
     # 截取从起点到最近点（包含最近点）
     truncated = centerline[:closest_idx + 1]
@@ -830,12 +844,13 @@ class DrivableLanesExtender:
         # 从每个交集车道出发，计算向后延伸的所有可行驶车道中心线
         for start_lane in result.intersection_lanes:
             # 获取从这个车道开始的延伸路径
-            extended_path, extended_centerline = self._get_extended_path(
+            extended_path, extended_centerline, first_lane_remaining = self._get_extended_path(
                 start_lane, query_road_id, remaining_roads, query_x, query_y
             )
 
             result.extended_lane_ids.append(extended_path)
             result.extended_centerlines.append(np.array(extended_centerline))
+            result.first_lane_remaining_lengths.append(float(first_lane_remaining))
 
         return result
 
@@ -896,7 +911,7 @@ class DrivableLanesExtender:
 
     def _get_extended_path(self, start_lane: str, start_road_id: str,
                            remaining_roads: List[str], query_x: float,
-                           query_y: float) -> Tuple[List[str], List[List[float]]]:
+                           query_y: float) -> Tuple[List[str], List[List[float]], float]:
         """
         获取从起始车道向后延伸的路径和中心线坐标
 
@@ -945,12 +960,17 @@ class DrivableLanesExtender:
                     break
 
         extended_centerline = self._build_extended_centerline(extended_lanes, query_point)
+        first_lane_remaining = 0.0
+        first_centerline = self.parser.lane_centerlines.get(start_lane)
+        if first_centerline is not None and len(first_centerline) > 1:
+            first_slice = self._slice_centerline_from_projection(np.asarray(first_centerline, dtype=float), query_point)
+            first_lane_remaining = _polyline_length(first_slice)
 
         # 在终点处截断
         if self.goal_point is not None and len(extended_centerline) > 0:
             extended_centerline = _truncate_at_goal(extended_centerline, self.goal_point)
 
-        return extended_lanes, extended_centerline
+        return extended_lanes, extended_centerline, first_lane_remaining
 
     def _build_extended_centerline(self, lane_sequence: List[str], query_point: np.ndarray) -> List[List[float]]:
         """

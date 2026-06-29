@@ -165,6 +165,7 @@ class GVT:
         self.refer_line_lane_ids = []
         self.refer_line_lane_sequences = []
         self.refer_line_lateral_steps = []
+        self.refer_line_first_lane_remaining_lengths = []
         self.current_road_id = None
         self.pre_traj = None
         self.pre_traj_id = 0
@@ -219,6 +220,7 @@ class GVT:
         self.refer_line_lane_sequences = [list(seq) for seq in result.extended_lane_ids]
         self.refer_line_lane_ids = [seq[0] if seq else "" for seq in self.refer_line_lane_sequences]
         self.refer_line_lateral_steps = self._compute_lateral_steps(self.refer_line_lane_ids)
+        self.refer_line_first_lane_remaining_lengths = list(result.first_lane_remaining_lengths)
         self.current_road_id = result.query_road_id
         self.scene_runtime_step_index = 0
         if self.scene_target_provider is not None:
@@ -234,17 +236,23 @@ class GVT:
             refreshed_lines = []
             refreshed_lane_sequences = []
             refreshed_lane_ids = []
-            for line, lane_seq in zip(result.extended_centerlines, result.extended_lane_ids):
+            refreshed_first_lane_remaining_lengths = []
+            for idx, (line, lane_seq) in enumerate(zip(result.extended_centerlines, result.extended_lane_ids)):
                 if line is None or len(line) <= 1:
                     continue
                 refreshed_lines.append(line)
                 refreshed_lane_sequences.append(list(lane_seq))
                 refreshed_lane_ids.append(lane_seq[0] if lane_seq else "")
+                if idx < len(result.first_lane_remaining_lengths):
+                    refreshed_first_lane_remaining_lengths.append(float(result.first_lane_remaining_lengths[idx]))
+                else:
+                    refreshed_first_lane_remaining_lengths.append(0.0)
             if refreshed_lines:
                 self.refer_lines = refreshed_lines
                 self.refer_line_lane_sequences = refreshed_lane_sequences
                 self.refer_line_lane_ids = refreshed_lane_ids
                 self.refer_line_lateral_steps = self._compute_lateral_steps(self.refer_line_lane_ids)
+                self.refer_line_first_lane_remaining_lengths = refreshed_first_lane_remaining_lengths
                 self.current_road_id = result.query_road_id
 
     def traj_planning(self, obsList):

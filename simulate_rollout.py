@@ -36,7 +36,7 @@ def build_arg_parser():
     parser.add_argument("--start-xy", nargs=2, type=float, required=True, metavar=("X", "Y"))
     parser.add_argument("--goal-xy", nargs=2, type=float, required=True, metavar=("X", "Y"))
     parser.add_argument("--advance-index", type=int, default=1, help="每轮执行局部轨迹中的第几个点；默认 1 表示 0.1s 重规划一次")
-    parser.add_argument("--max-steps", type=int, default=400, help="最大滚动步数")
+    parser.add_argument("--max-steps", type=int, default=0, help="最大滚动步数；<=0 表示不限步数，只按到达/失败停止")
     parser.add_argument("--arrive-dist", type=float, default=1.5, help="到达判定距离阈值")
     parser.add_argument("--arrive-speed", type=float, default=0.3, help="到达判定速度阈值")
     parser.add_argument("--replan-dt", type=float, default=0.1, help="每次重规划对应的离线时间步长，默认 0.1s")
@@ -58,6 +58,13 @@ def instantiate_vehicle(xodr_parser):
         "minAcc": 2.0,
     }
     return GVT("manual", outline, sport_params, xodr_parser)
+
+
+def normalise_max_steps(raw_value):
+    if raw_value is None:
+        return None
+    value = int(raw_value)
+    return value if value > 0 else None
 
 
 def to_builtin(value):
@@ -471,7 +478,9 @@ def rollout(
     initial_point = [gvt.x, gvt.y, gvt.heading, gvt.v, gvt.a, gvt.kappa]
     executed_points.append(initial_point)
 
-    for step_idx in range(max_steps):
+    step_limit = normalise_max_steps(max_steps)
+    step_idx = 0
+    while step_limit is None or step_idx < step_limit:
         ego_state_before_plan = snapshot_vehicle_state(gvt)
         with contextlib.nullcontext() if verbose_planner else contextlib.redirect_stdout(io.StringIO()):
             trajectory = gvt.traj_planning([])
@@ -589,6 +598,7 @@ def rollout(
                 "refer_line_count": len(gvt.refer_lines),
             }
         )
+        step_idx += 1
 
     return {
         "planned_path": list(gvt.lanePlanner.planner.planned_path),

@@ -115,10 +115,21 @@ class VirtualVehicle:
             return
 
         old_v = self.v
-        if int(self.command.brkreq) or int(self.command.gear) != 4:
-            self.v = 0.0
+        if int(self.command.gear) != 4:
+            target_speed_mps = 0.0
+        elif int(self.command.brkreq):
+            target_speed_mps = 0.0
         else:
-            self.v = max(0.0, float(self.target_speed_mps))
+            target_speed_mps = max(0.0, float(self.target_speed_mps))
+
+        max_accel = max(float(self.config.max_accel_mps2), 1e-3)
+        max_decel = max(float(self.config.max_decel_mps2), 1e-3)
+        speed_delta = float(target_speed_mps - old_v)
+        if speed_delta >= 0.0:
+            speed_delta = min(speed_delta, max_accel * dt)
+        else:
+            speed_delta = max(speed_delta, -max_decel * dt)
+        self.v = max(0.0, float(old_v + speed_delta))
         self.a = (self.v - old_v) / dt
 
         wheelbase = max(float(self.config.wheelbase_m), 1e-3)
