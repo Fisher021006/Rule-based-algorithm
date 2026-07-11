@@ -290,115 +290,6 @@ class LaneChangeGenerator:
         return curve_points
 
     @staticmethod
-    def generate_multi_lane_change_curve(from_lane_points: np.ndarray,
-                                         to_lane_points: np.ndarray,
-                                         num_lanes: int = 2,
-                                         num_points: int = None) -> np.ndarray:
-        """
-        生成跨多车道的平滑换道曲线（连续换道合并为一条曲线）
-
-        参数:
-            from_lane_points: 起始车道中心线点
-            to_lane_points: 最终目标车道中心线点
-            num_lanes: 跨越的车道数
-            num_points: 输出点数（None则根据车道数自动计算）
-
-        返回:
-            换道曲线坐标点数组
-        """
-        # 根据跨越车道数计算点数
-        if num_points is None:
-            num_points = LANE_CHANGE_CONFIG['multi_num_points_per_lane'] * num_lanes
-
-        # 根据跨越车道数调整换道区间
-        base_start = LANE_CHANGE_CONFIG['single_start_ratio']
-        base_end = LANE_CHANGE_CONFIG['single_end_ratio']
-        start_adjust = LANE_CHANGE_CONFIG['multi_start_adjust']
-        end_adjust = LANE_CHANGE_CONFIG['multi_end_adjust']
-
-        start_ratio = max(0.1, base_start - start_adjust * (num_lanes - 1))
-        end_ratio = min(0.9, base_end + end_adjust * (num_lanes - 1))
-
-        # 计算起始车道的累计长度
-        from_lengths = np.zeros(len(from_lane_points))
-        for i in range(1, len(from_lane_points)):
-            from_lengths[i] = from_lengths[i - 1] + np.linalg.norm(
-                from_lane_points[i] - from_lane_points[i - 1]
-            )
-
-        total_length = from_lengths[-1]
-        start_s = total_length * start_ratio
-
-        # 获取起点
-        start_idx = np.searchsorted(from_lengths, start_s)
-        start_idx = max(1, min(start_idx, len(from_lane_points) - 1))
-
-        if start_idx > 0 and start_idx < len(from_lengths):
-            denom = from_lengths[start_idx] - from_lengths[start_idx - 1]
-            if denom > 1e-6:
-                ratio = (start_s - from_lengths[start_idx - 1]) / denom
-            else:
-                ratio = 0
-            start_point = from_lane_points[start_idx - 1] + ratio * (
-                    from_lane_points[start_idx] - from_lane_points[start_idx - 1]
-            )
-        else:
-            start_point = from_lane_points[0]
-
-        # 计算目标车道的累计长度
-        to_lengths = np.zeros(len(to_lane_points))
-        for i in range(1, len(to_lane_points)):
-            to_lengths[i] = to_lengths[i - 1] + np.linalg.norm(
-                to_lane_points[i] - to_lane_points[i - 1]
-            )
-
-        to_total_length = to_lengths[-1]
-        end_s_target = to_total_length * end_ratio
-
-        # 获取终点
-        end_idx = np.searchsorted(to_lengths, end_s_target)
-        end_idx = max(1, min(end_idx, len(to_lane_points) - 1))
-
-        if end_idx > 0 and end_idx < len(to_lengths):
-            denom = to_lengths[end_idx] - to_lengths[end_idx - 1]
-            if denom > 1e-6:
-                ratio = (end_s_target - to_lengths[end_idx - 1]) / denom
-            else:
-                ratio = 0
-            end_point = to_lane_points[end_idx - 1] + ratio * (
-                    to_lane_points[end_idx] - to_lane_points[end_idx - 1]
-            )
-        else:
-            end_point = to_lane_points[-1]
-
-        # 计算切线方向
-        if start_idx < len(from_lane_points) - 1 and start_idx > 0:
-            start_tangent = from_lane_points[start_idx] - from_lane_points[start_idx - 1]
-        elif len(from_lane_points) >= 2:
-            start_tangent = from_lane_points[-1] - from_lane_points[-2]
-        else:
-            start_tangent = np.array([1.0, 0.0])
-        start_tangent = start_tangent / (np.linalg.norm(start_tangent) + 1e-6)
-
-        if end_idx < len(to_lane_points) - 1 and end_idx > 0:
-            end_tangent = to_lane_points[end_idx] - to_lane_points[end_idx - 1]
-        elif len(to_lane_points) >= 2:
-            end_tangent = to_lane_points[-1] - to_lane_points[-2]
-        else:
-            end_tangent = np.array([1.0, 0.0])
-        end_tangent = end_tangent / (np.linalg.norm(end_tangent) + 1e-6)
-
-        # 使用五次多项式生成更平滑的曲线
-        control_factor = LANE_CHANGE_CONFIG['multi_control_factor']
-        curve_points = LaneChangeGenerator._quintic_bezier_curve(
-            start_point, start_tangent,
-            end_point, end_tangent,
-            num_points, control_factor
-        )
-
-        return curve_points
-
-    @staticmethod
     def _cubic_bezier_curve(p0: np.ndarray, t0: np.ndarray,
                             p1: np.ndarray, t1: np.ndarray,
                             num_points: int,
@@ -440,52 +331,6 @@ class LaneChangeGenerator:
 
         return curve
 
-    @staticmethod
-    def _quintic_bezier_curve(p0: np.ndarray, t0: np.ndarray,
-                              p1: np.ndarray, t1: np.ndarray,
-                              num_points: int,
-                              control_factor: float = 2.5) -> np.ndarray:
-        """
-        生成五次贝塞尔曲线（更平滑，适合多车道换道）
-
-        参数:
-            p0: 起点
-            t0: 起点切线方向（单位向量）
-            p1: 终点
-            t1: 终点切线方向（单位向量）
-            num_points: 采样点数
-            control_factor: 控制点距离系数，越小曲线越圆润
-
-        返回:
-            曲线采样点数组
-        """
-        dist = np.linalg.norm(p1 - p0)
-        control_dist = dist / control_factor
-
-        t = np.linspace(0, 1, num_points)
-        curve = np.zeros((num_points, 2))
-
-        # 计算6个控制点（五次贝塞尔）
-        c0 = p0
-        c1 = p0 + control_dist * t0 * 0.4
-        c2 = p0 + control_dist * t0 * 0.8
-        c3 = p1 - control_dist * t1 * 0.8
-        c4 = p1 - control_dist * t1 * 0.4
-        c5 = p1
-
-        for i, ti in enumerate(t):
-            # 五次贝塞尔公式
-            b0 = (1 - ti) ** 5
-            b1 = 5 * (1 - ti) ** 4 * ti
-            b2 = 10 * (1 - ti) ** 3 * ti ** 2
-            b3 = 10 * (1 - ti) ** 2 * ti ** 3
-            b4 = 5 * (1 - ti) * ti ** 4
-            b5 = ti ** 5
-
-            curve[i] = b0 * c0 + b1 * c1 + b2 * c2 + b3 * c3 + b4 * c4 + b5 * c5
-
-        return curve
-
 
 class TrajectoryGenerator:
     """完整轨迹生成器"""
@@ -500,34 +345,10 @@ class TrajectoryGenerator:
         self.planner = planner
         self.lane_change_gen = LaneChangeGenerator()
 
-    @staticmethod
-    def _find_consecutive_lane_changes(actions: List[dict]) -> List[Tuple[int, int]]:
-        """
-        找出连续换道的区间
-
-        参数:
-            actions: 动作列表
-
-        返回:
-            [(start_idx, end_idx), ...] 连续换道的索引区间
-        """
-        groups = []
-        i = 0
-        while i < len(actions):
-            if actions[i]['action'] in ['left_change', 'right_change']:
-                start = i
-                # 继续查找连续的换道
-                while i < len(actions) and actions[i]['action'] in ['left_change', 'right_change']:
-                    i += 1
-                groups.append((start, i - 1))  # end_idx是最后一个换道的索引
-            else:
-                i += 1
-        return groups
-
     def generate_full_trajectory(self, path: List[str],
                                  actions: List[dict]) -> Tuple[np.ndarray, List[dict]]:
         """
-        生成完整的规划轨迹（支持连续换道合并）
+        生成完整的规划轨迹。
 
         参数:
             path: 车道ID列表
@@ -538,18 +359,6 @@ class TrajectoryGenerator:
         """
         if not path:
             return np.array([]), []
-
-        # 找出连续换道区间
-        lc_groups = self._find_consecutive_lane_changes(actions)
-
-        # 标记哪些索引是连续换道的一部分（非首个）
-        skip_indices = set()
-        lc_group_starts = {}
-        for start_idx, end_idx in lc_groups:
-            if end_idx > start_idx:  # 有连续换道
-                for j in range(start_idx + 1, end_idx + 1):
-                    skip_indices.add(j)
-                lc_group_starts[start_idx] = end_idx
 
         all_points = []
         segments = []
@@ -584,88 +393,35 @@ class TrajectoryGenerator:
                     i += 1
                     continue
 
-                # 检查是否是连续换道的开始
-                if i in lc_group_starts:
-                    # 连续换道：直接从起始车道换到最终目标车道
-                    final_idx = lc_group_starts[i]
-                    final_lane_id = path[final_idx]
-                    final_centerline = self.planner.get_lane_centerline(final_lane_id)
+                change_curve = self.lane_change_gen.generate_lane_change_curve(
+                    from_centerline, lane_centerline,
+                    start_ratio=0.3, end_ratio=0.7
+                )
 
-                    if final_centerline is not None and len(final_centerline) > 0:
-                        # 计算跨越的车道数，调整换道曲线长度
-                        num_lanes = final_idx - i + 1
+                segments.append({
+                    'type': 'lane_change',
+                    'from_lane': from_lane_id,
+                    'to_lane': lane_id,
+                    'action': action,
+                    'start_idx': len(all_points),
+                    'end_idx': len(all_points) + len(change_curve)
+                })
+                all_points.extend(change_curve.tolist())
 
-                        # 生成一条直接到最终车道的平滑曲线
-                        change_curve = self.lane_change_gen.generate_multi_lane_change_curve(
-                            from_centerline, final_centerline,
-                            num_lanes=num_lanes,
-                            num_points=50 * num_lanes
-                        )
+                # 换道后继续跟随目标车道的剩余部分；若后续仍需换道，下一段会重新生成单次换道。
+                start_idx = int(len(lane_centerline) * 0.7)
+                remaining_points = lane_centerline[start_idx:].copy()
 
-                        segments.append({
-                            'type': 'multi_lane_change',
-                            'from_lane': from_lane_id,
-                            'to_lane': final_lane_id,
-                            'lanes_crossed': num_lanes,
-                            'start_idx': len(all_points),
-                            'end_idx': len(all_points) + len(change_curve)
-                        })
-                        all_points.extend(change_curve.tolist())
-
-                        # 换道后跟随最终车道剩余部分
-                        start_ratio = min(0.3 + 0.15 * num_lanes, 0.85)
-                        start_pt_idx = int(len(final_centerline) * start_ratio)
-                        remaining_points = final_centerline[start_pt_idx:].copy()
-
-                        if len(remaining_points) > 0:
-                            segments.append({
-                                'type': 'lane_follow',
-                                'lane_id': final_lane_id,
-                                'start_idx': len(all_points),
-                                'end_idx': len(all_points) + len(remaining_points)
-                            })
-                            all_points.extend(remaining_points.tolist())
-
-                        # 跳过连续换道中的其他车道
-                        i = final_idx + 1
-                    else:
-                        i += 1
-
-                elif i in skip_indices:
-                    # 这是连续换道的中间部分，已经在上面处理过了，跳过
-                    i += 1
-
-                else:
-                    # 单次换道
-                    change_curve = self.lane_change_gen.generate_lane_change_curve(
-                        from_centerline, lane_centerline,
-                        start_ratio=0.3, end_ratio=0.7
-                    )
-
+                if len(remaining_points) > 0:
                     segments.append({
-                        'type': 'lane_change',
-                        'from_lane': from_lane_id,
-                        'to_lane': lane_id,
-                        'action': action,
+                        'type': 'lane_follow',
+                        'lane_id': lane_id,
                         'start_idx': len(all_points),
-                        'end_idx': len(all_points) + len(change_curve)
+                        'end_idx': len(all_points) + len(remaining_points)
                     })
-                    all_points.extend(change_curve.tolist())
+                    all_points.extend(remaining_points.tolist())
 
-                    # 换道后继续跟随目标车道的剩余部分
-                    start_idx = int(len(lane_centerline) * 0.7)
-                    remaining_points = lane_centerline[start_idx:].copy()
-
-                    if len(remaining_points) > 0:
-                        segments.append({
-                            'type': 'lane_follow',
-                            'lane_id': lane_id,
-                            'start_idx': len(all_points),
-                            'end_idx': len(all_points) + len(remaining_points)
-                        })
-                        all_points.extend(remaining_points.tolist())
-
-                    i += 1
+                i += 1
             else:
                 i += 1
 

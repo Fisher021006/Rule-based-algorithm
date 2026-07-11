@@ -54,6 +54,18 @@ def _default(defaults: dict[str, Any], key: str, fallback: Any) -> Any:
     return defaults.get(key, fallback)
 
 
+def _default_pair(defaults: dict[str, Any], key: str) -> list[float] | None:
+    """从配置文件读取可选二元坐标。"""
+
+    value = defaults.get(key)
+    if value in (None, ""):
+        return None
+    parts = value.replace(",", " ").split() if isinstance(value, str) else list(value)
+    if len(parts) != 2:
+        raise ValueError(f"{key} must contain exactly two numbers")
+    return [float(parts[0]), float(parts[1])]
+
+
 def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     """创建 Adapter 命令行参数解析器。
 
@@ -113,6 +125,10 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--obu-topic", default=_default(defaults, "obu_topic", os.getenv("ROS_OBU_TOPIC", "/obu/source")))
     parser.add_argument("--scene-main-ptc-id", default=_default(defaults, "scene_main_ptc_id", os.getenv("ROS_SCENE_MAIN_PTC_ID", "")))
     parser.add_argument("--scene-exposed-ptc-id", default=_default(defaults, "scene_exposed_ptc_id", os.getenv("ROS_SCENE_EXPOSED_PTC_ID", "")))
+    parser.add_argument("--scene-main-start-xy", nargs=2, type=float, default=_default_pair(defaults, "scene_main_start_xy"))
+    parser.add_argument("--scene-main-start-latlon", nargs=2, type=float, default=_default_pair(defaults, "scene_main_start_latlon"))
+    parser.add_argument("--scene-main-goal-xy", nargs=2, type=float, default=_default_pair(defaults, "scene_main_goal_xy"))
+    parser.add_argument("--scene-main-goal-latlon", nargs=2, type=float, default=_default_pair(defaults, "scene_main_goal_latlon"))
     return parser
 
 
@@ -445,6 +461,10 @@ class VirtualRedisRosAdapter:
             obu_topic=self.args.obu_topic,
             scene_main_ptc_id=self.args.scene_main_ptc_id,
             scene_exposed_ptc_id=self.args.scene_exposed_ptc_id,
+            scene_main_start_xy=self.args.scene_main_start_xy,
+            scene_main_start_latlon=self.args.scene_main_start_latlon,
+            scene_main_goal_xy=self.args.scene_main_goal_xy,
+            scene_main_goal_latlon=self.args.scene_main_goal_latlon,
             plan_hz=self.args.plan_hz,
             control_hz=self.args.control_hz,
             trajectory_topic=self.args.trajectory_topic,

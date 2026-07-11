@@ -19,9 +19,4 @@ LANE_CHANGE_CONFIG = {
     'single_num_points': 50,  # 曲线采样点数 (范围: 30~100，越大越平滑)
     'single_control_factor': 3.0,  # 贝塞尔控制点系数 (范围: 2.0~5.0，越小曲线越圆润)
 
-    # === 多车道换道参数 ===
-    'multi_num_points_per_lane': 50,  # 每跨一个车道增加的点数
-    'multi_control_factor': 2.5,  # 五次贝塞尔控制点系数 (范围: 2.0~4.0)
-    'multi_start_adjust': 0.05,  # 每多跨一个车道，起点提前的比例
-    'multi_end_adjust': 0.05,  # 每多跨一个车道，终点延后的比例
 }

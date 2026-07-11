@@ -60,3 +60,4 @@ xodr_parser/data/nongan_v5_1202（农安地图完整版）/nongan_v5_1202/shp/
 
 # Platform integration payload logs
 platform_integration/logs/platform_redis_ros_adapter/redis_control_payloads/
+platform_integration/logs/platform_redis_ros_adapter/redis_background_payloads/

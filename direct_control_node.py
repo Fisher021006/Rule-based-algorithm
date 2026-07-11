@@ -181,6 +181,10 @@ def build_arg_parser():
         default=_get_env("ROS_SCENE_MAIN_PTC_ID", default=""),
         help="场景算法锁定的主车 ptc_id；为空时按默认规则选取 OBU 车辆",
     )
+    parser.add_argument("--scene-main-start-xy", nargs=2, type=float, metavar=("X", "Y"), help="场景主车起点投影坐标")
+    parser.add_argument("--scene-main-start-latlon", nargs=2, type=float, metavar=("LAT", "LON"), help="场景主车起点经纬度")
+    parser.add_argument("--scene-main-goal-xy", nargs=2, type=float, metavar=("X", "Y"), help="场景主车终点投影坐标")
+    parser.add_argument("--scene-main-goal-latlon", nargs=2, type=float, metavar=("LAT", "LON"), help="场景主车终点经纬度")
     parser.add_argument(
         "--scene-algorithm-symbol",
         default=_get_env("ROS_SCENE_ALGORITHM_SYMBOL", default="scenarios.scene_algorithm.scene_algorithm"),
@@ -339,6 +343,25 @@ class DirectControlNode:
         self._last_plan_failure_log_ts = 0.0
 
         self.goal_xy = parse_point_args("goal", args.goal_xy, args.goal_latlon, self.transformer_to_proj)
+        self.scene_main_start_xy = None
+        self.scene_main_goal_xy = None
+        has_main_start = args.scene_main_start_xy is not None or args.scene_main_start_latlon is not None
+        has_main_goal = args.scene_main_goal_xy is not None or args.scene_main_goal_latlon is not None
+        if has_main_start != has_main_goal:
+            raise ValueError("场景主车路线输入必须同时提供起点和终点。")
+        if has_main_start and has_main_goal:
+            self.scene_main_start_xy = parse_point_args(
+                "scene-main-start",
+                args.scene_main_start_xy,
+                args.scene_main_start_latlon,
+                self.transformer_to_proj,
+            )
+            self.scene_main_goal_xy = parse_point_args(
+                "scene-main-goal",
+                args.scene_main_goal_xy,
+                args.scene_main_goal_latlon,
+                self.transformer_to_proj,
+            )
         self.start_xy = None
         self.goal_reached = False
         self.route_initialized = False
@@ -357,6 +380,7 @@ class DirectControlNode:
         self.gvt = GVT("ego", outline, sport_params, self.xodr_parser)
         self.gvt.set_planner_mode(self.args.planner_mode)
         self.gvt.scene_target_provider.set_main_vehicle_ptc_id(self.args.scene_main_ptc_id)
+        self.gvt.scene_target_provider.set_main_route_points(self.scene_main_start_xy, self.scene_main_goal_xy)
         self.gvt.scene_target_provider.set_scene_algorithm_symbol(self.args.scene_algorithm_symbol)
         self.gvt.scene_target_provider.set_runtime_dt(1.0 / max(float(self.args.plan_hz), 1e-3))
         self.gvt.config["local_fsm"]["arrive_complete_dist"] = float(self.args.arrive_dist)

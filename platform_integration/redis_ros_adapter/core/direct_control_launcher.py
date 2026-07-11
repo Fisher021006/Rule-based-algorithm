@@ -64,6 +64,10 @@ class DirectControlLauncher:
         obu_topic: str,
         scene_main_ptc_id: str,
         scene_exposed_ptc_id: str,
+        scene_main_start_xy: list[float] | None,
+        scene_main_start_latlon: list[float] | None,
+        scene_main_goal_xy: list[float] | None,
+        scene_main_goal_latlon: list[float] | None,
         plan_hz: float,
         control_hz: float,
         trajectory_topic: str,
@@ -118,6 +122,14 @@ class DirectControlLauncher:
             command.extend(["--scene-algorithm-symbol", str(scene_algorithm_symbol)])
         if scene_main_ptc_id:
             command.extend(["--scene-main-ptc-id", str(scene_main_ptc_id)])
+        if scene_main_start_xy:
+            command.extend(["--scene-main-start-xy", str(scene_main_start_xy[0]), str(scene_main_start_xy[1])])
+        if scene_main_start_latlon:
+            command.extend(["--scene-main-start-latlon", str(scene_main_start_latlon[0]), str(scene_main_start_latlon[1])])
+        if scene_main_goal_xy:
+            command.extend(["--scene-main-goal-xy", str(scene_main_goal_xy[0]), str(scene_main_goal_xy[1])])
+        if scene_main_goal_latlon:
+            command.extend(["--scene-main-goal-latlon", str(scene_main_goal_latlon[0]), str(scene_main_goal_latlon[1])])
         env = os.environ.copy()
         if scene_exposed_ptc_id:
             env["ROS_SCENE_EXPOSED_PTC_ID"] = str(scene_exposed_ptc_id)

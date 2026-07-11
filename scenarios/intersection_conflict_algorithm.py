@@ -422,8 +422,20 @@ def _build_conflict_target_output(
     scene_status: str,
     scene_debug: dict[str, Any],
 ) -> dict[str, Any]:
-    line = _resolve_gvt_line(context, metrics)
-    target_s = float(sync_target.get("target_s_m", metrics.get("gvt_s_conflict_m", line.current_s)))
+    route_line = _route_line(context.ego_vehicle)
+    route_target_s = float(sync_target.get("target_s_m", metrics.get("gvt_s_conflict_m", 0.0)))
+    route_target_xy = np.asarray(metrics.get("conflict_xy", [context.ego_vehicle.x, context.ego_vehicle.y]), dtype=float)
+    if route_line is not None:
+        route_lower_s = float(route_line.current_s) + float(CFG["min_target_progress_m"])
+        route_upper_s = max(route_lower_s, float(route_line.cumulative_s[-1]))
+        route_target_s = _clamp(route_target_s, route_lower_s, route_upper_s)
+        route_target_xy, _route_target_heading = get_path_point_at_s(
+            route_line.line,
+            route_target_s,
+            route_line.cumulative_s,
+        )
+    line = _select_gvt_local_line_for_point(context, route_target_xy)
+    _, target_s, _ = project_point_to_path(np.asarray(route_target_xy, dtype=float), line.line)
     target_v = float(sync_target.get("target_v_mps", context.ego_vehicle.v))
     plan_t = float(sync_target.get("plan_t_s", 1.0))
     limits = _read_vehicle_limits(context)
@@ -433,6 +445,9 @@ def _build_conflict_target_output(
         limits.max_acc,
     )
     scene_debug["target_acc_mps2"] = float(target_a)
+    scene_debug["route_target_s_m"] = float(route_target_s)
+    scene_debug["route_target_xy"] = [float(route_target_xy[0]), float(route_target_xy[1])]
+    scene_debug["output_target_line_source"] = "local_planner_line_projected_from_route"
     return _build_line_target_output(
         context=context,
         target_line=line,
@@ -609,50 +624,47 @@ def _build_conflict_context(context: SceneContext) -> dict[str, Any]:
             "invalid_scene_reasons": ["no_main_vehicle"],
         }
 
-    best_result = None
-    best_score = float("inf")
-    best_priority = 999
-    current_gvt_line_index = int(context.ego_vehicle.current_ref_line.line_index)
-    gvt_candidate_lines = _candidate_gvt_lines(context)
-    main_candidate_lines = _candidate_main_lines(context)
-    for gvt_line in gvt_candidate_lines:
-        for main_line in main_candidate_lines:
-            result = _find_forward_conflict_point(gvt_line, main_line)
-            if not bool(result.get("valid", False)):
-                continue
-            gvt_line_priority = 0 if int(gvt_line.line_index) == current_gvt_line_index else 1
-            score = (
-                float(result["gvt_distance_to_conflict_m"])
-                + float(result["vut_distance_to_conflict_m"])
-            )
-            if gvt_line_priority < best_priority or (
-                gvt_line_priority == best_priority and score < best_score
-            ):
-                best_priority = gvt_line_priority
-                best_score = score
-                best_result = result
-                best_result["gvt_line_index"] = int(gvt_line.line_index)
-                best_result["gvt_lane_id"] = str(gvt_line.lane_id)
-                best_result["gvt_lane_sequence"] = _normalize_lane_sequence(gvt_line.lane_sequence)
-                best_result["main_line_index"] = int(main_line.line_index)
-                best_result["main_lane_id"] = str(main_line.lane_id)
-                best_result["main_lane_sequence"] = _normalize_lane_sequence(main_line.lane_sequence)
-
-    if best_result is None:
+    gvt_line = _route_line(context.ego_vehicle)
+    main_line = _route_line(context.main_vehicle)
+    if gvt_line is None or main_line is None:
         return {
             "valid": False,
-            "reason": "no_forward_conflict_point",
+            "reason": "route_intent_missing",
             "conflict_type": conflict_type,
-            "gvt_candidate_line_count": len(gvt_candidate_lines),
-            "gvt_candidate_lane_ids": [str(line.lane_id) for line in gvt_candidate_lines],
-            "invalid_scene_reasons": ["no_forward_conflict_point"],
+            "gvt_route_reason": _route_intent_reason(context.ego_vehicle),
+            "main_route_reason": _route_intent_reason(context.main_vehicle),
+            "invalid_scene_reasons": ["route_intent_missing"],
         }
+
+    best_result = _find_forward_conflict_point(gvt_line, main_line)
+    if not bool(best_result.get("valid", False)):
+        return {
+            "valid": False,
+            "reason": "no_forward_route_conflict_point",
+            "conflict_type": conflict_type,
+            "gvt_lane_sequence": _normalize_lane_sequence(gvt_line.lane_sequence),
+            "main_lane_sequence": _normalize_lane_sequence(main_line.lane_sequence),
+            "invalid_scene_reasons": ["no_forward_route_conflict_point"],
+        }
+    best_result["gvt_line_index"] = int(gvt_line.line_index)
+    best_result["gvt_lane_id"] = str(gvt_line.lane_id)
+    best_result["gvt_lane_sequence"] = _normalize_lane_sequence(gvt_line.lane_sequence)
+    best_result["main_line_index"] = int(main_line.line_index)
+    best_result["main_lane_id"] = str(main_line.lane_id)
+    best_result["main_lane_sequence"] = _normalize_lane_sequence(main_line.lane_sequence)
+
+    conflict_xy = best_result["conflict_xy"]
+    print(
+        "[intersection_conflict] conflict_xy="
+        f"({float(conflict_xy[0]):.3f}, {float(conflict_xy[1]):.3f})",
+        flush=True,
+    )
 
     return {
         "valid": True,
         "reason": "conflict_point_locked",
         "conflict_type": conflict_type,
-        "conflict_xy": list(best_result["conflict_xy"]),
+        "conflict_xy": list(conflict_xy),
         "conflict_angle_deg": float(best_result["conflict_angle_deg"]),
         "segment_distance_m": float(best_result["segment_distance_m"]),
         "gvt_line_index": int(best_result["gvt_line_index"]),
@@ -701,23 +713,16 @@ def _compute_conflict_metrics(
             "invalid_scene_reasons": ["no_main_vehicle"],
         }
 
-    gvt_line = _resolve_line(
-        context.ego_vehicle.candidate_ref_lines,
-        locked_conflict.get("gvt_lane_sequence", []),
-        str(locked_conflict.get("gvt_lane_id", "")),
-        int(locked_conflict.get("gvt_line_index", 0)),
-    )
-    if gvt_line is None:
-        gvt_line = context.ego_vehicle.current_ref_line
-
-    main_line = _resolve_line(
-        context.main_vehicle.candidate_ref_lines,
-        locked_conflict.get("main_lane_sequence", []),
-        str(locked_conflict.get("main_lane_id", "")),
-        int(locked_conflict.get("main_line_index", 0)),
-    )
-    if main_line is None:
-        main_line = context.main_vehicle.current_ref_line
+    gvt_line = _route_line(context.ego_vehicle)
+    main_line = _route_line(context.main_vehicle)
+    if gvt_line is None or main_line is None:
+        return {
+            "valid": False,
+            "reason": "route_intent_missing",
+            "gvt_route_reason": _route_intent_reason(context.ego_vehicle),
+            "main_route_reason": _route_intent_reason(context.main_vehicle),
+            "invalid_scene_reasons": ["route_intent_missing"],
+        }
 
     conflict_xy = np.asarray(locked_conflict.get("conflict_xy", [0.0, 0.0]), dtype=float)
     _, gvt_s_conflict, gvt_d_conflict = project_point_to_path(conflict_xy, gvt_line.line)
@@ -1277,99 +1282,41 @@ def _gvt_cleared_conflict(metrics: dict[str, Any]) -> bool:
     return bool(distance <= -clear_after or longitudinal <= -clear_after)
 
 
-def _candidate_main_lines(context: SceneContext) -> list[ReferenceLineView]:
-    if context.main_vehicle is None:
-        return []
-    current = context.main_vehicle.current_ref_line
-    lines = [current]
-    for line in context.main_vehicle.candidate_ref_lines:
-        if int(line.line_index) == int(current.line_index):
-            continue
-        lines.append(line)
-    return lines
-
-
-def _candidate_gvt_lines(context: SceneContext) -> list[ReferenceLineView]:
-    current = context.ego_vehicle.current_ref_line
-    lines = [current]
-    for line in context.ego_vehicle.candidate_ref_lines:
-        if int(line.line_index) == int(current.line_index):
-            continue
-        lines.append(line)
-    return lines
-
-
-def _resolve_gvt_line(context: SceneContext, metrics: dict[str, Any]) -> ReferenceLineView:
-    line = _resolve_line(
-        context.ego_vehicle.candidate_ref_lines,
-        metrics.get("gvt_lane_sequence", []),
-        str(metrics.get("gvt_lane_id", "")),
-        int(metrics.get("gvt_line_index", 0)),
-    )
-    if line is not None:
-        return line
-    return context.ego_vehicle.current_ref_line
-
-
-def _resolve_line(
-    candidate_lines: list[ReferenceLineView],
-    lane_sequence: list[str] | tuple[str, ...] | None,
-    lane_id: str,
-    line_index: int | None,
-) -> ReferenceLineView | None:
-    line = _line_by_lane_sequence(candidate_lines, lane_sequence)
-    if line is not None:
-        return line
-    line = _line_by_lane_id(candidate_lines, lane_id)
-    if line is not None:
-        return line
-    return _line_by_index(candidate_lines, line_index)
-
-
-def _line_by_index(candidate_lines: list[ReferenceLineView], line_index: int | None) -> ReferenceLineView | None:
-    if line_index is None:
+def _route_line(vehicle: Any | None) -> ReferenceLineView | None:
+    if vehicle is None:
         return None
-    for line in candidate_lines:
-        if int(line.line_index) == int(line_index):
-            return line
-    return None
-
-
-def _line_by_lane_id(candidate_lines: list[ReferenceLineView], lane_id: str) -> ReferenceLineView | None:
-    target_lane_id = str(lane_id or "")
-    if not target_lane_id:
+    route_intent = getattr(vehicle, "route_intent", None)
+    if route_intent is None or not bool(getattr(route_intent, "valid", False)):
         return None
-    for line in candidate_lines:
-        if str(line.lane_id) == target_lane_id:
-            return line
-    return None
-
-
-def _line_by_lane_sequence(
-    candidate_lines: list[ReferenceLineView],
-    lane_sequence: list[str] | tuple[str, ...] | None,
-) -> ReferenceLineView | None:
-    target_sequence = _normalize_lane_sequence(lane_sequence)
-    if not target_sequence:
+    line = getattr(route_intent, "route_line", None)
+    if line is None:
         return None
-    target_set = set(target_sequence)
-    best_line = None
-    best_score: tuple[int, int, int] | None = None
-    for line in candidate_lines:
-        line_sequence = _normalize_lane_sequence(line.lane_sequence)
-        overlap_count = sum(1 for lane_id in line_sequence if lane_id in target_set)
-        if overlap_count <= 0:
-            continue
-        first_match_idx = len(target_sequence)
-        for idx, lane_id in enumerate(target_sequence):
-            if lane_id in line_sequence:
-                first_match_idx = idx
-                break
-        score = (overlap_count, -first_match_idx, -len(line_sequence))
-        if best_score is None or score > best_score:
-            best_score = score
-            best_line = line
-    return best_line
+    return line
+
+
+def _route_intent_reason(vehicle: Any | None) -> str:
+    if vehicle is None:
+        return "no_vehicle"
+    route_intent = getattr(vehicle, "route_intent", None)
+    if route_intent is None:
+        return "no_route_intent"
+    if bool(getattr(route_intent, "valid", False)):
+        return "route_line_ok"
+    return str(getattr(route_intent, "reason", "route_intent_invalid"))
+
+
+def _select_gvt_local_line_for_point(context: SceneContext, point_xy: np.ndarray) -> ReferenceLineView:
+    """从现有局部参考线中选一条承接 route 目标点的线。"""
+
+    lines = list(context.ego_vehicle.candidate_ref_lines) or [context.ego_vehicle.current_ref_line]
+    query = np.asarray(point_xy, dtype=float)
+
+    def score(line: ReferenceLineView) -> tuple[float, float, int]:
+        _idx, s, d = project_point_to_path(query, line.line)
+        forward_gap = max(0.0, float(line.current_s) - float(s))
+        return (float(abs(d)) + 10.0 * forward_gap, float(abs(d)), int(line.line_index))
+
+    return min(lines, key=score)
 
 
 def _normalize_lane_sequence(lane_sequence: list[str] | tuple[str, ...] | None) -> list[str]:

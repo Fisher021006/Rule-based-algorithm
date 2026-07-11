@@ -16,16 +16,21 @@ from typing import Any
 import numpy as np
 
 from drivable_lanes_planner.planner import DrivableLanesExtender
+from global_planner.curve_planner.planner import CurvePlanner, TrajectoryGenerator
+from global_planner.curve_planner.tools import project_and_cut_path
 from planning_runtime.frame import PlanningActorState, PlanningFrame, build_planning_actor_state
 from planning_runtime.scene.map_views import (
+    build_route_line_view,
     build_reference_views_from_extender_result,
     build_reference_views_from_lane_sequences,
     build_reference_views_from_frame,
+    build_reference_views_from_refer_lines,
     extend_lane_forward,
 )
 from planning_runtime.scene.types import (
     SceneAlgorithmOutput,
     SceneContext,
+    SceneRouteIntent,
     SceneVehicleState,
 )
 from traj_planner.config import VehicleState
@@ -171,6 +176,13 @@ class SceneTargetProvider:
         self.last_scene_context: SceneContext | None = None
         self.last_scene_algorithm_timing_ms: float = 0.0
         self._main_lane_locator: DrivableLanesExtender | None = None
+        self.main_route_start_xy: np.ndarray | None = None
+        self.main_route_goal_xy: np.ndarray | None = None
+        self._route_curve_planner: CurvePlanner | None = None
+        self._main_route_cache_key: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._main_route_cache: dict[str, Any] | None = None
+        self._ego_route_cache_key: tuple[tuple[str, ...], tuple[float, float], tuple[float, float]] | None = None
+        self._ego_route_cache: dict[str, Any] | None = None
         self.set_scene_algorithm_symbol(scene_algorithm_symbol)
 
     def set_runtime(self, step_index: int, time_s: float) -> None:
@@ -184,6 +196,18 @@ class SceneTargetProvider:
 
         self.main_vehicle_ptc_id = str(ptc_id or "").strip()
 
+    def set_main_route_points(
+        self,
+        start_xy: np.ndarray | None,
+        goal_xy: np.ndarray | None,
+    ) -> None:
+        """设置场景主车由起终点定义的路线意图输入。"""
+
+        self.main_route_start_xy = None if start_xy is None else np.asarray(start_xy, dtype=float)[:2]
+        self.main_route_goal_xy = None if goal_xy is None else np.asarray(goal_xy, dtype=float)[:2]
+        self._main_route_cache_key = None
+        self._main_route_cache = None
+
     def set_runtime_dt(self, dt: float) -> None:
         """更新当前运行时周期，用于写入统一视图上下文。"""
 
@@ -195,6 +219,174 @@ class SceneTargetProvider:
         normalized = str(symbol_path or "").strip() or DEFAULT_SCENE_ALGORITHM_SYMBOL
         self.scene_algorithm_symbol = normalized
         self.scene_algorithm = load_scene_algorithm(normalized)
+
+    def uses_route_intent(self) -> bool:
+        """当前场景算法是否需要把全局 route line 纳入规划输入。"""
+
+        return "intersection_conflict_algorithm" in str(self.scene_algorithm_symbol)
+
+    def _get_route_curve_planner(self) -> CurvePlanner:
+        """返回用于场景路线意图的全局曲线路径规划器。"""
+
+        if self._route_curve_planner is None:
+            self._route_curve_planner = CurvePlanner(self.parser)
+        return self._route_curve_planner
+
+    @staticmethod
+    def _route_cache_point(point: np.ndarray) -> tuple[float, float]:
+        return (round(float(point[0]), 3), round(float(point[1]), 3))
+
+    @staticmethod
+    def _road_sequence_from_path(planned_path: list[str]) -> list[str]:
+        road_sequence: list[str] = []
+        seen: set[str] = set()
+        for lane_id in planned_path:
+            road_id = str(lane_id).split(".")[0]
+            if road_id and road_id not in seen:
+                road_sequence.append(road_id)
+                seen.add(road_id)
+        return road_sequence
+
+    def _build_route_cache_from_plan(
+        self,
+        *,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        planned_path: list[str],
+        planned_actions: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """把全局 lane 路径转换成连续路线几何。"""
+
+        normalized_path = [str(lane_id) for lane_id in planned_path if str(lane_id)]
+        if not normalized_path:
+            return None
+        planner = self._get_route_curve_planner()
+        try:
+            path_xy, _segments = TrajectoryGenerator(planner).generate_full_trajectory(
+                normalized_path,
+                list(planned_actions),
+            )
+            if path_xy.ndim != 2 or len(path_xy) < 2:
+                return None
+            path = project_and_cut_path(path_xy[:, :2], np.asarray(start_xy, dtype=float), np.asarray(goal_xy, dtype=float))
+        except Exception:
+            return None
+        if path.ndim != 2 or len(path) < 2:
+            return None
+        return {
+            "route_line": np.asarray(path[:, :2], dtype=float),
+            "planned_path": normalized_path,
+            "planned_actions": list(planned_actions),
+            "road_sequence": self._road_sequence_from_path(normalized_path),
+        }
+
+    def _ensure_ego_route_cache(self, planning_frame: PlanningFrame) -> dict[str, Any] | None:
+        start_raw = planning_frame.config.get("sg_info", {}).get("sp")
+        if start_raw is None:
+            return None
+        start_xy = np.asarray(start_raw, dtype=float)
+        goal_xy = np.asarray(planning_frame.goal_xy, dtype=float)
+        if start_xy.ndim == 0 or goal_xy.ndim == 0 or start_xy.shape[0] < 2 or goal_xy.shape[0] < 2:
+            return None
+        planned_path = [str(lane_id) for lane_id in planning_frame.planned_path if str(lane_id)]
+        cache_key = (
+            tuple(planned_path),
+            self._route_cache_point(start_xy),
+            self._route_cache_point(goal_xy),
+        )
+        if self._ego_route_cache_key == cache_key and self._ego_route_cache is not None:
+            return self._ego_route_cache
+        cache = self._build_route_cache_from_plan(
+            start_xy=start_xy[:2],
+            goal_xy=goal_xy[:2],
+            planned_path=planned_path,
+            planned_actions=list(planning_frame.planned_actions),
+        )
+        self._ego_route_cache_key = cache_key
+        self._ego_route_cache = cache
+        return cache
+
+    def _ensure_main_route_cache(self) -> dict[str, Any] | None:
+        if self.main_route_start_xy is None or self.main_route_goal_xy is None:
+            return None
+        start_xy = np.asarray(self.main_route_start_xy, dtype=float)[:2]
+        goal_xy = np.asarray(self.main_route_goal_xy, dtype=float)[:2]
+        cache_key = (self._route_cache_point(start_xy), self._route_cache_point(goal_xy))
+        if self._main_route_cache_key == cache_key and self._main_route_cache is not None:
+            return self._main_route_cache
+        planner = self._get_route_curve_planner()
+        planned_path, planned_actions = planner.plan_route(
+            float(start_xy[0]),
+            float(start_xy[1]),
+            float(goal_xy[0]),
+            float(goal_xy[1]),
+        )
+        cache = self._build_route_cache_from_plan(
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            planned_path=[str(lane_id) for lane_id in planned_path],
+            planned_actions=list(planned_actions),
+        )
+        self._main_route_cache_key = cache_key
+        self._main_route_cache = cache
+        return cache
+
+    def _build_route_intent(
+        self,
+        *,
+        role: str,
+        start_xy: np.ndarray | None,
+        goal_xy: np.ndarray | None,
+        query_xy: np.ndarray,
+        line_index: int,
+        cache: dict[str, Any] | None,
+    ) -> SceneRouteIntent:
+        """根据缓存路线和当前坐标构造一帧路线意图。"""
+
+        if start_xy is None or goal_xy is None:
+            return SceneRouteIntent(
+                start_xy=start_xy,
+                goal_xy=goal_xy,
+                valid=False,
+                reason=f"{role}_route_points_missing",
+            )
+        if cache is None:
+            return SceneRouteIntent(
+                start_xy=np.asarray(start_xy, dtype=float)[:2],
+                goal_xy=np.asarray(goal_xy, dtype=float)[:2],
+                valid=False,
+                reason=f"{role}_route_plan_failed",
+            )
+        try:
+            route_view = build_route_line_view(
+                np.asarray(cache["route_line"], dtype=float),
+                np.asarray(query_xy, dtype=float),
+                line_index=int(line_index),
+                lane_sequence=list(cache.get("planned_path", [])),
+                lane_id=str((cache.get("planned_path") or ["route"])[0]),
+                lateral_step=0,
+                slice_from_query=True,
+            )
+        except ValueError as exc:
+            return SceneRouteIntent(
+                start_xy=np.asarray(start_xy, dtype=float)[:2],
+                goal_xy=np.asarray(goal_xy, dtype=float)[:2],
+                planned_path=list(cache.get("planned_path", [])),
+                planned_actions=list(cache.get("planned_actions", [])),
+                road_sequence=list(cache.get("road_sequence", [])),
+                valid=False,
+                reason=f"{role}_route_line_invalid:{exc}",
+            )
+        return SceneRouteIntent(
+            start_xy=np.asarray(start_xy, dtype=float)[:2],
+            goal_xy=np.asarray(goal_xy, dtype=float)[:2],
+            planned_path=list(cache.get("planned_path", [])),
+            planned_actions=list(cache.get("planned_actions", [])),
+            road_sequence=list(cache.get("road_sequence", [])),
+            route_line=route_view,
+            valid=True,
+            reason="route_line_ok",
+        )
 
     def resolve_main_actor(
         self,
@@ -356,6 +548,14 @@ class SceneTargetProvider:
             main_lane_s = float(main_current.current_s)
             main_lane_d = float(main_current.current_d)
             main_lane_heading = float(main_actor.heading)
+        main_route_intent = self._build_route_intent(
+            role="main",
+            start_xy=self.main_route_start_xy,
+            goal_xy=self.main_route_goal_xy,
+            query_xy=np.array([float(main_actor.x), float(main_actor.y)], dtype=float),
+            line_index=-1,
+            cache=self._ensure_main_route_cache(),
+        )
         # 主车相对自车的 s / d 关系统一投影到自车当前主参考线上。
         _, main_s_on_ego, main_d_on_ego = project_point_to_path(
             np.array([main_actor.x, main_actor.y], dtype=float),
@@ -383,17 +583,43 @@ class SceneTargetProvider:
             lane_d=float(main_lane_d),
             lane_heading=float(main_lane_heading),
             lane_centerline=main_lane_centerline,
+            route_intent=main_route_intent,
         )
 
-    def _build_ego_vehicle_state(self, planning_frame: PlanningFrame) -> SceneVehicleState:
+    def _build_ego_vehicle_state(
+        self,
+        planning_frame: PlanningFrame,
+        planning_input: PlanningInput | None = None,
+    ) -> SceneVehicleState:
         """根据原始运行时帧构造统一视图中的自车状态。"""
 
         ego_point = np.array([planning_frame.ego_state.x, planning_frame.ego_state.y], dtype=float)
-        ego_views = build_reference_views_from_frame(
-            planning_frame=planning_frame,
-            query_point=ego_point,
-        )
+        if planning_input is not None:
+            ego_views = build_reference_views_from_refer_lines(
+                refer_lines=planning_input.refer_lines,
+                refer_line_lane_ids=planning_input.refer_line_lane_ids,
+                refer_line_lane_sequences=planning_input.refer_line_lane_sequences,
+                refer_line_lateral_steps=planning_input.refer_line_lateral_steps,
+                query_point=ego_point,
+            )
+        else:
+            ego_views = build_reference_views_from_frame(
+                planning_frame=planning_frame,
+                query_point=ego_point,
+            )
         current_view = ego_views[0]
+        route_intent = None
+        if self.uses_route_intent():
+            start_raw = planning_frame.config.get("sg_info", {}).get("sp")
+            start_xy = None if start_raw is None else np.asarray(start_raw, dtype=float)[:2]
+            route_intent = self._build_route_intent(
+                role="ego",
+                start_xy=start_xy,
+                goal_xy=np.asarray(planning_frame.goal_xy, dtype=float)[:2],
+                query_xy=ego_point,
+                line_index=-1,
+                cache=self._ensure_ego_route_cache(planning_frame),
+            )
         ego_lane_s, ego_lane_d, ego_lane_heading, ego_lane_centerline = self._project_to_full_lane(
             str(current_view.lane_id),
             float(planning_frame.ego_state.x),
@@ -421,6 +647,7 @@ class SceneTargetProvider:
             lane_d=float(ego_lane_d),
             lane_heading=float(ego_lane_heading),
             lane_centerline=ego_lane_centerline,
+            route_intent=route_intent,
         )
 
     @staticmethod
@@ -448,7 +675,7 @@ class SceneTargetProvider:
         它本身不执行场景算法，也不是局部规划器内部的 `PlanningContext`。
         """
 
-        ego_vehicle = self._build_ego_vehicle_state(planning_frame)
+        ego_vehicle = self._build_ego_vehicle_state(planning_frame, planning_input)
         main_vehicle = self._build_main_vehicle_state(planning_frame, ego_vehicle)
         scene_context = SceneContext(
             frame_index=int(planning_frame.frame_index),

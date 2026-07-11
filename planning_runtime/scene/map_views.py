@@ -214,6 +214,44 @@ def build_reference_views_from_refer_lines(
     return views
 
 
+def build_route_line_view(
+    route_line: np.ndarray,
+    query_point: np.ndarray,
+    *,
+    line_index: int,
+    lane_sequence: list[str],
+    lane_id: str | None = None,
+    lateral_step: int = 0,
+    slice_from_query: bool = True,
+) -> ReferenceLineView:
+    """把全局路线几何线转换成 scene 算法使用的路线视图。"""
+
+    line_xy = np.asarray(route_line, dtype=float)
+    if line_xy.ndim != 2 or len(line_xy) < 2:
+        raise ValueError("route line 点数不足，无法构造参考线")
+    line_xy = line_xy[:, :2]
+    query_xy = np.asarray(query_point, dtype=float)[:2]
+    if slice_from_query:
+        line_xy = slice_centerline_from_projection(line_xy, query_xy)
+    if line_xy.ndim != 2 or len(line_xy) < 2:
+        raise ValueError("route line 截取后点数不足，无法构造参考线")
+
+    cumulative_s = calculate_path_cumulative_distance(line_xy)
+    _, current_s, current_d = project_point_to_path(query_xy, line_xy)
+    normalized_sequence = [str(lane) for lane in lane_sequence if str(lane)]
+    resolved_lane_id = str(lane_id or (normalized_sequence[0] if normalized_sequence else "route"))
+    return ReferenceLineView(
+        line_index=int(line_index),
+        lane_id=resolved_lane_id,
+        lane_sequence=normalized_sequence,
+        lateral_step=int(lateral_step),
+        line=line_xy,
+        cumulative_s=cumulative_s,
+        current_s=float(current_s),
+        current_d=float(current_d),
+    )
+
+
 def build_reference_views_from_lane_sequences(
     parser: XODRParser,
     lane_sequences: list[list[str]],

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -22,6 +22,20 @@ class ReferenceLineView:
     cumulative_s: np.ndarray
     current_s: float
     current_d: float
+
+
+@dataclass
+class SceneRouteIntent:
+    """车辆由起终点派生出的全局路线意图。"""
+
+    start_xy: np.ndarray | None
+    goal_xy: np.ndarray | None
+    planned_path: list[str] = field(default_factory=list)
+    planned_actions: list[dict[str, Any]] = field(default_factory=list)
+    road_sequence: list[str] = field(default_factory=list)
+    route_line: ReferenceLineView | None = None
+    valid: bool = False
+    reason: str = ""
 
 
 @dataclass
@@ -49,6 +63,7 @@ class SceneVehicleState:
     lane_d: float = 0.0
     lane_heading: float = 0.0
     lane_centerline: np.ndarray | None = None
+    route_intent: SceneRouteIntent | None = None
 
 
 @dataclass
