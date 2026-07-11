@@ -29,6 +29,25 @@ def _safe_filename_part(value: object, fallback: str) -> str:
     return text.strip("._-") or fallback
 
 
+def _log_algorithm_label(planner_mode: str, scene_algorithm_symbol: str) -> str:
+    """根据实际启动参数生成便于筛选的日志算法标签。"""
+
+    mode = str(planner_mode or "").strip().lower()
+    if mode == "local_sampling":
+        return "local_sampling"
+    if mode != "scene_target":
+        return _safe_filename_part(mode, "unknown_planner")
+
+    parts = [part for part in str(scene_algorithm_symbol or "").strip().split(".") if part]
+    if not parts:
+        return "scene_target_default"
+
+    # scene symbol 通常是 ``package.module.function``，日志以模块名代表场景算法。
+    module_name = parts[-2] if len(parts) >= 2 else parts[-1]
+    scenario_name = re.sub(r"_algorithm$", "", module_name)
+    return f"scene_{_safe_filename_part(scenario_name, 'unknown')}"
+
+
 class DirectControlLauncher:
     """管理单个 `direct_control_node.py` 进程的生命周期。
 
@@ -87,7 +106,8 @@ class DirectControlLauncher:
         task_id = _safe_filename_part(task.task_id, "unknown_task")
         case_id = _safe_filename_part(task.case_id, "unknown_case")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        log_path = self.log_dir / f"direct_control_node_task_{task_id}_case_{case_id}_{timestamp}.log"
+        algorithm_label = _log_algorithm_label(planner_mode, scene_algorithm_symbol)
+        log_path = self.log_dir / f"{algorithm_label}_{timestamp}_task_{task_id}_case_{case_id}.log"
         self.current_log_path = log_path
         self.log_file = open(log_path, "w", encoding="utf-8")
         command = [

@@ -1394,7 +1394,7 @@ def _compute_blind_spot_metrics(
         "ttc_debug_s": float(ttc_debug),
         "closing_speed_mps": float(closing_speed),
         "lane_change_progress_ratio": float(lane_change_progress),
-        "vut_lane_change_complete": bool(current_abs_d <= complete_d or lane_change_progress >= 0.98),
+        "vut_lane_change_complete": bool(current_abs_d <= complete_d or lane_change_progress >= 0.85),
         "hard_collision_risk": bool(hard_collision["hard_collision_risk"]),
         "longitudinal_overlap_m": float(hard_collision["longitudinal_overlap_m"]),
         "lateral_overlap_m": float(hard_collision["lateral_overlap_m"]),
