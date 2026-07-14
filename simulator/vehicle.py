@@ -53,7 +53,7 @@ class VUT:
 class GVT:
     """围绕全局路线缓存和局部规划器的自车包装类。"""
 
-    def __init__(self, ptcId, outline, sportParams, xodr_parser):
+    def __init__(self, ptcId, outline, sportParams, xodr_parser, scene_algorithm_symbol=None):
         self.ptcId = ptcId
         wheelbase_mm = outline.get("wheelbase", 2700) or 2700
         if wheelbase_mm <= 0:
@@ -169,7 +169,9 @@ class GVT:
         self.current_road_id = None
         self.pre_traj = None
         self.pre_traj_id = 0
-        self.planner_mode: Literal["scene_target", "local_sampling"] = "scene_target"
+        self.planner_mode: Literal["scene_target", "local_sampling"] = (
+            "scene_target" if scene_algorithm_symbol else "local_sampling"
+        )
         self.scene_ref_lane_count = 5
         self.scene_runtime_step_index = 0
         self.last_planning_frame = None
@@ -177,9 +179,9 @@ class GVT:
         # 规控器
         self.lanePlanner = DrivableLanesExtender(xodr_parser)
         self.traj_planner = LocalPlanner(self.config)
-        self.scene_target_provider = self._build_scene_target_provider(xodr_parser)
+        self.scene_target_provider = self._build_scene_target_provider(xodr_parser, scene_algorithm_symbol)
 
-    def _build_scene_target_provider(self, xodr_parser):
+    def _build_scene_target_provider(self, xodr_parser, scene_algorithm_symbol=None):
         """延迟引入 scene pipeline，避免模块循环依赖。"""
 
         from planning_runtime.scene.provider import SceneTargetProvider
@@ -190,6 +192,7 @@ class GVT:
             main_lane_extender=None,
             dt=float(self.config["local_fsm"]["planner_cycle_dt"]),
             max_lane_segments=int(self.scene_ref_lane_count),
+            scene_algorithm_symbol=scene_algorithm_symbol,
         )
 
     def set_planner_mode(self, planner_mode: str) -> None:
@@ -198,6 +201,8 @@ class GVT:
         normalized = str(planner_mode or "").strip().lower()
         if normalized not in {"scene_target", "local_sampling"}:
             raise ValueError(f"unsupported planner mode: {planner_mode}")
+        if normalized == "scene_target" and self.scene_target_provider.scene_algorithm is None:
+            raise ValueError("scene_target 模式必须显式传入 scene_algorithm_symbol")
         self.planner_mode = normalized
 
     def global_planning(self, s_point, g_point, s_v=0.0):

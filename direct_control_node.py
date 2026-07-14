@@ -187,7 +187,7 @@ def build_arg_parser():
     parser.add_argument("--scene-main-goal-latlon", nargs=2, type=float, metavar=("LAT", "LON"), help="场景主车终点经纬度")
     parser.add_argument(
         "--scene-algorithm-symbol",
-        default=_get_env("ROS_SCENE_ALGORITHM_SYMBOL", default="scenarios.scene_algorithm.scene_algorithm"),
+        default=_get_env("ROS_SCENE_ALGORITHM_SYMBOL", default=""),
         help="scene_target 模式下使用的场景算法符号路径，例如 scenarios.cut_in_algorithm.cut_in_algorithm",
     )
 
@@ -377,11 +377,16 @@ class DirectControlNode:
             "maxAcc": args.max_acc,
             "minAcc": args.min_acc,
         }
-        self.gvt = GVT("ego", outline, sport_params, self.xodr_parser)
+        self.gvt = GVT(
+            "ego",
+            outline,
+            sport_params,
+            self.xodr_parser,
+            scene_algorithm_symbol=self.args.scene_algorithm_symbol,
+        )
         self.gvt.set_planner_mode(self.args.planner_mode)
         self.gvt.scene_target_provider.set_main_vehicle_ptc_id(self.args.scene_main_ptc_id)
         self.gvt.scene_target_provider.set_main_route_points(self.scene_main_start_xy, self.scene_main_goal_xy)
-        self.gvt.scene_target_provider.set_scene_algorithm_symbol(self.args.scene_algorithm_symbol)
         self.gvt.scene_target_provider.set_runtime_dt(1.0 / max(float(self.args.plan_hz), 1e-3))
         self.gvt.config["local_fsm"]["arrive_complete_dist"] = float(self.args.arrive_dist)
         self.gvt.config["local_fsm"]["arrive_complete_speed"] = float(self.args.arrive_speed)
@@ -879,6 +884,8 @@ def main():
         raise SystemExit("必须提供终点：--goal-xy 或 --goal-latlon")
     if not args.use_current_start and args.start_xy is None and args.start_latlon is None:
         raise SystemExit("必须提供起点：--start-xy / --start-latlon，或使用 --use-current-start")
+    if args.planner_mode == "scene_target" and not str(args.scene_algorithm_symbol or "").strip():
+        raise SystemExit("scene_target 模式必须提供 --scene-algorithm-symbol")
 
     node = DirectControlNode(args)
     node.run()

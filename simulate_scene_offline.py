@@ -44,7 +44,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scene-algorithm-symbol",
-        default="scenarios.scene_algorithm.scene_algorithm",
+        default="",
         help="scene_target 模式下使用的场景算法符号路径，例如 scenarios.cut_in_algorithm.cut_in_algorithm",
     )
     parser.add_argument("--map-cache", default=str(DEFAULT_MAP_CACHE), help="地图缓存 .pkl 路径")
@@ -130,6 +130,8 @@ def main() -> None:
     from offline_sim.runner import run_simulation
 
     args = parser.parse_args()
+    if args.planner_mode == "scene_target" and not str(args.scene_algorithm_symbol or "").strip():
+        parser.error("scene_target 模式必须提供 --scene-algorithm-symbol")
     summary = run_simulation(args)
     compact = {
         "planner_mode": summary["planner_mode"],

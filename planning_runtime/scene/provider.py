@@ -41,7 +41,6 @@ from xodr_parser.xodr_parser import XODRParser
 
 MAIN_ACTOR_EGO_CORRIDOR_MATCH_MAX_D = 4.5
 MAIN_ACTOR_GLOBAL_LANE_MATCH_MAX_D = 5.0
-DEFAULT_SCENE_ALGORITHM_SYMBOL = "scenarios.scene_algorithm.scene_algorithm"
 
 
 def load_scene_algorithm(symbol_path: str):
@@ -151,7 +150,7 @@ class SceneTargetProvider:
         main_lane_extender: DrivableLanesExtender | None,
         dt: float,
         max_lane_segments: int,
-        scene_algorithm_symbol: str = DEFAULT_SCENE_ALGORITHM_SYMBOL,
+        scene_algorithm_symbol: str | None = None,
     ) -> None:
         """保存统一视图上下文构造所需的长期配置与运行期缓存。
 
@@ -183,7 +182,8 @@ class SceneTargetProvider:
         self._main_route_cache: dict[str, Any] | None = None
         self._ego_route_cache_key: tuple[tuple[str, ...], tuple[float, float], tuple[float, float]] | None = None
         self._ego_route_cache: dict[str, Any] | None = None
-        self.set_scene_algorithm_symbol(scene_algorithm_symbol)
+        if scene_algorithm_symbol:
+            self.set_scene_algorithm_symbol(scene_algorithm_symbol)
 
     def set_runtime(self, step_index: int, time_s: float) -> None:
         """更新当前仿真步编号和仿真时间。"""
@@ -216,7 +216,9 @@ class SceneTargetProvider:
     def set_scene_algorithm_symbol(self, symbol_path: str) -> None:
         """切换当前 provider 使用的场景算法入口。"""
 
-        normalized = str(symbol_path or "").strip() or DEFAULT_SCENE_ALGORITHM_SYMBOL
+        normalized = str(symbol_path or "").strip()
+        if not normalized:
+            raise ValueError("scene_target 模式必须显式传入 scene_algorithm_symbol")
         self.scene_algorithm_symbol = normalized
         self.scene_algorithm = load_scene_algorithm(normalized)
 
@@ -702,6 +704,9 @@ class SceneTargetProvider:
             ``PlanningFrame -> SceneContext -> scene_algorithm
             -> SceneAlgorithmOutput -> ExternalTarget``
         """
+
+        if self.scene_algorithm is None:
+            raise RuntimeError("scene_target 模式未配置 scene_algorithm_symbol")
 
         scene_context = self.build_scene_context(
             planning_frame=planning_frame,

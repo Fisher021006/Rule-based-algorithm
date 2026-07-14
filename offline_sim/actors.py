@@ -15,12 +15,22 @@ from traj_planner.tools import calculate_path_cumulative_distance, get_path_poin
 from xodr_parser.xodr_parser import XODRParser
 
 
-def instantiate_ego_vehicle(xodr_parser: XODRParser, max_speed_kph: float = 25.0) -> GVT:
+def instantiate_ego_vehicle(
+    xodr_parser: XODRParser,
+    max_speed_kph: float = 25.0,
+    scene_algorithm_symbol: str | None = None,
+) -> GVT:
     """创建离线仿真自车，并补齐可视化所需字段。"""
 
     outline = {"height": 4640.0, "width": 1780.0, "wheelbase": 2700.0}
     sport_params = {"maxSpeed": float(max_speed_kph), "maxAcc": 3.0, "minAcc": 3.0}
-    ego = GVT("ego", outline, sport_params, xodr_parser)
+    ego = GVT(
+        "ego",
+        outline,
+        sport_params,
+        xodr_parser,
+        scene_algorithm_symbol=scene_algorithm_symbol,
+    )
     ego.length = ego.config["size"]["L"]
     ego.width = ego.config["size"]["W"]
     ego.height = 1.5
@@ -68,6 +78,7 @@ class IDMRouteVehicle:
         self.lane_change_elapsed_s = 0.0
         self.lane_change_started = False
         self.lane_change_completed = False
+        self.script_pose_initialized = False
         self.script_source_line: np.ndarray | None = None
         self.script_source_cum: np.ndarray | None = None
         self.script_target_line: np.ndarray | None = None
@@ -307,8 +318,15 @@ class IDMRouteVehicle:
                 )
             blend = _smoothstep(self.lane_change_elapsed_s / max(float(self.lane_change_duration_s), 1e-3))
             self.lane_change_completed = bool(blend >= 0.999)
-            previous_xy = np.array([float(self.x), float(self.y)], dtype=float)
+            # 输入起点可在车道中心线附近但不完全重合。首帧若用该偏差计算朝向，
+            # 会把一次横向对齐误认为 60+ 度转向；首帧改用局部路径切线。
+            previous_xy = (
+                np.array([float(self.x), float(self.y)], dtype=float)
+                if self.script_pose_initialized
+                else None
+            )
             pos, heading = self._scripted_pose_at_progress(self.progress_s, blend, previous_xy)
+            self.script_pose_initialized = True
         else:
             pos, heading = get_path_point_at_s(self.path, self.progress_s, self.path_cumulative_s)
         self.x = float(pos[0])

@@ -250,11 +250,19 @@ class LocalPlanner:
             template_name="external_target",
         )
         candidate = build_candidate_smooth_path(context, terminal)
-        candidate_osqp = apply_time_param_to_candidate(context, candidate, method="osqp")
+        candidate_osqp = apply_time_param_to_candidate(
+            context,
+            candidate,
+            method="osqp",
+        )
         if candidate_osqp.trajectory is not None and len(candidate_osqp.trajectory) > 0:
             candidate = candidate_osqp
         else:
-            candidate = apply_time_param_to_candidate(context, candidate, method="quintic")
+            candidate = apply_time_param_to_candidate(
+                context,
+                candidate,
+                method="quintic",
+            )
         timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
         if candidate.trajectory is None or len(candidate.trajectory) == 0:
             timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
@@ -274,6 +282,9 @@ class LocalPlanner:
                 "candidate_count": 1,
                 "feasible_candidate_count": 1,
                 "target_point": np.asarray(candidate.trajectory[-1, :2], dtype=float).tolist(),
+                "external_target_v": float(terminal.target_v),
+                "external_target_plan_T": float(terminal.plan_T),
+                "time_param_method": str(candidate.metrics.get("time_param_method", "")),
                 "selected_line_id": terminal.line_id,
                 "selected_template": terminal.template_name,
                 "selected_score": None,

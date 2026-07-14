@@ -3,7 +3,7 @@
 场景语义：
 - 受控车辆是背景车 GVT，对应 ``context.ego_vehicle``。
 - 被测主车是 VUT，对应 ``context.main_vehicle``。
-- ``CFG["scene_side"]`` 表示 VUT 的预期换道方向，取值为 ``left`` 或 ``right``。
+- ``SCENE_CONFIG["scene_side"]`` 表示 VUT 的预期换道方向，取值为 ``left`` 或 ``right``。
 - VUT 尚未实际换道时，GVT 必须位于对应侧相邻车道后方，并仅通过纵向速度控制保持在 VUT 侧后方盲区。
 - VUT 产生稳定横向换道趋势后，算法预测 VUT 到达目标车道时的位置，并把外部配置的完成时 THW 换算成目标净距进行控制。
 - TTC 只作为调试指标输出，不作为主动规避条件；算法只保留硬碰撞几何约束。
@@ -35,65 +35,28 @@ class VehicleLimits:
     max_acc: float
 
 
-CFG: dict[str, Any] = {
-    # 严格场景几何检查默认开启：初始几何不满足盲区构造条件时，输出显式错误并令 GVT 停车。
-    "strict_scene_geometry": True,
+SCENE_CONFIG: dict[str, Any] = {
+    # 以下仅保留测试需求可见的场景契约；内部策略值定义为私有模块常量。
     # VUT 预期换道方向。算法不控制 VUT，只根据该方向构造同侧 GVT 盲区目标。
     "scene_side": "left",
-    "cruise_target_v": 5.0,
-    "prepare_plan_t_s": 1.5,
-    "hold_plan_t_s": 1.2,
-    "active_plan_t_s": 1.0,
-    "abort_plan_t_s": 1.0,
-    "complete_decel_mps2": 2.5,
-    "complete_stop_v_mps": 0.05,
-    "active_min_external_target_progress_m": 0.05,
-    "active_terminal_speed_ignore_acc_limit": True,
-    "search_rel_s_min_m": -35.0,
-    "search_rel_s_max_m": -1.0,
     "blind_rel_s_min_m": -8.6,
     "blind_rel_s_max_m": -5.1,
     "blind_rel_s_target_m": -6.1,
-    "rel_s_control_gain": 0.35,
-    "active_rel_s_control_gain": 0.28,
-    "completion_prediction_gain": 0.45,
-    "prepare_max_speed_adv_mps": 3.0,
-    "prepare_max_speed_lag_mps": 2.5,
-    "active_max_speed_adv_mps": 2.0,
-    "active_max_speed_lag_mps": 3.0,
-    "max_heading_diff_deg": 20.0,
-    "max_ego_d_on_target_line_m": 1.5,
-    "side_lateral_min_m": 1.8,
-    "side_lateral_max_m": 5.5,
-    "min_road_remaining_m": 18.0,
-    "min_target_progress_m": 2.0,
-    "prepare_timeout_s": 12.0,
-    "hold_success_duration_s": 3.0,
-    "hold_max_wait_s": 60.0,
-    "blind_zone_lost_max_frames": 8,
-    # VUT 换道开始判定。基准值是 VUT 初始到目标侧车道中心线的横向距离。
-    "lane_change_start_d_m": 0.35,
-    "lane_change_lateral_v_min_mps": 0.15,
-    "lane_change_heading_min_deg": 1.0,
-    "lane_change_debounce_frames": 3,
-    "lane_change_complete_d_m": 0.6,
-    "lane_change_min_lateral_v_mps": 0.15,
-    "lane_change_prediction_t_min_s": 0.1,
-    "lane_change_prediction_t_max_s": 6.0,
-    "lane_change_prediction_time_scale": 0.8,
-    "lane_change_prediction_time_buffer_s": 0.05,
-    "completion_blend_start_progress": 0.50,
     # 外部显式配置的完成时 THW。内部会把 THW 换算成同车道完成时目标净距。
     "completion_target_thw_s": 3.0,
     "completion_thw_tol_s": 0.2,
     "completion_min_net_gap_m": 1.0,
-    "completion_success_frames": 3,
-    "thw_v_floor_mps": 0.5,
-    # 只保留硬碰撞几何保护；TTC 只写入 scene_debug。
-    "hard_collision_margin_m": 0.2,
-    "abort_hold_s": 1.0,
-    "abort_cooldown_s": 2.0,
 }
+
+
+# 仅保留跨多个函数复用的内部算法不变量。
+_LANE_CHANGE_COMPLETE_D_M = 0.6
+_LANE_CHANGE_PREDICTION_T_MIN_S = 0.1
+_LANE_CHANGE_PREDICTION_T_MAX_S = 6.0
+_THW_V_FLOOR_MPS = 0.5
+_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M = 0.05
+_COMPLETE_DECEL_MPS2 = 2.5
+_ACTIVE_TIMEOUT_MIN_S = 6.0
 
 
 SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
@@ -102,6 +65,10 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "prepare_start_time_s": -1.0,
     "hold_start_time_s": -1.0,
     "active_start_time_s": -1.0,
+    "active_timeout_deadline_s": -1.0,
+    "blind_spot_disabled": False,
+    "disabled_start_time_s": -1.0,
+    "disabled_reason": "",
     "complete_start_time_s": -1.0,
     "abort_start_time_s": -1.0,
     "locked_line_index": None,
@@ -110,10 +77,13 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "baseline_main_abs_d_on_target": -1.0,
     "prev_main_abs_d_on_target": -1.0,
     "lane_change_start_hits": 0,
+    "last_hold_detection_debug_time_s": -1.0,
     "blind_zone_hits": 0,
     "blind_zone_miss_hits": 0,
     "hold_success_latched": False,
     "completion_success_hits": 0,
+    "completion_success": None,
+    "active_completion_target": None,
     "last_metrics": None,
 }
 
@@ -146,6 +116,9 @@ def _scene_fsm_step(
     """执行一帧盲区场景状态机。"""
     now = float(context.time_s)
     mode = str(memory.get("mode", "APPROACH"))
+
+    if bool(memory.get("blind_spot_disabled", False)):
+        return _handle_blind_spot_disabled(context, memory, now)
 
     if mode == "COOLDOWN":
         if now < float(memory["cooldown_until_time_s"]):
@@ -290,7 +263,7 @@ def _handle_prepare_blind_zone(
         ), memory
 
     elapsed = max(0.0, now - float(memory.get("prepare_start_time_s", now)))
-    if elapsed >= float(CFG["prepare_timeout_s"]):
+    if elapsed >= float(12.0):
         _enter_cooldown(memory, now)
         return _build_keep_lane_output(
             context,
@@ -332,31 +305,65 @@ def _handle_hold_blind_zone(
     _update_blind_zone_hold(memory, metrics, now)
     memory["last_metrics"] = copy.deepcopy(metrics)
 
+    last_debug_time = float(memory.get("last_hold_detection_debug_time_s", -1.0))
+    if now - last_debug_time >= float(1.0):
+        memory["last_hold_detection_debug_time_s"] = float(now)
+        print(
+            "[blind_spot] hold_detect "
+            f"main_abs_d={float(metrics.get('main_abs_d_on_target_line_m', float('nan'))):.3f}m "
+            f"target_side_d={float(metrics.get('target_line_side_offset_m', float('nan'))):.3f}m "
+            f"baseline_abs_d={float(metrics.get('baseline_main_abs_d_on_target_m', float('nan'))):.3f}m "
+            f"lateral_progress={float(metrics.get('main_lateral_progress_to_target_m', float('nan'))):.3f}m "
+            f"lateral_v={float(metrics.get('main_lateral_v_toward_target_mps', float('nan'))):.3f}m/s "
+            f"offset_ok={bool(metrics.get('lane_change_start_offset_ok', False))} "
+            f"velocity_ok={bool(metrics.get('lane_change_start_velocity_ok', False))} "
+            f"heading_ok={bool(metrics.get('lane_change_start_heading_ok', False))} "
+            f"strong_offset_ok={bool(metrics.get('lane_change_start_strong_offset_ok', False))} "
+            f"start_hits={int(metrics.get('lane_change_start_hits', 0))} "
+            f"started={bool(metrics.get('lane_change_started', False))}",
+            flush=True,
+        )
+
     if _should_hard_abort(metrics):
         _enter_safe_abort(memory, now)
         return _build_abort_output(context, target_line, metrics, reason="blind_spot_hard_collision_risk"), memory
 
-    if not _is_prepare_candidate(metrics):
-        metrics["invalid_scene_reasons"] = _invalid_scene_reasons(metrics, require_search_window=False)
-        if _strict_scene_geometry_enabled():
-            memory["mode"] = "APPROACH"
-            _reset_execution_memory(memory)
-            return _build_invalid_scene_output(
-                context,
-                reason="blind_spot_hold_geometry_lost",
-                scene_debug=metrics,
-            ), memory
-
     if bool(metrics["lane_change_started"]):
+        if not _is_active_candidate(metrics):
+            metrics["invalid_scene_reasons"] = _hold_invalid_scene_reasons(metrics)
+            if _strict_scene_geometry_enabled():
+                memory["mode"] = "APPROACH"
+                _reset_execution_memory(memory)
+                return _build_invalid_scene_output(
+                    context,
+                    reason="blind_spot_hold_geometry_lost",
+                    scene_debug=metrics,
+                ), memory
+
+        active_road_feasible = _annotate_active_entry_feasibility(metrics)
         print(
             "主车开始换道 "
             f"rel_s={float(metrics.get('rel_s_m', float('nan'))):.3f}m "
             f"progress={float(metrics.get('lane_change_progress_ratio', 0.0)):.3f} "
             f"main_abs_d={float(metrics.get('main_abs_d_on_target_line_m', float('nan'))):.3f}m "
-            f"lateral_v={float(metrics.get('main_lateral_v_toward_target_mps', float('nan'))):.3f}m/s",
+            f"lateral_v={float(metrics.get('main_lateral_v_toward_target_mps', float('nan'))):.3f}m/s "
+            f"road_remaining={float(metrics.get('road_remaining_m', float('nan'))):.3f}m "
+            f"required_road={float(metrics.get('active_required_road_m', float('nan'))):.3f}m "
+            f"active_timeout={float(metrics.get('active_timeout_s', float('nan'))):.3f}s",
             flush=True,
         )
-        _enter_lane_change_active(memory, now)
+        if not active_road_feasible:
+            reason = "blind_spot_insufficient_road_before_completion"
+            _disable_blind_spot(memory, now, reason)
+            print(
+                "[blind_spot] disabled "
+                f"reason={reason} road_remaining={float(metrics.get('road_remaining_m', float('nan'))):.3f}m "
+                f"required_road={float(metrics.get('active_required_road_m', float('nan'))):.3f}m",
+                flush=True,
+            )
+            return _build_blind_spot_disabled_output(context, memory, metrics), memory
+
+        _enter_lane_change_active(memory, now, metrics)
         return _build_active_output(
             context,
             target_line,
@@ -366,7 +373,21 @@ def _handle_hold_blind_zone(
             scene_status="lane_change_active",
         ), memory
 
-    if int(memory.get("blind_zone_miss_hits", 0)) >= int(CFG["blind_zone_lost_max_frames"]):
+    # 进入 HOLD 后，VUT 向目标车道横向移动会天然破坏“尚未换道时”的侧向
+    # 几何阈值。这里仅检查锁定目标线、同向和前后关系，保留检测去抖记忆直到
+    # 能确认 VUT 已开始换道；道路余量只在进入 ACTIVE 时统一判定。
+    if not _is_hold_candidate(metrics):
+        metrics["invalid_scene_reasons"] = _hold_invalid_scene_reasons(metrics)
+        if _strict_scene_geometry_enabled():
+            memory["mode"] = "APPROACH"
+            _reset_execution_memory(memory)
+            return _build_invalid_scene_output(
+                context,
+                reason="blind_spot_hold_geometry_lost",
+                scene_debug=metrics,
+            ), memory
+
+    if int(memory.get("blind_zone_miss_hits", 0)) >= int(8):
         memory["mode"] = "PREPARE_BLIND_ZONE"
         memory["prepare_start_time_s"] = float(now)
         return _build_prepare_output(
@@ -382,7 +403,7 @@ def _handle_hold_blind_zone(
     status = "blind_zone_hold_success" if bool(memory.get("hold_success_latched", False)) else "hold_blind_zone"
     debug = copy.deepcopy(metrics)
     debug["hold_elapsed_s"] = float(hold_elapsed)
-    debug["hold_success_duration_s"] = float(CFG["hold_success_duration_s"])
+    debug["hold_success_duration_s"] = float(3.0)
     return _build_hold_output(
         context,
         target_line,
@@ -412,7 +433,7 @@ def _handle_lane_change_active(
     if bool(metrics.get("vut_lane_change_complete", False)):
         metrics["completion_success"] = bool(completion_success)
         _print_lane_change_completion_thw(metrics, completion_success)
-        _enter_complete(memory, now)
+        _enter_complete(memory, now, completion_success)
         return _build_complete_output(
             context,
             target_line,
@@ -422,15 +443,36 @@ def _handle_lane_change_active(
         ), memory
 
     if not _is_active_candidate(metrics):
-        metrics["invalid_scene_reasons"] = _invalid_scene_reasons(metrics, require_search_window=False)
-        if _strict_scene_geometry_enabled():
-            memory["mode"] = "APPROACH"
-            _reset_execution_memory(memory)
-            return _build_invalid_scene_output(
-                context,
-                reason="blind_spot_active_geometry_lost",
-                scene_debug=metrics,
-            ), memory
+        metrics["invalid_scene_reasons"] = _invalid_scene_reasons(
+            metrics,
+            require_search_window=False,
+            require_road_remaining=False,
+        )
+        reason = "blind_spot_active_geometry_lost"
+        _disable_blind_spot(memory, now, reason)
+        _print_scene_disabled(reason, memory, metrics)
+        return _build_blind_spot_disabled_output(context, memory, metrics), memory
+
+    active_start = float(memory.get("active_start_time_s", now))
+    active_deadline = float(memory.get("active_timeout_deadline_s", -1.0))
+    if active_deadline < 0.0:
+        active_deadline = float(now) + _active_timeout_s(metrics)
+        memory["active_timeout_deadline_s"] = active_deadline
+    metrics["active_elapsed_s"] = max(0.0, float(now) - active_start)
+    metrics["active_timeout_deadline_s"] = float(active_deadline)
+    metrics["active_timeout_remaining_s"] = float(active_deadline - float(now))
+    if float(now) >= active_deadline:
+        reason = "blind_spot_lane_change_timeout"
+        _disable_blind_spot(memory, now, reason)
+        print(
+            "[blind_spot] disabled "
+            f"elapsed={float(metrics['active_elapsed_s']):.3f}s "
+            f"progress={float(metrics.get('lane_change_progress_ratio', float('nan'))):.3f} "
+            f"main_abs_d={float(metrics.get('main_abs_d_on_target_line_m', float('nan'))):.3f}m "
+            f"road_remaining={float(metrics.get('road_remaining_m', float('nan'))):.3f}m",
+            flush=True,
+        )
+        return _build_blind_spot_disabled_output(context, memory, metrics), memory
 
     return _build_active_output(
         context,
@@ -440,6 +482,16 @@ def _handle_lane_change_active(
         reason="blind_spot_lane_change_active",
         scene_status="lane_change_active",
     ), memory
+
+
+def _handle_blind_spot_disabled(
+    context: SceneContext,
+    memory: dict[str, Any],
+    now: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """盲区场景已禁用：剩余任务交给当前车道普通巡航。"""
+    del now
+    return _build_blind_spot_disabled_output(context, memory), memory
 
 
 def _handle_complete(
@@ -452,12 +504,14 @@ def _handle_complete(
     metrics = _compute_blind_spot_metrics(context, target_line, memory)
     complete_start = float(memory.get("complete_start_time_s", now))
     metrics["complete_elapsed_s"] = max(0.0, now - complete_start)
+    completion_success = bool(memory.get("completion_success", False))
+    metrics["completion_success"] = completion_success
     return _build_complete_output(
         context,
         target_line,
         metrics,
-        reason="blind_spot_complete_hold",
-        scene_status="complete",
+        reason="blind_spot_complete_hold" if completion_success else "blind_spot_complete_thw_miss_stop",
+        scene_status="complete" if completion_success else "complete_thw_miss",
     ), memory
 
 
@@ -473,7 +527,7 @@ def _handle_safe_abort(
     if abort_start < 0.0:
         abort_start = float(now)
         memory["abort_start_time_s"] = abort_start
-    if now - abort_start >= float(CFG["abort_hold_s"]):
+    if now - abort_start >= float(1.0):
         _enter_cooldown(memory, now)
     return _build_abort_output(context, target_line, metrics, reason="blind_spot_safe_abort"), memory
 
@@ -518,19 +572,33 @@ def _enter_hold_blind_zone(memory: dict[str, Any], metrics: dict[str, Any], now:
     _reset_lane_change_detection(memory, metrics)
     memory["blind_zone_hits"] = 0
     memory["blind_zone_miss_hits"] = 0
+    memory["last_hold_detection_debug_time_s"] = -1.0
 
 
-def _enter_lane_change_active(memory: dict[str, Any], now: float) -> None:
+def _enter_lane_change_active(memory: dict[str, Any], now: float, metrics: dict[str, Any]) -> None:
     """进入 VUT 换道交互阶段。"""
     memory["mode"] = "LANE_CHANGE_ACTIVE"
     memory["active_start_time_s"] = float(now)
+    memory["active_timeout_deadline_s"] = float(now) + _active_timeout_s(metrics)
+    memory["blind_spot_disabled"] = False
+    memory["disabled_start_time_s"] = -1.0
+    memory["disabled_reason"] = ""
     memory["completion_success_hits"] = 0
+    memory["active_completion_target"] = None
 
 
-def _enter_complete(memory: dict[str, Any], now: float) -> None:
+def _disable_blind_spot(memory: dict[str, Any], now: float, reason: str) -> None:
+    """锁存本轮盲区场景禁用，后续帧不再回到盲区状态机。"""
+    memory["blind_spot_disabled"] = True
+    memory["disabled_start_time_s"] = float(now)
+    memory["disabled_reason"] = str(reason)
+
+
+def _enter_complete(memory: dict[str, Any], now: float, completion_success: bool) -> None:
     """进入场景完成阶段。"""
     memory["mode"] = "COMPLETE"
     memory["complete_start_time_s"] = float(now)
+    memory["completion_success"] = bool(completion_success)
 
 
 def _enter_safe_abort(memory: dict[str, Any], now: float) -> None:
@@ -542,7 +610,7 @@ def _enter_safe_abort(memory: dict[str, Any], now: float) -> None:
 def _enter_cooldown(memory: dict[str, Any], now: float) -> None:
     """进入冷却阶段，并清理本轮场景上下文。"""
     memory["mode"] = "COOLDOWN"
-    memory["cooldown_until_time_s"] = float(now) + float(CFG["abort_cooldown_s"])
+    memory["cooldown_until_time_s"] = float(now) + float(2.0)
     _reset_execution_memory(memory)
 
 
@@ -571,6 +639,10 @@ def _reset_execution_memory(memory: dict[str, Any]) -> None:
     memory["prepare_start_time_s"] = -1.0
     memory["hold_start_time_s"] = -1.0
     memory["active_start_time_s"] = -1.0
+    memory["active_timeout_deadline_s"] = -1.0
+    memory["blind_spot_disabled"] = False
+    memory["disabled_start_time_s"] = -1.0
+    memory["disabled_reason"] = ""
     memory["complete_start_time_s"] = -1.0
     memory["abort_start_time_s"] = -1.0
     memory["locked_line_index"] = None
@@ -579,10 +651,13 @@ def _reset_execution_memory(memory: dict[str, Any]) -> None:
     memory["baseline_main_abs_d_on_target"] = -1.0
     memory["prev_main_abs_d_on_target"] = -1.0
     memory["lane_change_start_hits"] = 0
+    memory["last_hold_detection_debug_time_s"] = -1.0
     memory["blind_zone_hits"] = 0
     memory["blind_zone_miss_hits"] = 0
     memory["hold_success_latched"] = False
     memory["completion_success_hits"] = 0
+    memory["completion_success"] = None
+    memory["active_completion_target"] = None
     memory["last_metrics"] = None
 
 
@@ -604,7 +679,7 @@ def _build_keep_lane_output(
 ) -> dict[str, Any]:
     """构造默认当前车道巡航目标，仅在非严格模式或冷却态使用。"""
     limits = _read_vehicle_limits(context)
-    target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
+    target_v = _clamp(float(5.0), 0.0, limits.max_v)
     return _build_line_target_output(
         context=context,
         target_line=context.ego_vehicle.current_ref_line,
@@ -615,6 +690,27 @@ def _build_keep_lane_output(
         scene_status=scene_status,
         scene_detail=scene_detail or reason,
         scene_debug=scene_debug,
+    )
+
+
+def _build_blind_spot_disabled_output(
+    context: SceneContext,
+    memory: dict[str, Any],
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """构造禁用盲区算法后的当前车道普通巡航目标。"""
+    reason = str(memory.get("disabled_reason", "blind_spot_disabled"))
+    disabled_start = float(memory.get("disabled_start_time_s", context.time_s))
+    debug = copy.deepcopy(metrics if metrics is not None else memory.get("last_metrics") or {})
+    debug["blind_spot_disabled"] = True
+    debug["disabled_reason"] = reason
+    debug["disabled_elapsed_s"] = max(0.0, float(context.time_s) - disabled_start)
+    return _build_keep_lane_output(
+        context,
+        reason=reason,
+        scene_status="blind_spot_disabled",
+        scene_detail=reason,
+        scene_debug=debug,
     )
 
 
@@ -665,16 +761,16 @@ def _build_prepare_output(
 ) -> dict[str, Any]:
     """构造 PREPARE 阶段输出：沿目标侧车道纵向接近盲区目标位置。"""
     del memory
-    target_rel_s = float(CFG["blind_rel_s_target_m"])
+    target_rel_s = float(SCENE_CONFIG["blind_rel_s_target_m"])
     return _build_rel_s_control_output(
         context=context,
         target_line=target_line,
         metrics=metrics,
         target_rel_s=target_rel_s,
-        gain=float(CFG["rel_s_control_gain"]),
-        max_adv=float(CFG["prepare_max_speed_adv_mps"]),
-        max_lag=float(CFG["prepare_max_speed_lag_mps"]),
-        plan_t=float(CFG["prepare_plan_t_s"]),
+        gain=float(0.35),
+        max_adv=float(3.0),
+        max_lag=float(2.5),
+        plan_t=float(1.5),
         reason=reason,
         scene_status=scene_status,
     )
@@ -690,16 +786,16 @@ def _build_hold_output(
 ) -> dict[str, Any]:
     """构造 HOLD 阶段输出：保持 GVT 在 VUT 侧后方盲区。"""
     del memory
-    target_rel_s = float(CFG["blind_rel_s_target_m"])
+    target_rel_s = float(SCENE_CONFIG["blind_rel_s_target_m"])
     return _build_rel_s_control_output(
         context=context,
         target_line=target_line,
         metrics=metrics,
         target_rel_s=target_rel_s,
-        gain=float(CFG["rel_s_control_gain"]),
-        max_adv=float(CFG["prepare_max_speed_adv_mps"]),
-        max_lag=float(CFG["prepare_max_speed_lag_mps"]),
-        plan_t=float(CFG["hold_plan_t_s"]),
+        gain=float(0.35),
+        max_adv=float(3.0),
+        max_lag=float(2.5),
+        plan_t=float(1.2),
         reason=reason,
         scene_status=scene_status,
     )
@@ -714,8 +810,7 @@ def _build_active_output(
     scene_status: str,
 ) -> dict[str, Any]:
     """构造 ACTIVE 阶段输出：反解 VUT 换道完成时的目标 THW 终端状态。"""
-    del memory
-    precise_target = _solve_completion_thw_terminal(context, target_line, metrics)
+    precise_target = _get_active_completion_target(context, target_line, metrics, memory)
     if bool(precise_target.get("valid", False)):
         return _build_precise_completion_output(
             context=context,
@@ -739,10 +834,10 @@ def _build_active_output(
         target_line=target_line,
         metrics=metrics,
         target_rel_s=float(fallback_target["target_rel_s_m"]),
-        gain=float(CFG["active_rel_s_control_gain"]),
-        max_adv=float(CFG["active_max_speed_adv_mps"]),
-        max_lag=float(CFG["active_max_speed_lag_mps"]),
-        plan_t=float(CFG["active_plan_t_s"]),
+        gain=float(0.28),
+        max_adv=float(2.0),
+        max_lag=float(3.0),
+        plan_t=float(1.0),
         reason=reason,
         scene_status=scene_status,
         extra_speed_delta=float(fallback_target["prediction_speed_delta_mps"]),
@@ -763,7 +858,7 @@ def _build_precise_completion_output(
     line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
     target_s = _clamp(
         float(precise_target["target_s_m"]),
-        float(line.current_s) + float(CFG["active_min_external_target_progress_m"]),
+        float(line.current_s) + float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
         float(line.cumulative_s[-1]) - 0.5,
     )
     target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
@@ -780,7 +875,7 @@ def _build_precise_completion_output(
         "hold_t": 0.0,
         "reason": str(reason),
         "min_external_plan_t_s": float(context.dt),
-        "min_external_target_progress_m": float(CFG["active_min_external_target_progress_m"]),
+        "min_external_target_progress_m": float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
     }
     return _annotate_output(output, scene_status, reason, debug)
 
@@ -796,20 +891,20 @@ def _build_complete_output(
     limits = _read_vehicle_limits(context)
     line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
     current_v = max(0.0, float(context.ego_vehicle.v))
-    requested_decel = abs(float(CFG["complete_decel_mps2"]))
-    stop_v = max(0.0, float(CFG["complete_stop_v_mps"]))
+    requested_decel = abs(float(_COMPLETE_DECEL_MPS2))
+    stop_v = max(0.0, float(0.05))
 
     if current_v <= stop_v or requested_decel <= 1e-6:
         target_v = 0.0
         target_a = 0.0
-        plan_t = float(CFG["active_plan_t_s"])
+        plan_t = float(1.0)
         stop_distance = 0.0
     else:
         target_v = 0.0
         target_a = _clamp(-requested_decel, limits.min_acc, limits.max_acc)
         effective_decel = abs(min(target_a, 0.0))
         if effective_decel <= 1e-6:
-            plan_t = float(CFG["active_plan_t_s"])
+            plan_t = float(1.0)
             stop_distance = current_v * plan_t
         else:
             plan_t = max(float(context.dt), current_v / effective_decel)
@@ -864,7 +959,7 @@ def _build_abort_output(
     limits = _read_vehicle_limits(context)
     line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
     target_v = max(0.0, min(float(context.ego_vehicle.v), float(context.main_vehicle.v) if context.main_vehicle else 0.0) - 1.0)
-    plan_t = float(CFG["abort_plan_t_s"])
+    plan_t = float(1.0)
     target_a = _clamp((target_v - float(context.ego_vehicle.v)) / max(plan_t, 1e-3), limits.min_acc, limits.max_acc)
     return _build_line_target_output(
         context=context,
@@ -897,7 +992,7 @@ def _build_rel_s_control_output(
     """根据目标 ``rel_s`` 构造 GVT 速度闭环目标。"""
     limits = _read_vehicle_limits(context)
     main_v = float(metrics.get("main_v_mps", context.main_vehicle.v if context.main_vehicle else 0.0))
-    rel_s = float(metrics.get("rel_s_m", float(CFG["blind_rel_s_target_m"])))
+    rel_s = float(metrics.get("rel_s_m", float(SCENE_CONFIG["blind_rel_s_target_m"])))
     rel_error = float(target_rel_s) - rel_s
     speed_delta = _clamp(gain * rel_error + float(extra_speed_delta), -float(max_lag), float(max_adv))
     target_v = _clamp(main_v + speed_delta, 0.0, limits.max_v)
@@ -939,7 +1034,7 @@ def _build_line_target_output(
     scene_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """在指定参考线上构造可被 ``ExternalTarget`` 消费的终端目标。"""
-    min_progress = float(CFG["min_target_progress_m"])
+    min_progress = float(2.0)
     travel_s = max(min_progress, float(target_v) * float(plan_t))
     target_s = _clamp(
         float(target_line.current_s) + travel_s,
@@ -962,6 +1057,47 @@ def _build_line_target_output(
 
 
 # ==================== 条件判断与指标计算 ====================
+
+
+def _active_timeout_s(metrics: dict[str, Any]) -> float:
+    """按开始换道帧预测的剩余横向时间设置 ACTIVE 超时。"""
+    predicted_t = float(metrics.get("predicted_t_complete_s", float("nan")))
+    if not np.isfinite(predicted_t):
+        predicted_t = float(_ACTIVE_TIMEOUT_MIN_S)
+    return _clamp(
+        predicted_t + float(3.0),
+        float(_ACTIVE_TIMEOUT_MIN_S),
+        float(12.0),
+    )
+
+
+def _annotate_active_entry_feasibility(metrics: dict[str, Any]) -> bool:
+    """把 ACTIVE 入口所需道路长度和超时写入 metrics，并返回是否可执行。"""
+    predicted_t = float(metrics.get("predicted_t_complete_s", float("nan")))
+    if not np.isfinite(predicted_t):
+        predicted_t = float(_LANE_CHANGE_PREDICTION_T_MAX_S)
+    predicted_t = _clamp(
+        predicted_t,
+        float(_LANE_CHANGE_PREDICTION_T_MIN_S),
+        float(_LANE_CHANGE_PREDICTION_T_MAX_S),
+    )
+    ego_v = max(0.0, float(metrics.get("ego_v_mps", 0.0)))
+    main_v = max(0.0, float(metrics.get("main_v_mps", 0.0)))
+    expected_v = max(ego_v, main_v)
+    decel = max(abs(float(_COMPLETE_DECEL_MPS2)), 1e-3)
+    predicted_travel = expected_v * predicted_t
+    stop_distance = (expected_v ** 2) / (2.0 * decel)
+    required_road = max(
+        float(18.0),
+        predicted_travel + stop_distance + float(3.0),
+    )
+    road_remaining = float(metrics.get("road_remaining_m", float("-inf")))
+    metrics["active_predicted_travel_m"] = float(predicted_travel)
+    metrics["active_stop_distance_m"] = float(stop_distance)
+    metrics["active_required_road_m"] = float(required_road)
+    metrics["active_timeout_s"] = float(_active_timeout_s(metrics))
+    metrics["active_road_feasible"] = bool(road_remaining >= required_road)
+    return bool(metrics["active_road_feasible"])
 
 
 def _is_approach_candidate(metrics: dict[str, Any]) -> bool:
@@ -988,19 +1124,41 @@ def _is_prepare_candidate(metrics: dict[str, Any]) -> bool:
     )
 
 
+def _is_hold_candidate(metrics: dict[str, Any]) -> bool:
+    """判断盲区保持阶段仍可继续观测 VUT 换道意图的最小条件。
+
+    ``gvt_on_configured_side_lane`` 只适用于进入 HOLD 前的初始场景构造；VUT
+    横向启动后该条件会连续变化，不能用它清空换道检测去抖状态。
+    """
+    return bool(
+        metrics.get("main_valid", False)
+        and metrics.get("target_line_valid", False)
+        and metrics.get("ego_on_target_line", False)
+        and metrics.get("rel_s_m", 0.0) < 0.0
+        and _main_heading_trackable(metrics)
+    )
+
+
 def _is_active_candidate(metrics: dict[str, Any]) -> bool:
     """判断换道交互阶段是否仍满足完成时 THW 控制所需的基础几何。
 
     VUT 完成换道后，GVT 与 VUT 会进入同一目标车道，因此这里不再要求
     ``gvt_on_configured_side_lane`` 为真，只要求两车同向、目标线有效且
-    GVT 仍在 VUT 后方。
+    GVT 仍在 VUT 后方。道路余量只在进入 ACTIVE 前校验，避免末段静默退回 APPROACH。
     """
     return bool(
         metrics.get("main_valid", False)
         and metrics.get("target_line_valid", False)
-        and metrics.get("same_direction", False)
         and metrics.get("rel_s_m", 0.0) < 0.0
-        and metrics.get("road_remaining_ok", False)
+        and _main_heading_trackable(metrics)
+    )
+
+
+def _main_heading_trackable(metrics: dict[str, Any]) -> bool:
+    """判断 VUT 航向仍属于同向换道，而非反向或错误目标。"""
+    return bool(
+        float(metrics.get("main_heading_diff_to_target_line_deg", float("inf")))
+        <= float(90.0)
     )
 
 
@@ -1017,7 +1175,7 @@ def _update_blind_zone_hold(memory: dict[str, Any], metrics: dict[str, Any], now
         hold_start = float(now)
         memory["hold_start_time_s"] = hold_start
     hold_elapsed = max(0.0, float(now) - hold_start)
-    if hold_elapsed >= float(CFG["hold_success_duration_s"]) and int(memory.get("blind_zone_miss_hits", 0)) == 0:
+    if hold_elapsed >= float(3.0) and int(memory.get("blind_zone_miss_hits", 0)) == 0:
         memory["hold_success_latched"] = True
 
 
@@ -1032,10 +1190,10 @@ def _update_lane_change_detection(memory: dict[str, Any], metrics: dict[str, Any
     dt = max(float(metrics.get("dt_s", 0.1)), 1e-3)
     lateral_progress_m = max(0.0, baseline_abs - current_abs)
     lateral_v_toward = (prev_abs - current_abs) / dt
-    heading_ok = float(metrics.get("main_heading_diff_to_target_line_deg", 0.0)) >= float(CFG["lane_change_heading_min_deg"])
-    offset_ok = lateral_progress_m >= float(CFG["lane_change_start_d_m"])
-    velocity_ok = lateral_v_toward >= float(CFG["lane_change_lateral_v_min_mps"])
-    strong_offset_ok = lateral_progress_m >= 1.5 * float(CFG["lane_change_start_d_m"])
+    heading_ok = float(metrics.get("main_heading_diff_to_target_line_deg", 0.0)) >= float(1.0)
+    offset_ok = lateral_progress_m >= float(0.35)
+    velocity_ok = lateral_v_toward >= float(0.15)
+    strong_offset_ok = lateral_progress_m >= 1.5 * float(0.35)
     started_now = bool(offset_ok and velocity_ok and (heading_ok or strong_offset_ok))
     if started_now:
         memory["lane_change_start_hits"] += 1
@@ -1051,7 +1209,7 @@ def _update_lane_change_detection(memory: dict[str, Any], metrics: dict[str, Any
     metrics["lane_change_start_velocity_ok"] = bool(velocity_ok)
     metrics["lane_change_start_heading_ok"] = bool(heading_ok)
     metrics["lane_change_start_hits"] = int(memory["lane_change_start_hits"])
-    metrics["lane_change_started"] = bool(int(memory["lane_change_start_hits"]) >= int(CFG["lane_change_debounce_frames"]))
+    metrics["lane_change_started"] = bool(int(memory["lane_change_start_hits"]) >= int(3))
 
 
 def _is_completion_success(metrics: dict[str, Any]) -> bool:
@@ -1059,14 +1217,14 @@ def _is_completion_success(metrics: dict[str, Any]) -> bool:
     if not bool(metrics.get("vut_lane_change_complete", False)):
         return False
     thw = float(metrics.get("completion_thw_s", float("inf")))
-    target_thw = float(CFG["completion_target_thw_s"])
-    return bool(np.isfinite(thw) and abs(thw - target_thw) <= float(CFG["completion_thw_tol_s"]))
+    target_thw = float(SCENE_CONFIG["completion_target_thw_s"])
+    return bool(np.isfinite(thw) and abs(thw - target_thw) <= float(SCENE_CONFIG["completion_thw_tol_s"]))
 
 
 def _print_lane_change_completion_thw(metrics: dict[str, Any], completion_success: bool) -> None:
     """在 VUT 换道完成当帧打印实际 THW 结果。"""
     thw = float(metrics.get("completion_thw_s", float("nan")))
-    target_thw = float(CFG["completion_target_thw_s"])
+    target_thw = float(SCENE_CONFIG["completion_target_thw_s"])
     rel_s = float(metrics.get("rel_s_m", float("nan")))
     headway_gap = float(metrics.get("completion_headway_gap_m", float("nan")))
     net_gap = float(metrics.get("completion_net_gap_m", float("nan")))
@@ -1081,17 +1239,36 @@ def _print_lane_change_completion_thw(metrics: dict[str, Any], completion_succes
     )
 
 
+def _print_scene_disabled(reason: str, memory: dict[str, Any], metrics: dict[str, Any]) -> None:
+    """打印盲区场景禁用转移，便于区分普通巡航与正常完成。"""
+    print(
+        "[blind_spot] scene_disabled "
+        f"reason={reason} mode={memory.get('mode', '')} "
+        f"progress={float(metrics.get('lane_change_progress_ratio', float('nan'))):.3f} "
+        f"main_abs_d={float(metrics.get('main_abs_d_on_target_line_m', float('nan'))):.3f}m "
+        f"rel_s={float(metrics.get('rel_s_m', float('nan'))):.3f}m "
+        f"road_remaining={float(metrics.get('road_remaining_m', float('nan'))):.3f}m "
+        f"invalid_reasons={metrics.get('invalid_scene_reasons', [])}",
+        flush=True,
+    )
+
+
 def _should_hard_abort(metrics: dict[str, Any]) -> bool:
     """只在车身几何发生硬碰撞风险时中止危险场景。"""
     return bool(metrics.get("hard_collision_risk", False))
 
 
 def _strict_scene_geometry_enabled() -> bool:
-    """读取是否启用严格场景几何检查。"""
-    return bool(CFG.get("strict_scene_geometry", True))
+    """返回固定的严格场景几何检查策略。"""
+    return True
 
 
-def _invalid_scene_reasons(metrics: dict[str, Any], *, require_search_window: bool) -> list[str]:
+def _invalid_scene_reasons(
+    metrics: dict[str, Any],
+    *,
+    require_search_window: bool,
+    require_road_remaining: bool = True,
+) -> list[str]:
     """汇总盲区场景构造不成立的具体原因，供日志和离线 JSON 排查使用。"""
     reasons: list[str] = []
     if not bool(metrics.get("main_valid", False)):
@@ -1109,7 +1286,7 @@ def _invalid_scene_reasons(metrics: dict[str, Any], *, require_search_window: bo
         reasons.append("gvt_not_behind_vut")
     if require_search_window and not bool(metrics.get("rel_s_search_ok", False)):
         reasons.append("gvt_not_in_approach_rel_s_window")
-    if not bool(metrics.get("road_remaining_ok", False)):
+    if require_road_remaining and not bool(metrics.get("road_remaining_ok", False)):
         reasons.append("target_lane_remaining_distance_insufficient")
     if bool(metrics.get("hard_collision_risk", False)):
         reasons.append("hard_collision_risk")
@@ -1118,10 +1295,114 @@ def _invalid_scene_reasons(metrics: dict[str, Any], *, require_search_window: bo
     return reasons
 
 
+def _hold_invalid_scene_reasons(metrics: dict[str, Any]) -> list[str]:
+    """汇总 HOLD 阶段的硬失效原因，避免把正常横向启动误报为几何失效。"""
+    reasons: list[str] = []
+    if not bool(metrics.get("main_valid", False)):
+        return ["no_main_vehicle"]
+    if not bool(metrics.get("target_line_valid", False)):
+        return ["locked_target_line_invalid"]
+    if not bool(metrics.get("same_direction", False)):
+        reasons.append("vut_gvt_heading_not_aligned")
+    if not bool(metrics.get("ego_on_target_line", False)):
+        reasons.append("gvt_left_locked_target_lane")
+    if float(metrics.get("rel_s_m", 0.0)) >= 0.0:
+        reasons.append("gvt_not_behind_vut")
+    if not _main_heading_trackable(metrics):
+        reasons.append("vut_heading_not_trackable")
+    return reasons
+
+
+def _get_active_completion_target(
+    context: SceneContext,
+    target_line: ReferenceLineView | None,
+    metrics: dict[str, Any],
+    memory: dict[str, Any],
+) -> dict[str, Any]:
+    """滚动求解 VUT 完成换道时的 GVT 终端，并对截止时刻做稳定更新。
+
+    首帧预测只作为初值。之后每帧按当前横向状态得到新的完成时刻候选，再以进度
+    相关的更新率和单帧变化上限更新截止时刻。这样能纠正 VUT 实际换道时长偏离
+    首帧预测的问题，同时避免中后段目标 ``s/v/T`` 跳变。
+    """
+    line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
+    saved = memory.get("active_completion_target")
+    candidate_t = _clamp(
+        float(metrics.get("predicted_t_complete_s", float("nan"))),
+        float(_LANE_CHANGE_PREDICTION_T_MIN_S),
+        float(_LANE_CHANGE_PREDICTION_T_MAX_S),
+    )
+    if not np.isfinite(candidate_t):
+        return {"valid": False, "reason": "invalid_predicted_completion_time"}
+
+    now = float(context.time_s)
+    candidate_deadline = now + candidate_t
+    progress = float(metrics.get("lane_change_progress_ratio", 0.0))
+    # 仅在距中心线最后 0.15m 且预测剩余时间不足 0.25s 时锁定终端，
+    # 避免换道尾段的离散测量使终端时刻反复跳变。
+    lock_d = float(_LANE_CHANGE_COMPLETE_D_M) + float(0.15)
+    can_lock = bool(
+        float(metrics.get("main_abs_d_on_target_line_m", float("inf"))) <= lock_d
+        and candidate_t <= float(0.25)
+    )
+
+    saved_for_line = isinstance(saved, dict) and str(saved.get("target_lane_id", "")) == str(line.lane_id)
+    if not saved_for_line:
+        deadline = float(candidate_deadline)
+        policy = "rolling_terminal_initial"
+    elif bool(saved.get("locked", False)):
+        deadline = max(now + float(context.dt), float(saved.get("deadline_s", candidate_deadline)))
+        policy = "rolling_terminal_locked"
+    else:
+        # 进度过半后降低截止时刻的单帧修正量，优先保证控制稳定性。
+        settled = progress >= float(0.50)
+        alpha = float(
+            0.30
+            if settled
+            else 0.60
+        )
+        max_shift = float(
+            0.08
+            if settled
+            else 0.20
+        )
+        previous_deadline = float(saved.get("deadline_s", candidate_deadline))
+        deadline_shift = _clamp(candidate_deadline - previous_deadline, -max_shift, max_shift)
+        deadline = max(now + float(context.dt), previous_deadline + alpha * deadline_shift)
+        policy = "rolling_terminal_settled" if settled else "rolling_terminal_tracking"
+
+    remaining_t = max(float(context.dt), deadline - now)
+    terminal = _solve_completion_thw_terminal(context, line, metrics, plan_t_override_s=remaining_t)
+    if not bool(terminal.get("valid", False)):
+        return terminal
+
+    target_s = _clamp(
+        float(terminal["target_s_m"]),
+        float(line.current_s) + float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
+        float(line.cumulative_s[-1]) - 0.5,
+    )
+    terminal["target_s_m"] = float(target_s)
+    terminal["plan_t_s"] = float(remaining_t)
+    terminal["active_completion_target_policy"] = policy
+    terminal["active_completion_deadline_s"] = float(deadline)
+    terminal["active_completion_candidate_deadline_s"] = float(candidate_deadline)
+    terminal["active_completion_deadline_error_s"] = float(candidate_deadline - deadline)
+    terminal["active_completion_remaining_t_s"] = float(remaining_t)
+    terminal["active_completion_terminal_locked"] = bool(can_lock or (saved_for_line and bool(saved.get("locked", False))))
+    terminal["active_completion_progress_ratio"] = float(progress)
+    memory["active_completion_target"] = {
+        "target_lane_id": str(line.lane_id),
+        "deadline_s": float(deadline),
+        "locked": bool(can_lock or (saved_for_line and bool(saved.get("locked", False)))),
+    }
+    return terminal
+
+
 def _solve_completion_thw_terminal(
     context: SceneContext,
     target_line: ReferenceLineView | None,
     metrics: dict[str, Any],
+    plan_t_override_s: float | None = None,
 ) -> dict[str, Any]:
     """反解 GVT 在 VUT 换道完成时满足目标 THW 所需的终端状态。
 
@@ -1140,9 +1421,9 @@ def _solve_completion_thw_terminal(
     if not np.isfinite(raw_t):
         return {"valid": False, "reason": "invalid_predicted_completion_time"}
     plan_t = _clamp(
-        raw_t,
-        float(CFG["lane_change_prediction_t_min_s"]),
-        float(CFG["lane_change_prediction_t_max_s"]),
+        raw_t if plan_t_override_s is None else float(plan_t_override_s),
+        float(_LANE_CHANGE_PREDICTION_T_MIN_S),
+        float(_LANE_CHANGE_PREDICTION_T_MAX_S),
     )
     if plan_t <= 1e-3:
         return {"valid": False, "reason": "non_positive_completion_time"}
@@ -1150,11 +1431,11 @@ def _solve_completion_thw_terminal(
     limits = _read_vehicle_limits(context)
     gvt_s = float(metrics.get("ego_s_on_target_line_m", target_line.current_s))
     gvt_v = max(0.0, float(metrics.get("ego_v_mps", context.ego_vehicle.v)))
-    vut_s_complete = float(metrics.get("predicted_main_s_complete_m", float("nan")))
-    if not np.isfinite(vut_s_complete):
-        vut_s_complete = float(metrics.get("main_s_on_target_line_m", 0.0)) + float(metrics.get("main_v_mps", 0.0)) * plan_t
+    main_s = float(metrics.get("main_s_on_target_line_m", 0.0))
+    main_v = float(metrics.get("main_v_mps", 0.0))
+    vut_s_complete = main_s + main_v * plan_t
 
-    target_thw = max(0.0, float(CFG["completion_target_thw_s"]))
+    target_thw = max(0.0, float(SCENE_CONFIG["completion_target_thw_s"]))
     ego_length = float(metrics.get("ego_length_m", limits.ego_length))
     main_length = float(metrics.get("main_length_m", limits.main_length))
     half_len_sum = 0.5 * (ego_length + main_length)
@@ -1170,7 +1451,7 @@ def _solve_completion_thw_terminal(
         - 0.5 * float(gvt_v) * plan_t
     ) / denominator
 
-    min_net_gap = float(CFG["completion_min_net_gap_m"])
+    min_net_gap = float(SCENE_CONFIG["completion_min_net_gap_m"])
     if target_thw * max(raw_target_v, 0.0) - main_length < min_net_gap:
         raw_target_v = 2.0 * (
             float(vut_s_complete)
@@ -1181,10 +1462,8 @@ def _solve_completion_thw_terminal(
 
     reachable_v_min = max(0.0, float(gvt_v) + limits.min_acc * plan_t)
     reachable_v_max = min(limits.max_v, float(gvt_v) + limits.max_acc * plan_t)
-    if bool(CFG["active_terminal_speed_ignore_acc_limit"]):
-        target_v = _clamp(raw_target_v, 0.0, limits.max_v)
-    else:
-        target_v = _clamp(raw_target_v, reachable_v_min, reachable_v_max)
+    # 这里保留反解的终端速度；实际可达性单独记录，统一由下游规划器施加约束。
+    target_v = _clamp(raw_target_v, 0.0, limits.max_v)
     target_acc = (target_v - float(gvt_v)) / plan_t
     target_s = float(gvt_s) + 0.5 * (float(gvt_v) + target_v) * plan_t
     target_headway_gap = (
@@ -1193,7 +1472,7 @@ def _solve_completion_thw_terminal(
     )
     target_net_gap = target_headway_gap - main_length
     achieved_thw = (
-        target_headway_gap / max(target_v, float(CFG["thw_v_floor_mps"]))
+        target_headway_gap / max(target_v, float(_THW_V_FLOOR_MPS))
         if target_headway_gap > 0.0
         else 0.0
     )
@@ -1201,7 +1480,7 @@ def _solve_completion_thw_terminal(
     feasible = bool(
         np.isfinite(raw_target_v)
         and abs(target_v - raw_target_v) <= 1e-3
-        and abs(thw_error) <= float(CFG["completion_thw_tol_s"])
+        and abs(thw_error) <= float(SCENE_CONFIG["completion_thw_tol_s"])
         and target_net_gap >= min_net_gap - 1e-3
     )
     acc_within_limit = bool(limits.min_acc <= target_acc <= limits.max_acc)
@@ -1212,12 +1491,13 @@ def _solve_completion_thw_terminal(
         "completion_thw_speed_base": "gvt_completion_speed",
         "plan_t_s": float(plan_t),
         "raw_predicted_t_complete_s": float(raw_t),
+        "completion_plan_t_overridden": bool(plan_t_override_s is not None),
         "target_s_m": float(target_s),
         "target_v_mps": float(target_v),
         "target_acc_mps2": float(target_acc),
         "required_avg_acc_mps2": float(target_acc),
         "external_target_acc_consumed": False,
-        "terminal_speed_ignore_acc_limit": bool(CFG["active_terminal_speed_ignore_acc_limit"]),
+        "terminal_speed_ignore_acc_limit": True,
         "required_avg_acc_within_platform_limit": bool(acc_within_limit),
         "raw_target_v_mps": float(raw_target_v),
         "reachable_v_min_mps": float(reachable_v_min),
@@ -1239,16 +1519,16 @@ def _compute_active_target_rel_s(metrics: dict[str, Any]) -> dict[str, Any]:
     ego_length = float(metrics.get("ego_length_m", 4.5))
     main_length = float(metrics.get("main_length_m", 4.5))
     limits_half_sum = 0.5 * (ego_length + main_length)
-    follower_v = max(float(metrics.get("ego_v_mps", 0.0)), float(CFG["thw_v_floor_mps"]))
-    target_headway_gap = float(CFG["completion_target_thw_s"]) * follower_v
+    follower_v = max(float(metrics.get("ego_v_mps", 0.0)), float(_THW_V_FLOOR_MPS))
+    target_headway_gap = float(SCENE_CONFIG["completion_target_thw_s"]) * follower_v
     target_net_gap = max(
         target_headway_gap - main_length,
-        float(CFG["completion_min_net_gap_m"]),
+        float(SCENE_CONFIG["completion_min_net_gap_m"]),
     )
     completion_rel_s_target = -(target_net_gap + limits_half_sum)
-    blind_target = float(CFG["blind_rel_s_target_m"])
+    blind_target = float(SCENE_CONFIG["blind_rel_s_target_m"])
     progress = float(metrics.get("lane_change_progress_ratio", 0.0))
-    blend_start = _clamp(float(CFG["completion_blend_start_progress"]), 0.0, 0.95)
+    blend_start = _clamp(float(0.50), 0.0, 0.95)
     blend = _clamp((progress - blend_start) / max(1.0 - blend_start, 1e-3), 0.0, 1.0)
     target_rel_s = (1.0 - blend) * blind_target + blend * completion_rel_s_target
 
@@ -1256,7 +1536,7 @@ def _compute_active_target_rel_s(metrics: dict[str, Any]) -> dict[str, Any]:
     rel_s_complete = float(metrics.get("predicted_rel_s_complete_m", float("nan")))
     if np.isfinite(t_complete) and np.isfinite(rel_s_complete) and t_complete > 1e-3:
         prediction_error = completion_rel_s_target - rel_s_complete
-        prediction_speed_delta = float(CFG["completion_prediction_gain"]) * prediction_error / t_complete
+        prediction_speed_delta = float(0.45) * prediction_error / t_complete
     else:
         prediction_error = 0.0
         prediction_speed_delta = 0.0
@@ -1320,32 +1600,41 @@ def _compute_blind_spot_metrics(
     heading_diff = _heading_diff_deg(float(main.heading), float(ego.heading))
     heading_diff_to_target = _heading_diff_deg(float(main.heading), float(target_heading_at_main_s))
     side_lateral = _signed_side_lateral_offset(main, ego, side)
-    ego_on_target_line = abs(float(ego_d)) <= float(CFG["max_ego_d_on_target_line_m"])
-    side_lateral_ok = float(CFG["side_lateral_min_m"]) <= side_lateral <= float(CFG["side_lateral_max_m"])
-    same_direction = heading_diff <= float(CFG["max_heading_diff_deg"])
+    ego_on_target_line = abs(float(ego_d)) <= float(1.5)
+    # 曲线道路上两车相距较远时，世界坐标下的横向投影会混入纵向距离；使用
+    # 锁定目标车道的 Frenet d 判断 VUT 是否仍处在目标车道的对侧。
+    target_line_side_offset = -float(main_d) if side == "left" else float(main_d)
+    side_lateral_ok = bool(
+        float(1.8)
+        <= target_line_side_offset
+        <= float(5.5)
+    )
+    same_direction = heading_diff <= float(20.0)
     road_remaining = float(target_line.cumulative_s[-1]) - float(ego_s)
-    road_remaining_ok = road_remaining >= float(CFG["min_road_remaining_m"])
-    rel_s_search_ok = float(CFG["search_rel_s_min_m"]) <= rel_s <= float(CFG["search_rel_s_max_m"])
+    road_remaining_ok = road_remaining >= float(18.0)
+    rel_s_search_ok = float(-35.0) <= rel_s <= float(-1.0)
     in_blind_zone = bool(
         same_direction
         and ego_on_target_line
         and side_lateral_ok
-        and float(CFG["blind_rel_s_min_m"]) <= rel_s <= float(CFG["blind_rel_s_max_m"])
+        and float(SCENE_CONFIG["blind_rel_s_min_m"]) <= rel_s <= float(SCENE_CONFIG["blind_rel_s_max_m"])
     )
 
     center_gap = -rel_s
     net_gap = center_gap - 0.5 * (limits.ego_length + limits.main_length)
     headway_gap = center_gap + 0.5 * (limits.main_length - limits.ego_length)
-    completion_thw = headway_gap / max(float(ego.v), float(CFG["thw_v_floor_mps"])) if headway_gap > 0.0 else 0.0
+    completion_thw = headway_gap / max(float(ego.v), float(_THW_V_FLOOR_MPS)) if headway_gap > 0.0 else 0.0
     closing_speed = float(ego.v) - float(main.v)
     ttc_debug = net_gap / closing_speed if net_gap > 0.0 and closing_speed > 1e-6 else float("inf")
     baseline_abs_d = float(memory.get("baseline_main_abs_d_on_target", -1.0))
     current_abs_d = abs(float(main_d))
     if baseline_abs_d <= 0.0:
         baseline_abs_d = current_abs_d
-    complete_d = float(CFG["lane_change_complete_d_m"])
+    complete_d = float(_LANE_CHANGE_COMPLETE_D_M)
+    # 换道进度以目标车道中心线 d=0 为终点；完成阈值 complete_d 只用于
+    # 判定，不参与进度归一化，避免 progress 提前替代真实完成条件。
     lane_change_progress = _clamp(
-        (baseline_abs_d - current_abs_d) / max(baseline_abs_d - complete_d, 1e-3),
+        (baseline_abs_d - current_abs_d) / max(baseline_abs_d, 1e-3),
         0.0,
         1.0,
     )
@@ -1375,6 +1664,7 @@ def _compute_blind_spot_metrics(
         "main_abs_d_on_target_line_m": float(current_abs_d),
         "rel_s_m": float(rel_s),
         "side_lateral_offset_m": float(side_lateral),
+        "target_line_side_offset_m": float(target_line_side_offset),
         "same_direction": bool(same_direction),
         "heading_diff_deg": float(heading_diff),
         "main_heading_diff_to_target_line_deg": float(heading_diff_to_target),
@@ -1389,12 +1679,12 @@ def _compute_blind_spot_metrics(
         "completion_headway_gap_m": float(headway_gap),
         "completion_net_gap_m": float(net_gap),
         "completion_thw_s": float(completion_thw),
-        "completion_target_thw_s": float(CFG["completion_target_thw_s"]),
-        "completion_thw_error_s": float(completion_thw - float(CFG["completion_target_thw_s"])),
+        "completion_target_thw_s": float(SCENE_CONFIG["completion_target_thw_s"]),
+        "completion_thw_error_s": float(completion_thw - float(SCENE_CONFIG["completion_target_thw_s"])),
         "ttc_debug_s": float(ttc_debug),
         "closing_speed_mps": float(closing_speed),
         "lane_change_progress_ratio": float(lane_change_progress),
-        "vut_lane_change_complete": bool(current_abs_d <= complete_d or lane_change_progress >= 0.85),
+        "vut_lane_change_complete": bool(current_abs_d <= complete_d),
         "hard_collision_risk": bool(hard_collision["hard_collision_risk"]),
         "longitudinal_overlap_m": float(hard_collision["longitudinal_overlap_m"]),
         "lateral_overlap_m": float(hard_collision["lateral_overlap_m"]),
@@ -1421,18 +1711,15 @@ def _predict_lane_change_completion(
 ) -> dict[str, Any]:
     """按纵向速度恒定假设，预测 VUT 到达目标侧车道中心附近时的两车纵向关系。"""
     lateral_v = (float(prev_abs_d) - float(current_abs_d)) / max(float(dt), 1e-3)
-    lateral_v_eff = max(float(lateral_v), float(CFG["lane_change_min_lateral_v_mps"]))
-    remaining_d = max(0.0, float(current_abs_d) - float(CFG["lane_change_complete_d_m"]))
+    lateral_v_eff = max(float(lateral_v), float(0.15))
+    remaining_d = max(0.0, float(current_abs_d) - float(_LANE_CHANGE_COMPLETE_D_M))
     raw_t_complete = remaining_d / max(lateral_v_eff, 1e-3)
-    adjusted_t_complete = max(
-        float(dt),
-        raw_t_complete * float(CFG["lane_change_prediction_time_scale"])
-        - float(CFG["lane_change_prediction_time_buffer_s"]),
-    )
+    # 横向剩余距离/横向速度给出主预测，固定 0.05s 补偿离散观测滞后。
+    adjusted_t_complete = max(float(dt), raw_t_complete - float(0.05))
     t_complete = _clamp(
         adjusted_t_complete,
-        float(CFG["lane_change_prediction_t_min_s"]),
-        float(CFG["lane_change_prediction_t_max_s"]),
+        float(_LANE_CHANGE_PREDICTION_T_MIN_S),
+        float(_LANE_CHANGE_PREDICTION_T_MAX_S),
     )
     ego_s_complete = float(ego_s) + float(ego_v) * t_complete
     main_s_complete = float(main_s) + float(main_v) * t_complete
@@ -1462,7 +1749,7 @@ def _evaluate_hard_collision(context: SceneContext, limits: VehicleLimits) -> di
     left = np.array([-forward[1], forward[0]], dtype=float)
     rel_longitudinal = abs(float(np.dot(rel_xy, forward)))
     rel_lateral = abs(float(np.dot(rel_xy, left)))
-    margin = float(CFG["hard_collision_margin_m"])
+    margin = float(0.2)
     longitudinal_overlap = 0.5 * (limits.ego_length + limits.main_length) + margin - rel_longitudinal
     lateral_overlap = 0.5 * (limits.ego_width + limits.main_width) + margin - rel_lateral
     hard_collision = bool(longitudinal_overlap > 0.0 and lateral_overlap > 0.0)
@@ -1484,9 +1771,9 @@ def _select_current_side_lane(context: SceneContext) -> ReferenceLineView | None
         return None
     side = _normalized_scene_side()
     side_lateral = _signed_side_lateral_offset(main, ego, side)
-    if side_lateral < float(CFG["side_lateral_min_m"]):
+    if side_lateral < float(1.8):
         return None
-    if abs(float(ego.current_ref_line.current_d)) > float(CFG["max_ego_d_on_target_line_m"]):
+    if abs(float(ego.current_ref_line.current_d)) > float(1.5):
         return None
     return ego.current_ref_line
 
@@ -1584,7 +1871,7 @@ def _annotate_output(
 
 def _normalized_scene_side() -> str:
     """读取配置侧；非法配置统一退化为 left。"""
-    side = str(CFG.get("scene_side", "left")).strip().lower()
+    side = str(SCENE_CONFIG["scene_side"]).strip().lower()
     if side not in {"left", "right"}:
         return "left"
     return side

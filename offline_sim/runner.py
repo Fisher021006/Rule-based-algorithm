@@ -132,6 +132,9 @@ def _build_route_extender(
 def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     """完整执行一次离线仿真，并返回结果摘要。"""
 
+    scene_algorithm_symbol = str(getattr(args, "scene_algorithm_symbol", "") or "").strip()
+    if str(args.planner_mode) == "scene_target" and not scene_algorithm_symbol:
+        raise ValueError("scene_target 模式必须显式传入 scene_algorithm_symbol")
     install_interrupt_handlers()
     wall_start = time.perf_counter()
     max_steps = _normalise_max_steps(getattr(args, "max_steps", None))
@@ -147,6 +150,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     ego_vehicle = instantiate_ego_vehicle(
         xodr_parser,
         max_speed_kph=float(getattr(args, "ego_max_speed_kph", 25.0)),
+        scene_algorithm_symbol=scene_algorithm_symbol,
     )
     ego_start_xy = np.asarray(args.ego_start_xy, dtype=float)
     ego_goal_xy = np.asarray(args.ego_goal_xy, dtype=float)
@@ -201,7 +205,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         main_lane_extender=None if bool(args.disable_main_obstacle) else main_lane_extender,
         dt=float(args.dt),
         max_lane_segments=int(args.ref_lane_count),
-        scene_algorithm_symbol=str(getattr(args, "scene_algorithm_symbol", "scenarios.scene_algorithm.scene_algorithm")),
+        scene_algorithm_symbol=scene_algorithm_symbol,
     )
     provider.set_main_vehicle_ptc_id(str(getattr(args, "main_ptc_id", "main")))
     ego_vehicle.scene_target_provider = provider
@@ -310,14 +314,22 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             traj = np.asarray(trajectory, dtype=float)
             exec_index = min(max(1, int(args.advance_index)), len(traj) - 1)
             exec_point = traj[exec_index]
+            previous_v = float(ego_vehicle.v)
+            executed_dt = max(float(args.dt) * float(exec_index), 1e-3)
+            # 轨迹点的 a 描述其后续离散区间，而本轮执行的是从当前状态到
+            # exec_point 的区间。回传给下一轮规划的加速度必须由实际速度变化
+            # 反算，否则会把“下一段加速度”错当成当前状态并污染 OSQP 初值。
+            executed_a = (float(exec_point[3]) - previous_v) / executed_dt
             ego_vehicle.x = float(exec_point[0])
             ego_vehicle.y = float(exec_point[1])
             ego_vehicle.heading = float(exec_point[2])
             ego_vehicle.v = float(exec_point[3])
-            ego_vehicle.a = float(exec_point[4])
+            ego_vehicle.a = float(executed_a)
             ego_vehicle.kappa = float(exec_point[5])
             ego_vehicle.timestamp_ms = int(round((time_s + float(args.dt)) * 1000.0))
-            ego_trace.append(exec_point.tolist())
+            executed_trace_point = np.asarray(exec_point, dtype=float).copy()
+            executed_trace_point[4] = float(executed_a)
+            ego_trace.append(executed_trace_point.tolist())
 
             main_step_obstacles = [ego_vehicle]
             if exposed_vehicle is not None:
@@ -426,13 +438,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                 else ""
             )
             if (
-                latest_scene_status == "complete"
+                latest_scene_status in {"complete", "complete_thw_miss"}
                 and latest_control_mode == "emergency_stop"
                 and ego_vehicle.v <= float(args.arrive_speed)
             ):
-                status = "scene_completed"
+                status = "scene_completed" if latest_scene_status == "complete" else "blind_spot_thw_miss"
                 log_status(
-                    f"[sim] blind-spot scene completed at step {step_label} "
+                    f"[sim] blind-spot scene finished at step {step_label} "
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
@@ -468,7 +480,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             6,
         ) if timing_frames else 0.0,
         "planner_mode": str(args.planner_mode),
-        "scene_algorithm_symbol": str(getattr(args, "scene_algorithm_symbol", "scenarios.scene_algorithm.scene_algorithm")),
+        "scene_algorithm_symbol": scene_algorithm_symbol,
         "status": status,
         "failure_reason": failure_reason,
         "map_cache": str(args.map_cache),
