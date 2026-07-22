@@ -48,6 +48,16 @@ platform_integration/scripts/check_platform_redis.sh
 platform_integration/scripts/run_platform_adapter.sh
 ```
 
+启动平台新注册的 3810 域控（`local_sampling` 背景车）：
+
+```bash
+platform_integration/scripts/run_platform_domain_3810.sh
+```
+
+如需让原域控和 3810 同时在线，先保持同一个 ROS Docker 容器运行，
+再在两个 Mac 终端分别执行上述两个启动脚本。3810 配置使用
+`/domain_3810/*` 话题和独立 ROS 节点名，可与原实例共用同一个 `roscore`。
+
 只验证 ROS 算法闭环：
 
 ```bash
@@ -59,4 +69,3 @@ platform_integration/scripts/run_ros_fake_smoke.sh
 ```bash
 platform_integration/scripts/run_virtual_redis_adapter_smoke.sh
 ```
-

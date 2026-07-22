@@ -47,7 +47,9 @@ ros:
 direct_control:
   planner_mode: scene_target
   # scene_algorithm_symbol: scenarios.intersection_conflict_algorithm.intersection_conflict_algorithm 
-  scene_algorithm_symbol: scenarios.blind_spot_algorithm.blind_spot_algorithm
+  # scene_algorithm_symbol: scenarios.blind_spot_algorithm.blind_spot_algorithm
+  scene_algorithm_symbol: scenarios.cut_in_algorithm.cut_in_algorithm
+  # scene_algorithm_symbol: ""
   scene_main_ptc_id: ""
   scene_exposed_ptc_id: ""
   # intersection_conflict 需要平台下发车/VUT 的起终点作为路线意图输入。

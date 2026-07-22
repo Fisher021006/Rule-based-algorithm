@@ -46,7 +46,48 @@ def load_adapter_config(path_str: str) -> dict[str, Any]:
     path = Path(path_str)
     if not path.exists():
         raise FileNotFoundError(f"adapter config not found: {path}")
-    return _load_yaml_or_json(path)
+    return _load_adapter_config_path(path.resolve(), ())
+
+
+def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """递归合并两层配置，子配置中的值优先。
+
+    多域控实例共用 Redis、地图等基础配置，但覆盖设备 ID、
+    通道和 ROS topic。对嵌套字典递归合并可以避免复制整份
+    平台配置以及其中的连接凭据。
+    """
+
+    merged = dict(base)
+    for key, value in override.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_adapter_config_path(path: Path, parents: tuple[Path, ...]) -> dict[str, Any]:
+    """加载配置及其可选的 `extends` 父配置。"""
+
+    if path in parents:
+        chain = " -> ".join(str(item) for item in (*parents, path))
+        raise ValueError(f"adapter config extends cycle: {chain}")
+    if not path.exists():
+        raise FileNotFoundError(f"adapter config not found: {path}")
+
+    data = _load_yaml_or_json(path)
+    extends = data.pop("extends", None)
+    if extends in (None, ""):
+        return data
+    if not isinstance(extends, str):
+        raise ValueError(f"adapter config extends must be a path string: {path}")
+
+    parent_path = Path(extends)
+    if not parent_path.is_absolute():
+        parent_path = path.parent / parent_path
+    parent_data = _load_adapter_config_path(parent_path.resolve(), (*parents, path))
+    return _deep_merge_config(parent_data, data)
 
 
 def flatten_adapter_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +124,7 @@ def flatten_adapter_config(data: dict[str, Any]) -> dict[str, Any]:
         "duration_s": adapter.get("duration_s"),
         "trajectory_advance_index": adapter.get("trajectory_advance_index"),
         "log_dir": adapter.get("log_dir"),
+        "node_name": adapter.get("node_name"),
         "vehicle_id": vehicle.get("id"),
         "vehicle_name": vehicle.get("name"),
         "vehicle_id_from_device_id": vehicle.get("id_from_device_id"),
@@ -106,6 +148,7 @@ def flatten_adapter_config(data: dict[str, Any]) -> dict[str, Any]:
         "scene_main_start_latlon": direct_control.get("scene_main_start_latlon"),
         "scene_main_goal_xy": direct_control.get("scene_main_goal_xy"),
         "scene_main_goal_latlon": direct_control.get("scene_main_goal_latlon"),
+        "direct_node_name": direct_control.get("node_name"),
         "plan_hz": direct_control.get("plan_hz"),
         "control_hz": direct_control.get("control_hz"),
         "max_speed_kph": direct_control.get("max_speed_kph"),

@@ -1,0 +1,36 @@
+# 平台新注册的 3810 域控实例。
+# 共用 platform_real.yaml 中的 Redis、地图和车辆尺寸配置，
+# 只覆盖该域控独有的身份、通道、ROS topic 和规划模式。
+extends: platform_real.yaml
+
+platform:
+  device_id: 3810
+  device_name: lxy--domain
+  control_channel: control0721channel
+  data_channel_hint: data0721channel
+
+adapter:
+  node_name: virtual_redis_ros_adapter_3810
+  log_dir: /workspace/direct_control_bundle/platform_integration/logs/platform_redis_ros_adapter_3810
+
+vehicle:
+  id_from_device_id: true
+  name: lxy--domain
+
+ros:
+  adapter_cache_path: /tmp/platform_adapter_3810_xodr_cache.pkl
+  direct_cache_path: /tmp/platform_direct_3810_xodr_cache.pkl
+  sensorgps_topic: /domain_3810/sensorgps
+  actuator_topic: /domain_3810/actuator
+  controlcmd_topic: /domain_3810/controlcmd
+  trajectory_topic: /domain_3810/planning/trajectory
+  obu_topic: /domain_3810/obu/source
+
+# 3810 先作为可独立 A-B 行驶的背景车域控。
+direct_control:
+  node_name: direct_control_node_3810
+  planner_mode: local_sampling
+  scene_algorithm_symbol: ""
+  scene_main_ptc_id: ""
+  scene_exposed_ptc_id: ""
+  max_speed_kph: 6

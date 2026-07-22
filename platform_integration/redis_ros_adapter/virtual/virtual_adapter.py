@@ -118,6 +118,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--max-speed-kph", type=float, default=float(_default(defaults, "max_speed_kph", os.getenv("ADAPTER_MAX_SPEED_KPH", "25"))))
     parser.add_argument("--log-dir", default=_default(defaults, "log_dir", os.getenv("ADAPTER_LOG_DIR", "/tmp/virtual_redis_ros_adapter")))
     parser.add_argument("--node-name", default=_default(defaults, "node_name", "virtual_redis_ros_adapter"))
+    parser.add_argument("--direct-node-name", default=_default(defaults, "direct_node_name", "direct_control_node"))
     parser.add_argument("--sensorgps-topic", default=_default(defaults, "sensorgps_topic", os.getenv("ROS_SENSORGPS_TOPIC", "/sensorgps")))
     parser.add_argument("--actuator-topic", default=_default(defaults, "actuator_topic", os.getenv("ROS_ACTUATOR_TOPIC", "/actuator")))
     parser.add_argument("--controlcmd-topic", default=_default(defaults, "controlcmd_topic", os.getenv("ROS_CONTROLCMD_TOPIC", "/controlcmd")))
@@ -465,9 +466,13 @@ class VirtualRedisRosAdapter:
             scene_main_start_latlon=self.args.scene_main_start_latlon,
             scene_main_goal_xy=self.args.scene_main_goal_xy,
             scene_main_goal_latlon=self.args.scene_main_goal_latlon,
+            sensorgps_topic=self.args.sensorgps_topic,
+            actuator_topic=self.args.actuator_topic,
+            controlcmd_topic=self.args.controlcmd_topic,
             plan_hz=self.args.plan_hz,
             control_hz=self.args.control_hz,
             trajectory_topic=self.args.trajectory_topic,
+            node_name=self.args.direct_node_name,
             max_speed_kph=self.args.max_speed_kph,
         )
         self.running_task = True

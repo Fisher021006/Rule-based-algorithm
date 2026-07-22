@@ -33,18 +33,14 @@ class VehicleLimits:
 
 CFG: dict[str, Any] = {
     "cutin_side": "auto",
-    "target_thw_s": 2.0,
+    "target_thw_s": 8.0,
     "thw_tol_s": 0.1,
     "cruise_target_v": 5.0,
     "lane_change_time_s": 4.0,
     "prepare_plan_t_s": 1.5,
     "prepare_convergence_time_s": 2.0,
-    "prepare_rel_s_nominal_scale": 0.30,
-    "prepare_rel_s_target_min_m": -12.0,
-    "prepare_rel_s_target_max_m": 8.0,
-    "prepare_rel_s_activate_tol_m": 1.0,
-    "launch_delta_s_min_m": 0.0,
-    "prepare_build_adv_gain": 2.0,
+    "prepare_merge_lead_m": 1.0,
+    "launch_delta_s_min_m": 0,
     "prepare_max_speed_adv_mps": 3.0,
     "prepare_max_speed_lag_mps": 2.0,
     "prepare_commit_debounce_frames": 1,
@@ -118,6 +114,7 @@ def cut_in_algorithm(context: SceneContext) -> dict[str, Any]:
     if int(context.step_index) == 0:
         _reset_scene_memory()
     output, SCENE_MEMORY = _scene_fsm_step(context, SCENE_MEMORY)
+    print(f"[cutin] mode={SCENE_MEMORY.get('mode', '')} scene_status={output.get('scene_status', '')} reason={output.get('scene_detail', output.get('reason', ''))} main_ptc_id={getattr(getattr(context.planning_frame, 'main_actor', None), 'ptc_id', '')} relative_s={None if context.main_vehicle is None else round(context.main_vehicle.relative_s_to_ego, 3)} relative_d={None if context.main_vehicle is None else round(context.main_vehicle.relative_d_to_ego, 3)} prepare_delta_s_target={output.get('scene_debug', {}).get('prepare_delta_s_target', '')} prepare_target_v={output.get('scene_debug', {}).get('prepare_target_v', '')} target_line_index={output.get('target_line_index', '')} prepare_state={output.get('scene_debug', {}).get('prepare_state', output.get('scene_status', ''))} feasibility_reason={output.get('scene_debug', {}).get('exact_activate_reason', output.get('scene_debug', {}).get('exact_reason', output.get('scene_detail', '')))}")
     end_ms = time.time() * 1000.0
     print(f"Cut-in algorithm execution time: {end_ms - start_ms} ms")
     return output
@@ -203,7 +200,7 @@ def _handle_approach(
 
     _enter_prepare_mode(memory, target_line, now)
     launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]))
-    prepare_strategy = _build_prepare_strategy(context, launch_plan)
+    prepare_strategy = _build_prepare_strategy(context, target_line)
     return _build_prepare_output(
         context,
         memory,
@@ -230,7 +227,7 @@ def _handle_prepare(
         ), memory
 
     launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]))
-    prepare_strategy = _build_prepare_strategy(context, launch_plan)
+    prepare_strategy = _build_prepare_strategy(context, target_line)
 
     if _prepare_should_abort_as_globally_infeasible(memory, launch_plan, now):
         _enter_cooldown(memory, now)
@@ -672,9 +669,9 @@ def _build_prepare_output(
         "hold_t": 0.0,
         "reason": str(reason),
         "prepare_success_hits": int(memory.get("prepare_success_hits", 0)),
-        "prepare_rel_s": float(prepare_strategy["rel_s"]),
-        "prepare_rel_s_target": float(prepare_strategy["rel_s_target"]),
-        "prepare_rel_s_error": float(prepare_strategy["rel_s_error"]),
+        "prepare_delta_s_target": float(prepare_strategy["delta_s_target"]),
+        "prepare_delta_s_goal": float(prepare_strategy["delta_s_goal"]),
+        "prepare_delta_s_error": float(prepare_strategy["delta_s_error"]),
     }
     return _annotate_output(
         output,
@@ -892,16 +889,13 @@ def _prepare_window_ok(
 ) -> tuple[bool, dict[str, Any]]:
     """判断 PREPARE 是否已经收敛到可发射窗口。"""
     # 逻辑：
-    # 1. rel_s_target 只服务 BUILD；一旦 exact/degraded 已经 ready，launch 只看目标车道投影关系。
-    # 2. 这样可以避免“已经平齐/超前且解可行，但仍被 rel_s_target 卡住”的情况。
+    # 1. 前插只在目标车道投影上已略领先，且 exact/degraded 解可执行时启动。
+    # 2. PREPARE 的速度组织不会再改变这个启动判定的语义。
     ego = context.ego_vehicle
     main = context.main_vehicle
     if main is None:
         return False, {"reason": "no_main_vehicle"}
     not_already_on_target = str(ego.current_ref_line.lane_id) != str(target_line.lane_id)
-    rel_s_error = float(prepare_strategy["rel_s_error"])
-    rel_s_tol = float(CFG["prepare_rel_s_activate_tol_m"])
-    rel_s_window_ok = rel_s_error <= rel_s_tol
     _, ego_s_on_target, _ = project_point_to_path(
         np.array([ego.x, ego.y], dtype=float),
         target_line.line,
@@ -917,13 +911,12 @@ def _prepare_window_ok(
     window_ok = bool(
         not_already_on_target
         and launch_geom_ok
-        and (launch_state_ready or rel_s_window_ok)
+        and launch_state_ready
     )
     return window_ok, {
-        "prepare_rel_s_target": float(prepare_strategy["rel_s_target"]),
-        "prepare_rel_s_error": float(rel_s_error),
-        "prepare_rel_s_activate_tol": float(rel_s_tol),
-        "prepare_rel_s_window_ok": bool(rel_s_window_ok),
+        "prepare_delta_s_target": float(prepare_strategy["delta_s_target"]),
+        "prepare_delta_s_goal": float(prepare_strategy["delta_s_goal"]),
+        "prepare_delta_s_error": float(prepare_strategy["delta_s_error"]),
         "ego_s_on_target": float(ego_s_on_target),
         "main_s_on_target": float(main_s_on_target),
         "delta_s_target": float(delta_s_target),
@@ -1272,80 +1265,52 @@ def _evaluate_launch_plan(
 
 def _build_prepare_strategy(
     context: SceneContext,
-    launch_plan: dict[str, Any],
+    target_line: ReferenceLineView,
 ) -> dict[str, Any]:
     """根据当前 launch plan 构造 PREPARE 的纵向组织策略。"""
     # 逻辑：
-    # 1. PREPARE 的目标不是跟主车接近，而是把 exact 可行性缺口补出来。
-    # 2. exact 不可行且是上界受限时，会主动把目标相对距离压小，甚至压成负值。
+    # 1. PREPARE 始终以主车速度为基准，持续建立前插所需的小幅领先量。
+    # 2. exact THW 仅由 ACTIVE 求解；它不能把 PREPARE 拉回主车后方。
     main = context.main_vehicle
     limits = _read_vehicle_limits(context)
     if main is None:
         target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
         return {
-            "rel_s": 0.0,
-            "rel_s_target": 0.0,
-            "rel_s_error": 0.0,
+            "delta_s_target": 0.0,
+            "delta_s_goal": float(CFG["prepare_merge_lead_m"]),
+            "delta_s_error": float(CFG["prepare_merge_lead_m"]),
             "target_v": float(target_v),
             "debug": {},
         }
 
-    interval = launch_plan.get("interval")
-    degraded_result = launch_plan["degraded_result"]
-    reference_thw = float(CFG["target_thw_s"])
-    if launch_plan["degrade_reason"] == "main_speed_too_low_for_exact_thw" and degraded_result["ok"]:
-        reference_thw = float(degraded_result["requested_thw"])
-
-    rel_s = float(main.relative_s_to_ego)
-    nominal_rel_s_target = float(CFG["prepare_rel_s_nominal_scale"]) * reference_thw * max(0.0, float(main.v))
-    nominal_rel_s_target = _clamp(
-        nominal_rel_s_target,
-        float(CFG["prepare_rel_s_target_min_m"]),
-        float(CFG["prepare_rel_s_target_max_m"]),
+    _, ego_s_on_target, _ = project_point_to_path(
+        np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float),
+        target_line.line,
     )
-
-    thw_deficit = 0.0
-    if interval is not None:
-        thw_deficit = max(0.0, float(CFG["target_thw_s"]) - float(interval["thw_max_feasible"]))
-
-    launch_deficit_m = max(
-        0.0,
-        float(CFG["launch_delta_s_min_m"]) - float(launch_plan["debug"].get("delta_s_target_now", 0.0)),
+    _, main_s_on_target, _ = project_point_to_path(
+        np.array([main.x, main.y], dtype=float),
+        target_line.line,
     )
-
-    build_adv_m = (
-        thw_deficit * float(main.v) * float(CFG["prepare_build_adv_gain"])
-        + launch_deficit_m
-    )
-    rel_s_target = nominal_rel_s_target
-    if launch_plan["prepare_state"] == "prepare_build_exact":
-        rel_s_target = nominal_rel_s_target - build_adv_m
-    rel_s_target = _clamp(
-        rel_s_target,
-        float(CFG["prepare_rel_s_target_min_m"]),
-        float(CFG["prepare_rel_s_target_max_m"]),
-    )
-
-    raw_speed_delta = (rel_s - rel_s_target) / max(0.1, float(CFG["prepare_convergence_time_s"]))
+    delta_s_target = float(ego_s_on_target) - float(main_s_on_target)
+    delta_s_goal = float(CFG["prepare_merge_lead_m"])
+    delta_s_error = float(delta_s_goal) - float(delta_s_target)
+    raw_speed_delta = float(delta_s_error) / max(0.1, float(CFG["prepare_convergence_time_s"]))
     speed_delta = _clamp(
         raw_speed_delta,
         -float(CFG["prepare_max_speed_lag_mps"]),
         float(CFG["prepare_max_speed_adv_mps"]),
     )
     target_v = _clamp(float(main.v) + float(speed_delta), 0.0, limits.max_v)
-    rel_s_error = abs(float(rel_s) - float(rel_s_target))
 
     return {
-        "rel_s": float(rel_s),
-        "rel_s_target": float(rel_s_target),
-        "rel_s_error": float(rel_s_error),
+        "delta_s_target": float(delta_s_target),
+        "delta_s_goal": float(delta_s_goal),
+        "delta_s_error": float(delta_s_error),
         "target_v": float(target_v),
         "debug": {
-            "prepare_reference_thw": float(reference_thw),
-            "prepare_nominal_rel_s_target": float(nominal_rel_s_target),
-            "prepare_thw_deficit": float(thw_deficit),
-            "prepare_launch_deficit_m": float(launch_deficit_m),
-            "prepare_build_adv_m": float(build_adv_m),
+            "prepare_delta_s_target": float(delta_s_target),
+            "prepare_delta_s_goal": float(delta_s_goal),
+            "prepare_delta_s_error": float(delta_s_error),
             "prepare_raw_speed_delta": float(raw_speed_delta),
             "prepare_speed_delta": float(speed_delta),
             "prepare_target_v": float(target_v),
