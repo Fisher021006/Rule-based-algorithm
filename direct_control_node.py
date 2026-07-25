@@ -26,7 +26,6 @@ from xodr_parser.xodr_parser import XODRParser
 
 
 DEFAULT_MAP_PATH = str((Path(__file__).resolve().parent / "xodr_parser" / "data" / "同济测试场.xodr"))
-OBU_SELF_FILTER_DIST_M = 1.0
 GPS_TO_VEHICLE_CENTER_OFFSET_M = 0.5
 PLANNING_FAILURE_GRACE_S = 0.5
 CONTROL_PREVIEW_INDEX = 5
@@ -158,6 +157,11 @@ def build_arg_parser():
         default=_get_env("ROS_TRAJECTORY_TOPIC", default="/planning/trajectory"),
         help="规划轨迹话题；本地平台推演用 std_msgs/String(JSON) 发布完整轨迹",
     )
+    parser.add_argument(
+        "--scene-trajectory-log-path",
+        default="",
+        help="场景算法复盘 JSONL 路径；为空时不落盘逐帧规划轨迹",
+    )
     parser.add_argument("--node-name", default=_get_env("ROS_NODE_NAME", default="direct_control_node"))
 
     parser.add_argument("--plan-hz", type=float, default=float(_get_env("ROS_PLAN_HZ", default="10.0")))
@@ -175,6 +179,11 @@ def build_arg_parser():
         type=int,
         default=int(_get_env("ROS_OBU_TRACK_TIMEOUT_MS", default="1000")),
         help="OBU 障碍物保留时长，超过该时长的历史目标将被丢弃",
+    )
+    parser.add_argument(
+        "--obu-self-ptc-id",
+        default=_get_env("ROS_OBU_SELF_PTC_ID", default=""),
+        help="本车在 OBU 消息中的 ptc_id；仅按该 ID 排除自车回传，支持逗号分隔多个 ID",
     )
     parser.add_argument(
         "--scene-main-ptc-id",
@@ -341,6 +350,13 @@ class DirectControlNode:
         self.latest_command = self.build_hold_command()
         self._last_valid_plan_ts = 0.0
         self._last_plan_failure_log_ts = 0.0
+        trajectory_log_arg = str(args.scene_trajectory_log_path or "").strip()
+        self.scene_trajectory_log_path = Path(trajectory_log_arg) if trajectory_log_arg else None
+        self._scene_trajectory_log_file = None
+        if self.scene_trajectory_log_path is not None:
+            self.scene_trajectory_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._scene_trajectory_log_file = self.scene_trajectory_log_path.open("w", encoding="utf-8")
+            print(f"[scene_trajectory] jsonl_path={self.scene_trajectory_log_path}", flush=True)
 
         self.goal_xy = parse_point_args("goal", args.goal_xy, args.goal_latlon, self.transformer_to_proj)
         self.scene_main_start_xy = None
@@ -385,6 +401,11 @@ class DirectControlNode:
             scene_algorithm_symbol=self.args.scene_algorithm_symbol,
         )
         self.gvt.set_planner_mode(self.args.planner_mode)
+        self.obu_self_ptc_ids = {
+            value.strip()
+            for value in str(self.args.obu_self_ptc_id).split(",")
+            if value.strip()
+        }
         self.gvt.scene_target_provider.set_main_vehicle_ptc_id(self.args.scene_main_ptc_id)
         self.gvt.scene_target_provider.set_main_route_points(self.scene_main_start_xy, self.scene_main_goal_xy)
         self.gvt.scene_target_provider.set_runtime_dt(1.0 / max(float(self.args.plan_hz), 1e-3))
@@ -648,15 +669,11 @@ class DirectControlNode:
         now_ms = int(time.time() * 1000)
         fresh_obstacles = []
         retained = {}
-        ego_x = self.gvt.x
-        ego_y = self.gvt.y
-
         for obstacle in obstacle_snapshot:
             if obstacle.timestamp_ms > 0 and now_ms - obstacle.timestamp_ms > self.args.obu_track_timeout_ms:
                 continue
-            if ego_x is not None and ego_y is not None:
-                if np.hypot(obstacle.x - ego_x, obstacle.y - ego_y) < OBU_SELF_FILTER_DIST_M:
-                    continue
+            if obstacle.ptc_id in self.obu_self_ptc_ids:
+                continue
             fresh_obstacles.append(obstacle)
             retained[obstacle.ptc_id] = obstacle
 
@@ -712,11 +729,71 @@ class DirectControlNode:
             "brkreq": brkreq,
         }
 
-    def publish_planned_trajectory(self, trajectory, command=None):
+    @staticmethod
+    def _json_safe(value):
+        """Convert numpy and non-finite values before writing strict JSON."""
+        if isinstance(value, np.ndarray):
+            return [DirectControlNode._json_safe(item) for item in value.tolist()]
+        if isinstance(value, np.generic):
+            return DirectControlNode._json_safe(value.item())
+        if isinstance(value, float):
+            return value if np.isfinite(value) else None
+        if isinstance(value, dict):
+            return {str(key): DirectControlNode._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [DirectControlNode._json_safe(item) for item in value]
+        return value
+
+    def _write_scene_trajectory_record(self, trajectory, command, obstacles) -> None:
+        """Persist the scene decision, current states, and final local trajectory."""
+        if self._scene_trajectory_log_file is None:
+            return
+        provider = self.gvt.scene_target_provider
+        scene_record = provider.history[-1] if provider.history else {}
+        scene_context = provider.last_scene_context
+        main_vehicle = None if scene_context is None else scene_context.main_vehicle
+        main_actor = None if scene_context is None or scene_context.planning_frame is None else scene_context.planning_frame.main_actor
+        record = {
+            "wall_time_ms": int(time.time() * 1000),
+            "scene": scene_record,
+            "ego_state": {
+                "x": float(self.gvt.x),
+                "y": float(self.gvt.y),
+                "heading": float(self.gvt.heading),
+                "v_mps": float(self.gvt.v),
+                "a_mps2": float(self.gvt.a),
+            },
+            "main_vehicle": None if main_vehicle is None else {
+                "ptc_id": str(getattr(main_actor, "ptc_id", "")),
+                "x": float(main_vehicle.x),
+                "y": float(main_vehicle.y),
+                "heading": float(main_vehicle.heading),
+                "v_mps": float(main_vehicle.v),
+                "a_mps2": float(main_vehicle.a),
+            },
+            "obstacles": [
+                {
+                    "ptc_id": str(getattr(obstacle, "ptc_id", "")),
+                    "x": float(obstacle.x),
+                    "y": float(obstacle.y),
+                    "heading": float(obstacle.heading),
+                    "v_mps": float(obstacle.v),
+                    "a_mps2": float(obstacle.a),
+                }
+                for obstacle in obstacles
+            ],
+            "trajectory_fields": ["x", "y", "heading", "v_mps", "a_mps2", "kappa"],
+            "trajectory": np.asarray(trajectory, dtype=float)[:, :6],
+            "control_command": command,
+        }
+        self._scene_trajectory_log_file.write(
+            json.dumps(self._json_safe(record), ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        self._scene_trajectory_log_file.flush()
+
+    def publish_planned_trajectory(self, trajectory, command=None, obstacles=None):
         """发布完整规划轨迹，供本地平台推演的轨迹一致车辆模型使用。"""
 
-        if self.trajectory_pub is None:
-            return
         traj = np.asarray(trajectory, dtype=float)
         if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[1] < 6:
             return
@@ -736,9 +813,11 @@ class DirectControlNode:
                 "turnlight": int(command["turnlight"]),
                 "brkreq": int(command["brkreq"]),
             }
-        msg = self.TrajectoryMsg()
-        msg.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self.trajectory_pub.publish(msg)
+        if self.trajectory_pub is not None:
+            msg = self.TrajectoryMsg()
+            msg.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            self.trajectory_pub.publish(msg)
+        self._write_scene_trajectory_record(traj, command, obstacles or [])
 
     def is_arrived(self):
         if self.gvt.x is None or self.gvt.y is None:
@@ -816,7 +895,7 @@ class DirectControlNode:
                 continue
 
             command = self.trajectory_to_control_cmd(trajectory)
-            self.publish_planned_trajectory(trajectory, command)
+            self.publish_planned_trajectory(trajectory, command, obstacles)
             with self.command_lock:
                 self.latest_command = command
             self._last_valid_plan_ts = time.time()
@@ -852,6 +931,9 @@ class DirectControlNode:
         except Exception as exc:
             if not (self.rospy.is_shutdown() or "closed topic" in str(exc)):
                 print(f"⚠ 停车命令发布失败：{exc}", flush=True)
+        if self._scene_trajectory_log_file is not None:
+            self._scene_trajectory_log_file.close()
+            self._scene_trajectory_log_file = None
         print("⏹️  节点退出，已下发一次安全停车命令。")
 
     def _apply_control_command(self, msg, command):

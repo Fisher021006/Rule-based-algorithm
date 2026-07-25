@@ -56,6 +56,11 @@ CFG: dict[str, Any] = {
     "clear_after_conflict_m": 4.0,
     "cruise_target_v": 5.0,
     "speed_floor_mps": 0.5,
+    # VUT 到冲突点的预测：短时使用 OBU 纵向加速度，随后保持预测末速度。
+    # 避免将一帧噪声或瞬时制动无限外推到整个路口。
+    "vut_accel_prediction_horizon_s": 1.5,
+    "vut_accel_min_mps2": -3.0,
+    "vut_accel_max_mps2": 2.0,
     "target_speed_min_mps": 0.2,
     "sync_plan_t_min_s": 0.2,
     "sync_plan_t_max_s": 8.0,
@@ -65,6 +70,12 @@ CFG: dict[str, Any] = {
     "stop_complete_v_mps": 0.05,
     "stop_hold_s": 10.0,
     "min_target_progress_m": 0.05,
+    # 局部规划只消费当前路线走廊上的近端目标，不能直接追踪冲突区后的全局点。
+    "local_target_preview_time_s": 1.5,
+    "local_target_preview_min_m": 8.0,
+    "local_target_preview_max_m": 12.0,
+    "local_output_plan_t_min_s": 0.8,
+    "local_output_plan_t_max_s": 4.0,
 }
 
 
@@ -422,39 +433,77 @@ def _build_conflict_target_output(
     scene_status: str,
     scene_debug: dict[str, Any],
 ) -> dict[str, Any]:
+    """Build a local preview target while retaining global post-conflict intent for timing."""
     route_line = _route_line(context.ego_vehicle)
-    route_target_s = float(sync_target.get("target_s_m", metrics.get("gvt_s_conflict_m", 0.0)))
-    route_target_xy = np.asarray(metrics.get("conflict_xy", [context.ego_vehicle.x, context.ego_vehicle.y]), dtype=float)
+    global_post_conflict_s = float(sync_target.get("target_s_m", metrics.get("gvt_s_conflict_m", 0.0)))
+    global_post_conflict_xy = np.asarray(
+        metrics.get("conflict_xy", [context.ego_vehicle.x, context.ego_vehicle.y]),
+        dtype=float,
+    )
     if route_line is not None:
         route_lower_s = float(route_line.current_s) + float(CFG["min_target_progress_m"])
         route_upper_s = max(route_lower_s, float(route_line.cumulative_s[-1]))
-        route_target_s = _clamp(route_target_s, route_lower_s, route_upper_s)
-        route_target_xy, _route_target_heading = get_path_point_at_s(
+        global_post_conflict_s = _clamp(global_post_conflict_s, route_lower_s, route_upper_s)
+        global_post_conflict_xy, _route_target_heading = get_path_point_at_s(
             route_line.line,
-            route_target_s,
+            global_post_conflict_s,
             route_line.cumulative_s,
         )
-    line = _select_gvt_local_line_for_point(context, route_target_xy)
-    _, target_s, _ = project_point_to_path(np.asarray(route_target_xy, dtype=float), line.line)
+
+    # The global point is only a through-conflict semantic marker.  The local
+    # planner must receive a near target on the route-aligned local corridor.
+    line, selection_debug = _select_route_aligned_local_line(context)
     target_v = float(sync_target.get("target_v_mps", context.ego_vehicle.v))
-    plan_t = float(sync_target.get("plan_t_s", 1.0))
+    global_sync_plan_t = float(sync_target.get("plan_t_s", 1.0))
     limits = _read_vehicle_limits(context)
+    _, ego_s_on_local_line, ego_d_on_local_line = project_point_to_path(
+        np.asarray([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float),
+        line.line,
+    )
+    local_preview_m = _clamp(
+        target_v * float(CFG["local_target_preview_time_s"]),
+        float(CFG["local_target_preview_min_m"]),
+        float(CFG["local_target_preview_max_m"]),
+    )
+    local_target_s = _clamp(
+        float(ego_s_on_local_line) + local_preview_m,
+        float(ego_s_on_local_line) + float(CFG["min_target_progress_m"]),
+        float(line.cumulative_s[-1]) - 0.5,
+    )
+    local_target_distance_m = max(0.0, float(local_target_s) - float(ego_s_on_local_line))
+    local_plan_t = _solve_local_output_plan_t(
+        distance_m=local_target_distance_m,
+        current_v=float(context.ego_vehicle.v),
+        target_v=target_v,
+        limits=limits,
+    )
     target_a = _clamp(
-        (target_v - float(context.ego_vehicle.v)) / max(plan_t, 1e-3),
+        (target_v - float(context.ego_vehicle.v)) / max(local_plan_t, 1e-3),
         limits.min_acc,
         limits.max_acc,
     )
     scene_debug["target_acc_mps2"] = float(target_a)
-    scene_debug["route_target_s_m"] = float(route_target_s)
-    scene_debug["route_target_xy"] = [float(route_target_xy[0]), float(route_target_xy[1])]
-    scene_debug["output_target_line_source"] = "local_planner_line_projected_from_route"
+    scene_debug["global_post_conflict_target_s_m"] = float(global_post_conflict_s)
+    scene_debug["global_post_conflict_target_xy"] = [
+        float(global_post_conflict_xy[0]),
+        float(global_post_conflict_xy[1]),
+    ]
+    scene_debug.update(selection_debug)
+    scene_debug["ego_s_on_selected_local_line_m"] = float(ego_s_on_local_line)
+    scene_debug["ego_d_on_selected_local_line_m"] = float(ego_d_on_local_line)
+    scene_debug["local_target_preview_m"] = float(local_preview_m)
+    scene_debug["local_output_target_distance_m"] = float(local_target_distance_m)
+    scene_debug["local_output_target_s_m"] = float(local_target_s)
+    scene_debug["global_sync_plan_t_s"] = float(global_sync_plan_t)
+    scene_debug["local_output_plan_t_s"] = float(local_plan_t)
+    scene_debug["output_target_line_source"] = "route_aligned_local_preview"
     return _build_line_target_output(
         context=context,
         target_line=line,
-        target_s=target_s,
+        target_s=local_target_s,
         target_v=target_v,
         target_a=target_a,
-        plan_t=plan_t,
+        plan_t=local_plan_t,
         reason=reason,
         scene_status=scene_status,
         scene_detail=reason,
@@ -746,7 +795,11 @@ def _compute_conflict_metrics(
     gvt_v = max(0.0, float(context.ego_vehicle.v))
     vut_v = max(0.0, float(context.main_vehicle.v))
     gvt_tta = gvt_distance / max(gvt_v, speed_floor) if gvt_distance >= 0.0 else 0.0
-    vut_tta = vut_distance / max(vut_v, speed_floor) if vut_distance >= 0.0 else 0.0
+    vut_tta, vut_prediction = _predict_vut_arrival_time(
+        distance_m=vut_distance,
+        speed_mps=vut_v,
+        accel_mps2=float(context.main_vehicle.a),
+    )
     delta_t = float(gvt_tta) - float(vut_tta)
     zone = _compute_pet_like(
         gvt_distance=gvt_distance,
@@ -781,6 +834,10 @@ def _compute_conflict_metrics(
         "vut_longitudinal_to_conflict_m": float(vut_longitudinal_to_conflict),
         "gvt_v_mps": float(gvt_v),
         "vut_v_mps": float(vut_v),
+        "vut_a_mps2": float(vut_prediction["accel_used_mps2"]),
+        "vut_arrival_prediction_mode": str(vut_prediction["mode"]),
+        "vut_accel_phase_distance_m": float(vut_prediction["accel_phase_distance_m"]),
+        "vut_accel_phase_end_speed_mps": float(vut_prediction["accel_phase_end_speed_mps"]),
         "gvt_tta_s": float(gvt_tta),
         "vut_tta_s": float(vut_tta),
         "target_delta_t_s": float(target_delta),
@@ -788,6 +845,86 @@ def _compute_conflict_metrics(
         "delta_t_error_s": float(delta_error),
         "success_time_tol_s": float(CFG["success_time_tol_s"]),
         **zone,
+    }
+
+
+def _predict_vut_arrival_time(
+    *,
+    distance_m: float,
+    speed_mps: float,
+    accel_mps2: float,
+) -> tuple[float, dict[str, float | str]]:
+    """Predict VUT arrival with bounded short-horizon constant acceleration.
+
+    The OBU acceleration is useful near the conflict point but should not be
+    extrapolated indefinitely.  This model applies it for a short horizon and
+    then keeps the resulting speed constant.  A vehicle predicted to stop
+    before the conflict point has no finite arrival time.
+    """
+    raw_distance = float(distance_m)
+    raw_speed = float(speed_mps)
+    raw_accel = float(accel_mps2)
+    distance = max(0.0, raw_distance) if np.isfinite(raw_distance) else 0.0
+    speed = max(0.0, raw_speed) if np.isfinite(raw_speed) else 0.0
+    if distance <= 0.0:
+        return 0.0, {
+            "mode": "already_at_or_past_conflict",
+            "accel_used_mps2": 0.0,
+            "accel_phase_distance_m": 0.0,
+            "accel_phase_end_speed_mps": speed,
+        }
+
+    accel = _clamp(
+        raw_accel if np.isfinite(raw_accel) else 0.0,
+        float(CFG["vut_accel_min_mps2"]),
+        float(CFG["vut_accel_max_mps2"]),
+    )
+    horizon = max(0.0, float(CFG["vut_accel_prediction_horizon_s"]))
+    speed_floor = max(float(CFG["speed_floor_mps"]), 1e-3)
+    if horizon <= 1e-6 or abs(accel) <= 1e-6:
+        return distance / max(speed, speed_floor), {
+            "mode": "constant_speed",
+            "accel_used_mps2": 0.0,
+            "accel_phase_distance_m": 0.0,
+            "accel_phase_end_speed_mps": speed,
+        }
+
+    # Under braking, the constant-acceleration phase ends once the vehicle
+    # stops, even when that happens before the configured horizon.
+    accel_duration = horizon
+    if accel < 0.0:
+        accel_duration = min(horizon, speed / abs(accel))
+    accel_end_speed = max(0.0, speed + accel * accel_duration)
+    accel_distance = max(0.0, speed * accel_duration + 0.5 * accel * accel_duration * accel_duration)
+
+    # The conflict lies inside the bounded acceleration phase.  Solve
+    # 0.5*a*t^2 + v*t - distance = 0 and select its non-negative root.
+    if distance <= accel_distance + 1e-6:
+        discriminant = max(0.0, speed * speed + 2.0 * accel * distance)
+        if abs(accel) > 1e-6:
+            roots = [(-speed + np.sqrt(discriminant)) / accel, (-speed - np.sqrt(discriminant)) / accel]
+            non_negative_roots = [root for root in roots if root >= -1e-6]
+            if non_negative_roots:
+                return max(0.0, min(non_negative_roots)), {
+                    "mode": "constant_accel_to_conflict",
+                    "accel_used_mps2": accel,
+                    "accel_phase_distance_m": accel_distance,
+                    "accel_phase_end_speed_mps": accel_end_speed,
+                }
+
+    if accel_end_speed <= 1e-3:
+        return float("inf"), {
+            "mode": "stops_before_conflict",
+            "accel_used_mps2": accel,
+            "accel_phase_distance_m": accel_distance,
+            "accel_phase_end_speed_mps": accel_end_speed,
+        }
+
+    return accel_duration + (distance - accel_distance) / accel_end_speed, {
+        "mode": "bounded_accel_then_constant_speed",
+        "accel_used_mps2": accel,
+        "accel_phase_distance_m": accel_distance,
+        "accel_phase_end_speed_mps": accel_end_speed,
     }
 
 
@@ -1305,18 +1442,93 @@ def _route_intent_reason(vehicle: Any | None) -> str:
     return str(getattr(route_intent, "reason", "route_intent_invalid"))
 
 
-def _select_gvt_local_line_for_point(context: SceneContext, point_xy: np.ndarray) -> ReferenceLineView:
-    """从现有局部参考线中选一条承接 route 目标点的线。"""
+def _select_route_aligned_local_line(context: SceneContext) -> tuple[ReferenceLineView, dict[str, Any]]:
+    """选择符合全局下一步车道动作的局部候选线，而非按远端坐标选线。"""
 
-    lines = list(context.ego_vehicle.candidate_ref_lines) or [context.ego_vehicle.current_ref_line]
-    query = np.asarray(point_xy, dtype=float)
+    ego = context.ego_vehicle
+    lines = list(ego.candidate_ref_lines) or [ego.current_ref_line]
+    route_intent = getattr(ego, "route_intent", None)
+    planned_path = [str(lane_id) for lane_id in getattr(route_intent, "planned_path", []) if str(lane_id)]
+    planned_actions = list(getattr(route_intent, "planned_actions", []) or [])
+    current_lane_id = str(ego.lane_id or ego.current_ref_line.lane_id)
 
-    def score(line: ReferenceLineView) -> tuple[float, float, int]:
-        _idx, s, d = project_point_to_path(query, line.line)
-        forward_gap = max(0.0, float(line.current_s) - float(s))
-        return (float(abs(d)) + 10.0 * forward_gap, float(abs(d)), int(line.line_index))
+    if not planned_path or current_lane_id not in planned_path:
+        return ego.current_ref_line, {
+            "route_action_used": "fallback_current_line",
+            "route_alignment_reason": "current_lane_not_in_planned_path",
+            "selected_local_lane_sequence": _normalize_lane_sequence(ego.current_ref_line.lane_sequence),
+        }
 
-    return min(lines, key=score)
+    current_path_index = max(index for index, lane_id in enumerate(planned_path) if lane_id == current_lane_id)
+    next_path_index = min(current_path_index + 1, len(planned_path) - 1)
+    next_action = (
+        str(planned_actions[next_path_index].get("action", "successor"))
+        if next_path_index < len(planned_actions) and isinstance(planned_actions[next_path_index], dict)
+        else "successor"
+    )
+    lateral_change = next_path_index > current_path_index and next_action in {"left_change", "right_change"}
+    desired_path_index = next_path_index if lateral_change else current_path_index
+    desired_lane_id = planned_path[desired_path_index]
+
+    candidates = [line for line in lines if str(line.lane_id) == desired_lane_id]
+    if not candidates and desired_path_index != current_path_index:
+        candidates = [line for line in lines if str(line.lane_id) == current_lane_id]
+    if not candidates:
+        candidates = [ego.current_ref_line]
+
+    def route_overlap(line: ReferenceLineView) -> int:
+        lane_sequence = _normalize_lane_sequence(line.lane_sequence)
+        expected = planned_path[desired_path_index:]
+        overlap = 0
+        for candidate_lane, expected_lane in zip(lane_sequence, expected):
+            if candidate_lane != expected_lane:
+                break
+            overlap += 1
+        return overlap
+
+    ego_xy = np.asarray([ego.x, ego.y], dtype=float)
+
+    def score(line: ReferenceLineView) -> tuple[int, float, int]:
+        _idx, _s, lateral_d = project_point_to_path(ego_xy, line.line)
+        return (-route_overlap(line), float(abs(lateral_d)), int(line.line_index))
+
+    selected_line = min(candidates, key=score)
+    return selected_line, {
+        "route_action_used": next_action,
+        "route_alignment_reason": "next_lateral_action" if lateral_change else "current_route_lane",
+        "route_current_lane_id": current_lane_id,
+        "route_desired_local_lane_id": desired_lane_id,
+        "route_current_path_index": int(current_path_index),
+        "route_desired_path_index": int(desired_path_index),
+        "selected_local_lane_sequence": _normalize_lane_sequence(selected_line.lane_sequence),
+    }
+
+
+def _solve_local_output_plan_t(
+    *,
+    distance_m: float,
+    current_v: float,
+    target_v: float,
+    limits: VehicleLimits,
+) -> float:
+    """Derive a local trajectory horizon that is consistent with a near terminal point."""
+
+    distance = max(0.0, float(distance_m))
+    start_v = max(0.0, float(current_v))
+    end_v = max(0.0, float(target_v))
+    average_v = max(0.5 * (start_v + end_v), float(CFG["speed_floor_mps"]))
+    distance_time = distance / average_v
+
+    if end_v >= start_v:
+        accel_time = (end_v - start_v) / max(float(limits.max_acc), 1e-3)
+    else:
+        accel_time = (start_v - end_v) / max(abs(float(limits.min_acc)), 1e-3)
+
+    return _clamp(
+        max(distance_time, accel_time, float(CFG["local_output_plan_t_min_s"])),
+        float(CFG["local_output_plan_t_min_s"]),
+        float(CFG["local_output_plan_t_max_s"]),
+    )
 
 
 def _normalize_lane_sequence(lane_sequence: list[str] | tuple[str, ...] | None) -> list[str]:

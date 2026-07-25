@@ -460,6 +460,7 @@ class VirtualRedisRosAdapter:
             planner_mode=self.args.planner_mode,
             scene_algorithm_symbol=self.args.scene_algorithm_symbol,
             obu_topic=self.args.obu_topic,
+            obu_self_ptc_id=self.args.vehicle_id,
             scene_main_ptc_id=self.args.scene_main_ptc_id,
             scene_exposed_ptc_id=self.args.scene_exposed_ptc_id,
             scene_main_start_xy=self.args.scene_main_start_xy,

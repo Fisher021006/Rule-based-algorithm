@@ -81,6 +81,7 @@ class DirectControlLauncher:
         planner_mode: str,
         scene_algorithm_symbol: str,
         obu_topic: str,
+        obu_self_ptc_id: str,
         scene_main_ptc_id: str,
         scene_exposed_ptc_id: str,
         scene_main_start_xy: list[float] | None,
@@ -112,6 +113,7 @@ class DirectControlLauncher:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         algorithm_label = _log_algorithm_label(planner_mode, scene_algorithm_symbol)
         log_path = self.log_dir / f"{algorithm_label}_{timestamp}_task_{task_id}_case_{case_id}.log"
+        trajectory_log_path = log_path.with_suffix(".trajectory.jsonl")
         self.current_log_path = log_path
         self.log_file = open(log_path, "w", encoding="utf-8")
         command = [
@@ -152,6 +154,10 @@ class DirectControlLauncher:
             command.append("--rebuild-cache")
         if scene_algorithm_symbol:
             command.extend(["--scene-algorithm-symbol", str(scene_algorithm_symbol)])
+        if obu_self_ptc_id:
+            command.extend(["--obu-self-ptc-id", str(obu_self_ptc_id)])
+        if str(planner_mode).strip().lower() == "scene_target" and scene_algorithm_symbol:
+            command.extend(["--scene-trajectory-log-path", str(trajectory_log_path)])
         if scene_main_ptc_id:
             command.extend(["--scene-main-ptc-id", str(scene_main_ptc_id)])
         if scene_main_start_xy:
@@ -166,6 +172,8 @@ class DirectControlLauncher:
         if scene_exposed_ptc_id:
             env["ROS_SCENE_EXPOSED_PTC_ID"] = str(scene_exposed_ptc_id)
         print(f"[launcher] log_path={log_path}", file=self.log_file, flush=True)
+        if str(planner_mode).strip().lower() == "scene_target" and scene_algorithm_symbol:
+            print(f"[launcher] trajectory_log_path={trajectory_log_path}", file=self.log_file, flush=True)
         print(f"[launcher] command={' '.join(command)}", file=self.log_file, flush=True)
         self.process = subprocess.Popen(
             command,

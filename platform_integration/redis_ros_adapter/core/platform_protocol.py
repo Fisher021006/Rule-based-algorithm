@@ -193,9 +193,10 @@ def _append_vehicle_values(values: list[dict[str, Any]], candidate: Any) -> None
 def extract_vehicle_values(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """从平台背景车或融合数据消息中提取车辆状态列表。
 
-    当前场景算法需要把平台背景车转成 ROS OBU 障碍物输入。平台消息可能嵌套
-    在 `value.value`、顶层 `value` 或 `participantTrajectories[].value`
-    中，因此这里做多种结构的兼容提取。
+    当前场景算法需要把平台背景车和静态障碍物转成 ROS OBU 规划输入。平台消息
+    可能嵌套在 `value.value`、`value.obstacles`、顶层 `value`、顶层
+    `obstacles` 或 `participantTrajectories[].value` 中，因此这里做多种
+    结构的兼容提取。
     """
 
     values: list[dict[str, Any]] = []
@@ -203,10 +204,12 @@ def extract_vehicle_values(payload: dict[str, Any]) -> list[dict[str, Any]]:
     body = payload.get("value")
     if isinstance(body, dict):
         _append_vehicle_values(values, body.get("value"))
+        _append_vehicle_values(values, body.get("obstacles"))
     else:
         _append_vehicle_values(values, body)
 
     _append_vehicle_values(values, payload.get("value"))
+    _append_vehicle_values(values, payload.get("obstacles"))
 
     for trajectory in payload.get("participantTrajectories", []) or []:
         if not isinstance(trajectory, dict):

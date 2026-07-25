@@ -33,4 +33,4 @@ direct_control:
   scene_algorithm_symbol: ""
   scene_main_ptc_id: ""
   scene_exposed_ptc_id: ""
-  max_speed_kph: 6
+  max_speed_kph: 15
