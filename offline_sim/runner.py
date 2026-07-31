@@ -425,6 +425,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
+            if latest_scene_status == "cutin_success":
+                status = "scene_completed"
+                log_status(
+                    f"[sim] cut-in scene finished at step {step_label} "
+                    f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
+                )
+                break
             if latest_scene_status in {"cutout_success", "cutout_metric_miss", "cutout_hard_metric_fail"}:
                 status = "scene_completed" if latest_scene_status == "cutout_success" else latest_scene_status
                 log_status(

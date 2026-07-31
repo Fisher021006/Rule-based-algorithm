@@ -96,6 +96,14 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "dead_zone_trigger_pred_main_v": -1.0,
     "execute_complete_hits": 0,
     "stable_until_time_s": -1.0,
+    # 完成指标在首次确认进入目标车道时锁存，不随 STABILIZE 结束清空。
+    "completion_time_s": -1.0,
+    "completion_lane_id": "",
+    "completion_execution_kind": "",
+    "completion_requested_thw_s": 0.0,
+    "completion_achieved_thw_s": None,
+    "completion_thw_error_s": None,
+    "completion_metric_reason": "",
 }
 
 
@@ -131,6 +139,11 @@ def _scene_fsm_step(
     # 1. 这里只保留状态分发；每个状态的解算细节下沉到对应 handler。
     now = float(context.time_s)
     mode = str(memory.get("mode", "APPROACH"))
+
+    # COMPLETE 是单轮场景的闭锁终态。它不再依赖 VUT 实时状态，
+    # 避免主车 OBU 短时丢失后把已完成的切入重置为 APPROACH。
+    if mode == "COMPLETE":
+        return _handle_complete(context, memory)
 
     if mode == "COOLDOWN":
         if now < float(memory["cooldown_until_time_s"]):
@@ -376,8 +389,7 @@ def _handle_active(
     memory["active_infeasible_count"] = 0
     memory["last_dynamic_solution"] = copy.deepcopy(active_output)
     if _is_execute_completed(context, memory, target_line):
-        memory["mode"] = "STABILIZE"
-        memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
+        _enter_stabilize_mode(context, memory, target_line, now)
         return _build_stabilize_output(context, target_line), memory
     return active_output, memory
 
@@ -399,8 +411,7 @@ def _handle_frozen(
         ), memory
 
     if _is_execute_completed(context, memory, target_line):
-        memory["mode"] = "STABILIZE"
-        memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
+        _enter_stabilize_mode(context, memory, target_line, now)
         if target_line is not None:
             return _build_stabilize_output(context, target_line), memory
     return frozen_output, memory
@@ -413,21 +424,30 @@ def _handle_stabilize(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """处理 STABILIZE：换道完成后短时稳定跟随。"""
     target_line = _resolve_target_line(context, memory)
+    if now >= float(memory["stable_until_time_s"]):
+        _enter_complete_mode(memory)
+        return _build_complete_output(context, memory), memory
+
     if target_line is None:
-        memory["mode"] = "APPROACH"
-        _reset_execute_memory(memory)
+        # 进入 STABILIZE 前已经连续确认进入目标车道。此时锁定参考线
+        # 短时丢失只降级为当前车道巡航，不撤销已确认的切入结果。
         return _build_keep_lane_output(
             context,
             reason="stabilize_no_target_line",
-            scene_status="approach_wait_target_line",
+            scene_status="stabilize_following",
+            scene_debug=_completion_debug(memory),
         ), memory
 
-    output = _build_stabilize_output(context, target_line)
-    if now >= float(memory["stable_until_time_s"]):
-        memory["mode"] = "APPROACH"
-        _reset_prepare_memory(memory)
-        _reset_execute_memory(memory)
-    return output, memory
+    return _build_stabilize_output(context, target_line), memory
+
+
+def _handle_complete(
+    context: SceneContext,
+    memory: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """处理 COMPLETE：闭锁本轮切入成功，同时保持当前车道巡航。"""
+
+    return _build_complete_output(context, memory), memory
 
 
 def _handle_unknown_mode(
@@ -536,6 +556,51 @@ def _enter_frozen_mode(
     )
 
 
+def _enter_stabilize_mode(
+    context: SceneContext,
+    memory: dict[str, Any],
+    target_line: ReferenceLineView | None,
+    now: float,
+) -> None:
+    """进入 STABILIZE，并锁存首次确认换道完成时的 THW。"""
+
+    achieved_thw, metric_reason = _measure_completion_thw(context)
+    requested_thw = float(memory.get("execution_requested_thw_s", CFG["target_thw_s"]))
+    memory["mode"] = "STABILIZE"
+    memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
+    memory["completion_time_s"] = float(now)
+    memory["completion_lane_id"] = str(
+        memory.get("locked_target_lane_id", "")
+        or ("" if target_line is None else target_line.lane_id)
+        or context.ego_vehicle.lane_id
+    )
+    memory["completion_execution_kind"] = str(memory.get("execution_kind", ""))
+    memory["completion_requested_thw_s"] = float(requested_thw)
+    memory["completion_achieved_thw_s"] = (
+        None if achieved_thw is None else float(achieved_thw)
+    )
+    memory["completion_thw_error_s"] = (
+        None if achieved_thw is None else float(achieved_thw) - float(requested_thw)
+    )
+    memory["completion_metric_reason"] = str(metric_reason)
+    thw_text = "nan" if achieved_thw is None else f"{float(achieved_thw):.3f}"
+    print(
+        f"[cutin] lane_change_complete time={float(now):.2f}s "
+        f"lane={memory['completion_lane_id']} "
+        f"execution={memory['completion_execution_kind']} "
+        f"thw={thw_text} requested={requested_thw:.3f} "
+        f"metric_reason={metric_reason}",
+        flush=True,
+    )
+
+
+def _enter_complete_mode(memory: dict[str, Any]) -> None:
+    """进入单轮闭锁完成态，只清理不再需要的 PREPARE 上下文。"""
+
+    memory["mode"] = "COMPLETE"
+    _reset_prepare_memory(memory)
+
+
 def _enter_cooldown(memory: dict[str, Any], now: float) -> None:
     """进入冷却态，并清空本轮执行上下文。"""
     # 逻辑：
@@ -621,6 +686,21 @@ def _build_keep_lane_output(
         "reason": str(reason),
     }
     return _annotate_output(output, scene_status, scene_detail or reason, scene_debug)
+
+
+def _build_complete_output(
+    context: SceneContext,
+    memory: dict[str, Any],
+) -> dict[str, Any]:
+    """构造切入完成后的当前车道巡航目标。"""
+
+    return _build_keep_lane_output(
+        context,
+        reason="cutin_complete_cruise",
+        scene_status="cutin_success",
+        scene_detail="cutin_complete_latched",
+        scene_debug=_completion_debug(memory),
+    )
 
 
 def _build_prepare_output(
@@ -1017,6 +1097,51 @@ def _is_execute_completed(
     else:
         memory["execute_complete_hits"] = 0
     return int(memory["execute_complete_hits"]) >= int(CFG["execute_complete_frames"])
+
+
+def _measure_completion_thw(
+    context: SceneContext,
+) -> tuple[float | None, str]:
+    """按现有 cut-in 求解口径计算换道完成时的实际 THW。"""
+
+    main = context.main_vehicle
+    if main is None:
+        return None, "main_vehicle_missing"
+    if float(main.v) <= 1e-3:
+        return None, "main_speed_too_low"
+
+    ego = context.ego_vehicle
+    ego_xy = np.array([ego.x, ego.y], dtype=float)
+    main_xy = np.array([main.x, main.y], dtype=float)
+
+    # 优先使用后车 VUT 的当前参考线。切入目标线往往已从 GVT
+    # 当前位置向前截断，直接在它上投影会把后方 VUT 夹到起点。
+    main_line = main.current_ref_line
+    _, ego_s_on_main, ego_d_on_main = project_point_to_path(ego_xy, main_line.line)
+    _, main_s_on_main, _ = project_point_to_path(main_xy, main_line.line)
+    projected_center_distance = float(ego_s_on_main) - float(main_s_on_main)
+    if (
+        projected_center_distance > 1e-3
+        and abs(float(ego_d_on_main)) <= float(CFG["max_ego_to_target_line_d_m"])
+    ):
+        center_distance = float(projected_center_distance)
+        metric_reason = "main_reference_line"
+    else:
+        # 参考线被截断或匹配不稳定时，退回 VUT 车体纵向投影。
+        # 换道完成已要求两车同向，因此该局部距离不依赖路段 s 原点。
+        main_forward = np.array(
+            [np.cos(float(main.heading)), np.sin(float(main.heading))],
+            dtype=float,
+        )
+        center_distance = float(np.dot(ego_xy - main_xy, main_forward))
+        metric_reason = "main_heading_fallback"
+
+    limits = _read_vehicle_limits(context)
+    net_gap = center_distance - 0.5 * (float(limits.ego_length) + float(limits.main_length))
+    # 与 _project_requested_thw 保持同一口径：用后车 VUT 速度作为分母，
+    # 分子为净间距加 GVT 车长。两车等长时等价于车身中心纵向距离。
+    achieved_thw = (float(net_gap) + float(limits.ego_length)) / float(main.v)
+    return float(achieved_thw), metric_reason
 
 
 # ==================== Target Helpers / 目标车道与参考线 ====================
@@ -1842,6 +1967,27 @@ def _predict_main_vehicle_at_t(
 
 
 # ==================== Utilities / 基础工具、调试与日志 ====================
+
+
+def _completion_debug(memory: dict[str, Any]) -> dict[str, Any]:
+    """构造 STABILIZE/COMPLETE 共用的闭锁完成指标。"""
+
+    achieved = memory.get("completion_achieved_thw_s")
+    error = memory.get("completion_thw_error_s")
+    return {
+        "completion_latched": True,
+        "completion_time_s": float(memory.get("completion_time_s", -1.0)),
+        "completion_lane_id": str(memory.get("completion_lane_id", "")),
+        "completion_execution_kind": str(memory.get("completion_execution_kind", "")),
+        "completion_requested_thw_s": float(memory.get("completion_requested_thw_s", 0.0)),
+        "completion_achieved_thw_s": None if achieved is None else float(achieved),
+        "completion_thw_error_s": None if error is None else float(error),
+        "completion_thw_within_tolerance": bool(
+            error is not None and abs(float(error)) <= float(CFG["thw_tol_s"])
+        ),
+        "completion_metric_reason": str(memory.get("completion_metric_reason", "")),
+    }
+
 
 def _annotate_output(
     output: dict[str, Any],

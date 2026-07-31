@@ -34,6 +34,7 @@ class SceneRouteIntent:
     planned_actions: list[dict[str, Any]] = field(default_factory=list)
     road_sequence: list[str] = field(default_factory=list)
     route_line: ReferenceLineView | None = None
+    corridor_line: ReferenceLineView | None = None
     valid: bool = False
     reason: str = ""
 

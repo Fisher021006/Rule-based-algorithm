@@ -151,6 +151,7 @@ class SceneTargetProvider:
         dt: float,
         max_lane_segments: int,
         scene_algorithm_symbol: str | None = None,
+        scene_algorithm_callable: Any | None = None,
     ) -> None:
         """保存统一视图上下文构造所需的长期配置与运行期缓存。
 
@@ -182,7 +183,12 @@ class SceneTargetProvider:
         self._main_route_cache: dict[str, Any] | None = None
         self._ego_route_cache_key: tuple[tuple[str, ...], tuple[float, float], tuple[float, float]] | None = None
         self._ego_route_cache: dict[str, Any] | None = None
-        if scene_algorithm_symbol:
+        if scene_algorithm_callable is not None:
+            self.set_scene_algorithm_callable(
+                scene_algorithm_callable,
+                symbol_path=scene_algorithm_symbol,
+            )
+        elif scene_algorithm_symbol:
             self.set_scene_algorithm_symbol(scene_algorithm_symbol)
 
     def set_runtime(self, step_index: int, time_s: float) -> None:
@@ -222,10 +228,39 @@ class SceneTargetProvider:
         self.scene_algorithm_symbol = normalized
         self.scene_algorithm = load_scene_algorithm(normalized)
 
+    def set_scene_algorithm_callable(
+        self,
+        algorithm: Any,
+        *,
+        symbol_path: str | None = None,
+    ) -> None:
+        """注入已由调用方准备好的场景算法。
+
+        Provider 只校验并调用 callable，不关心其进程、模块或配置
+        隔离方式。``symbol_path`` 仅用于日志和路线意图判断。
+        """
+
+        if not callable(algorithm):
+            raise TypeError("scene_algorithm_callable must be callable")
+        normalized = str(symbol_path or "").strip()
+        if not normalized:
+            module_name = str(getattr(algorithm, "__module__", "") or "").strip()
+            symbol_name = str(getattr(algorithm, "__name__", "scene_algorithm") or "scene_algorithm")
+            normalized = f"{module_name}.{symbol_name}" if module_name else symbol_name
+        self.scene_algorithm_symbol = normalized
+        self.scene_algorithm = algorithm
+
     def uses_route_intent(self) -> bool:
         """当前场景算法是否需要把全局 route line 纳入规划输入。"""
 
-        return "intersection_conflict_algorithm" in str(self.scene_algorithm_symbol)
+        symbol = str(self.scene_algorithm_symbol)
+        return any(
+            algorithm_name in symbol
+            for algorithm_name in (
+                "intersection_conflict_algorithm",
+                "companion_algorithm",
+            )
+        )
 
     def _get_route_curve_planner(self) -> CurvePlanner:
         """返回用于场景路线意图的全局曲线路径规划器。"""
@@ -270,13 +305,19 @@ class SceneTargetProvider:
             )
             if path_xy.ndim != 2 or len(path_xy) < 2:
                 return None
-            path = project_and_cut_path(path_xy[:, :2], np.asarray(start_xy, dtype=float), np.asarray(goal_xy, dtype=float))
+            corridor_line = np.asarray(path_xy[:, :2], dtype=float)
+            path = project_and_cut_path(
+                corridor_line,
+                np.asarray(start_xy, dtype=float),
+                np.asarray(goal_xy, dtype=float),
+            )
         except Exception:
             return None
         if path.ndim != 2 or len(path) < 2:
             return None
         return {
             "route_line": np.asarray(path[:, :2], dtype=float),
+            "corridor_line": corridor_line,
             "planned_path": normalized_path,
             "planned_actions": list(planned_actions),
             "road_sequence": self._road_sequence_from_path(normalized_path),
@@ -369,6 +410,15 @@ class SceneTargetProvider:
                 lateral_step=0,
                 slice_from_query=True,
             )
+            corridor_view = build_route_line_view(
+                np.asarray(cache["corridor_line"], dtype=float),
+                np.asarray(query_xy, dtype=float),
+                line_index=int(line_index),
+                lane_sequence=list(cache.get("planned_path", [])),
+                lane_id=str((cache.get("planned_path") or ["route"])[0]),
+                lateral_step=0,
+                slice_from_query=False,
+            )
         except ValueError as exc:
             return SceneRouteIntent(
                 start_xy=np.asarray(start_xy, dtype=float)[:2],
@@ -386,6 +436,7 @@ class SceneTargetProvider:
             planned_actions=list(cache.get("planned_actions", [])),
             road_sequence=list(cache.get("road_sequence", [])),
             route_line=route_view,
+            corridor_line=corridor_view,
             valid=True,
             reason="route_line_ok",
         )

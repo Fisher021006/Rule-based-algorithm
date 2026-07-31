@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "launch_mode": "offline_simulation",
+  "dry_run": false,
+  "runtime": {
+    "map_cache": "xodr_parser/cache/同济测试场.pkl",
+    "dt": 0.1,
+    "max_steps": 220,
+    "advance_index": 1,
+    "log_every": 10,
+    "skip_gif": true,
+    "live_show": true,
+    "live_refresh_every": 2,
+    "output_dir": "outputs",
+    "output_prefix": "cutin_two_companions"
+  },
+  "primary_vehicle_id": "cutin_gvt",
+  "stop_on_terminal_vehicle_ids": [],
+  "stop_on_terminal_mode": "all",
+  "vehicles": [
+    {
+      "id": "vut",
+      "kind": "route",
+      "motion": "idm",
+      "start_xy": [278.048064, 243.614533],
+      "goal_xy": [158.323736, 251.743110],
+      "start_speed": 5.0,
+      "desired_speed": 5.0
+    },
+    {
+      "id": "cutin_gvt",
+      "kind": "algorithm",
+      "algorithm": "scenarios.cut_in_algorithm.cut_in_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [277.698589, 239.935366],
+      "goal_xy": [158.323736, 251.743110],
+      "start_speed": 5.0,
+      "max_speed_kph": 36.0
+    },
+    {
+      "id": "companion_front",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [266.075005, 244.418185],
+      "goal_xy": [158.323736, 251.743110],
+      "start_speed": 5.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "front",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "8.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "12.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "16.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "cutin_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "cut_in"
+      }
+    },
+    {
+      "id": "companion_rear",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [290.021127, 242.810933],
+      "goal_xy": [158.323736, 251.743110],
+      "start_speed": 5.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "rear",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-16.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "-12.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "-8.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "cutin_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "cut_in"
+      }
+    }
+  ]
+}

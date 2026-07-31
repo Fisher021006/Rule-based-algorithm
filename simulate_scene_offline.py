@@ -47,6 +47,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="scene_target 模式下使用的场景算法符号路径，例如 scenarios.cut_in_algorithm.cut_in_algorithm",
     )
+    parser.add_argument(
+        "--multi-vehicle-config",
+        default="",
+        help="多算法车 JSON 配置路径；配置后忽略单车 ego/main/exposed 参数",
+    )
     parser.add_argument("--map-cache", default=str(DEFAULT_MAP_CACHE), help="地图缓存 .pkl 路径")
     parser.add_argument("--ego-start-xy", nargs=2, type=float, default=DEFAULT_EGO_START, metavar=("X", "Y"))
     parser.add_argument("--ego-goal-xy", nargs=2, type=float, default=DEFAULT_EGO_GOAL, metavar=("X", "Y"))
@@ -127,12 +132,40 @@ def main() -> None:
     parser = build_arg_parser()
     pre_args, _ = parser.parse_known_args()
     configure_matplotlib_environment(interactive=bool(pre_args.show or pre_args.live_show))
-    from offline_sim.runner import run_simulation
-
     args = parser.parse_args()
-    if args.planner_mode == "scene_target" and not str(args.scene_algorithm_symbol or "").strip():
+    multi_vehicle_config = str(args.multi_vehicle_config or "").strip()
+    if multi_vehicle_config and args.planner_mode != "scene_target":
+        parser.error("多算法车模式只支持 --planner-mode scene_target")
+    if (
+        not multi_vehicle_config
+        and args.planner_mode == "scene_target"
+        and not str(args.scene_algorithm_symbol or "").strip()
+    ):
         parser.error("scene_target 模式必须提供 --scene-algorithm-symbol")
-    summary = run_simulation(args)
+    if multi_vehicle_config:
+        from offline_sim.multi_runner import run_multi_vehicle_simulation
+
+        summary = run_multi_vehicle_simulation(args)
+    else:
+        from offline_sim.runner import run_simulation
+
+        summary = run_simulation(args)
+    if bool(summary.get("multi_vehicle", False)):
+        compact = {
+            "multi_vehicle": True,
+            "status": summary["status"],
+            "failure_reason": summary["failure_reason"],
+            "completed_steps": summary["completed_steps"],
+            "vehicle_ids": list(summary.get("vehicle_traces", {})),
+            "final_scene_statuses": summary.get("final_scene_statuses", {}),
+            "output_png": summary["output_png"],
+            "output_live_png": summary.get("output_live_png"),
+            "output_gif": summary["output_gif"],
+            "output_json": summary["output_json"],
+            "output_timing_json": summary.get("output_timing_json"),
+        }
+        print(compact)
+        return
     compact = {
         "planner_mode": summary["planner_mode"],
         "scene_algorithm_symbol": summary.get("scene_algorithm_symbol", ""),

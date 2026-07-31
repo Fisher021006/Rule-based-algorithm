@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "launch_mode": "direct_control",
+  "dry_run": true,
+  "confirm_real_vehicle": false,
+  "runtime": {
+    "map_path": "xodr_parser/data/同济测试场.xodr",
+    "cache_path": "xodr_parser/cache/同济测试场.pkl",
+    "rebuild_cache": false,
+    "start_xy": [
+      260.736816,
+      241.07478
+    ],
+    "goal_xy": [
+      158.323736,
+      251.74311
+    ],
+    "planner_mode": "scene_target",
+    "plan_hz": 10.0,
+    "control_hz": 50.0,
+    "arrive_dist": 1.5,
+    "arrive_speed": 0.3,
+    "obu_track_timeout_ms": 1000,
+    "node_name": "companion_gvt_control",
+    "scene_trajectory_log_path": "outputs/companion_gvt_trajectory.jsonl",
+    "swap_latlon": false,
+    "speed_scale": 1.0
+  },
+  "ros": {
+    "sensorgps_topic": "/sensorgps",
+    "actuator_topic": "/actuator",
+    "obu_topic": "/obu/source",
+    "controlcmd_topic": "/controlcmd",
+    "trajectory_topic": "/planning/trajectory"
+  },
+  "vehicle": {
+    "self_ptc_id": "companion_gvt",
+    "length_mm": 4640.0,
+    "width_mm": 1780.0,
+    "wheelbase_mm": 2700.0,
+    "max_speed_kph": 72.0,
+    "max_acc": 3.0,
+    "min_acc": 2.0
+  },
+  "scene": {
+    "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+    "main_ptc_id": "vut",
+    "main_start_xy": [
+      305.985199,
+      241.739304
+    ],
+    "main_goal_xy": [
+      158.323736,
+      251.74311
+    ],
+    "environment": {
+      "ROS_SCENE_COMPANION_POSITION": "left_front",
+      "ROS_SCENE_COMPANION_REL_S_MIN_M": "40.0",
+      "ROS_SCENE_COMPANION_REL_S_TARGET_M": "45.0",
+      "ROS_SCENE_COMPANION_REL_S_MAX_M": "50.0"
+    }
+  }
+}
