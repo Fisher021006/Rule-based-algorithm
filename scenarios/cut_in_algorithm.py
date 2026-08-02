@@ -667,7 +667,13 @@ def _build_keep_lane_output(
     limits = _read_vehicle_limits(context)
     target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
     plan_t = 2.0
-    travel_s = max(float(CFG["min_target_progress_m"]), target_v * plan_t + 4.0)
+    # 终点距离必须与当前速度、终端速度和规划时域自洽。
+    # 若固定使用 target_v * plan_t 再额外前推，滚动规划会每帧先加速、
+    # 把减速推迟到时域末端，导致 COMPLETE 巡航速度持续升高。
+    travel_s = max(
+        float(CFG["min_target_progress_m"]),
+        0.5 * (max(float(ego.v), 0.0) + target_v) * plan_t,
+    )
     target_s = _clamp(
         float(line.current_s) + float(travel_s),
         float(line.current_s) + float(CFG["min_target_progress_m"]),
@@ -678,7 +684,7 @@ def _build_keep_lane_output(
         "x": float(target_xy[0]),
         "y": float(target_xy[1]),
         "v": float(target_v),
-        "a": 0.0,
+        "a": float((target_v - float(ego.v)) / max(plan_t, 1e-3)),
         "theta": float(target_heading),
         "t": float(plan_t),
         "target_line_index": int(line.line_index),

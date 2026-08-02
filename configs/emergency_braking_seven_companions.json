@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "launch_mode": "offline_simulation",
+  "dry_run": false,
+  "runtime": {
+    "map_cache": "xodr_parser/cache/同济测试场.pkl",
+    "dt": 0.1,
+    "max_steps": 350,
+    "advance_index": 1,
+    "log_every": 10,
+    "skip_gif": false,
+    "live_show": true,
+    "live_refresh_every": 2,
+    "output_dir": "outputs",
+    "output_prefix": "emergency_braking_seven_companions_zero_start"
+  },
+  "primary_vehicle_id": "braking_gvt",
+  "stop_on_terminal_vehicle_ids": [
+    "braking_gvt"
+  ],
+  "stop_on_terminal_mode": "all",
+  "vehicles": [
+    {
+      "id": "vut",
+      "kind": "route",
+      "motion": "idm",
+      "start_xy": [393.836978, 235.736749],
+      "goal_xy": [157.350323, 251.810564],
+      "start_speed": 0.0,
+      "desired_speed": 5.0
+    },
+    {
+      "id": "braking_gvt",
+      "kind": "algorithm",
+      "algorithm": "scenarios.braking_algorithm.braking_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [363.908139, 237.801819],
+      "goal_xy": [157.350323, 251.810564],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0
+    },
+    {
+      "id": "companion_rear",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [405.807831, 234.900871],
+      "goal_xy": [157.350323, 251.810564],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "rear",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-16.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "-12.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "-8.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_left",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [393.487496, 232.057519],
+      "goal_xy": [180.323101, 248.156222],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "left",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-2.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "0.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "2.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_left_front",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [383.511462, 232.749435],
+      "goal_xy": [180.323101, 248.156222],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "left_front",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "7.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "10.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "13.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_left_rear",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [403.463237, 231.361397],
+      "goal_xy": [180.323101, 248.156222],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "left_rear",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-13.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "-10.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "-7.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_right",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [394.189837, 239.451537],
+      "goal_xy": [180.170119, 252.259999],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "right",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-2.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "0.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "2.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_right_front",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [384.213805, 240.143479],
+      "goal_xy": [180.170119, 252.259999],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "right_front",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "7.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "10.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "13.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    },
+    {
+      "id": "companion_right_rear",
+      "kind": "algorithm",
+      "algorithm": "scenarios.companion_algorithm.companion_algorithm",
+      "main_ptc_id": "vut",
+      "start_xy": [404.165577, 238.755397],
+      "goal_xy": [180.170119, 252.259999],
+      "start_speed": 0.0,
+      "max_speed_kph": 36.0,
+      "environment": {
+        "ROS_SCENE_COMPANION_POSITION": "right_rear",
+        "ROS_SCENE_COMPANION_REL_S_MIN_M": "-13.0",
+        "ROS_SCENE_COMPANION_REL_S_TARGET_M": "-10.0",
+        "ROS_SCENE_COMPANION_REL_S_MAX_M": "-7.0",
+        "ROS_SCENE_COMPANION_PRIMARY_PTC_ID": "braking_gvt",
+        "ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE": "emergency_braking"
+      }
+    }
+  ]
+}

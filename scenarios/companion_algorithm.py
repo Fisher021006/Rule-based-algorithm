@@ -145,6 +145,7 @@ CFG: dict[str, Any] = {
     "release_max_speed_lag_mps": 3.0,
     "plan_t_s": 0.5,
     "min_target_progress_m": 1.0,
+    "standstill_speed_eps_mps": 0.05,
     # 几何判断和状态去抖。连续命中/丢失若干帧后才切换状态，
     # 防止定位、车道匹配或边界测量抖动导致状态机来回跳变。
     "lane_center_tolerance_m": 1.5,
@@ -1014,12 +1015,19 @@ def _build_line_target_output(
     current_s = float(target_line.current_s)
     line_end_s = max(current_s, float(target_line.cumulative_s[-1]) - 0.05)
     remaining_s = max(0.0, line_end_s - current_s)
-    # 用当前速度与目标速度的梯形积分估算规划时域内纵向行程，并确保目标点
-    # 至少有最小前向距离，防止目标点与车辆当前位置重合。
-    travel_s = max(
-        float(CFG["min_target_progress_m"]),
-        0.5 * (max(float(context.ego_vehicle.v), 0.0) + max(float(target_v), 0.0)) * float(plan_t),
-    )
+    ego_v = max(float(context.ego_vehicle.v), 0.0)
+    target_v = max(float(target_v), 0.0)
+    standstill_eps = float(CFG["standstill_speed_eps_mps"])
+    standstill_request = bool(ego_v <= standstill_eps and target_v <= standstill_eps)
+    # 低速和停车过程不能强制前推 1m。否则当 VUT 已停车、target_v=0 时，
+    # 局部规划器仍需在 0.5s 内走完 1m，会把伴行车稳定在错误的非零速度。
+    kinematic_travel_s = 0.5 * (ego_v + target_v) * float(plan_t)
+    if standstill_request:
+        travel_s = 0.0
+        min_target_progress = 0.0
+    else:
+        travel_s = max(kinematic_travel_s, 1e-3)
+        min_target_progress = travel_s
     target_s = current_s + min(travel_s, remaining_s)
     if remaining_s <= 1e-3:
         # 参考线已到末端时将目标速度置零，避免目标点越过可用道路范围。
@@ -1041,8 +1049,12 @@ def _build_line_target_output(
         "hold_t": 0.0,
         "reason": str(reason),
         "control_mode": "trajectory_target",
-        "min_external_target_progress_m": float(min(float(CFG["min_target_progress_m"]), remaining_s)),
+        "min_external_target_progress_m": float(min(min_target_progress, remaining_s)),
     }
+    if standstill_request:
+        # 复用运行时的零速轨迹适配，只表示随 VUT 停车保持，不改变伴行状态机。
+        output["control_mode"] = "emergency_stop"
+        output["emergency_decel_mps2"] = abs(float(CFG["fail_safe_decel_mps2"]))
     return _annotate_output(
         output,
         scene_status=scene_status,

@@ -8,7 +8,7 @@
     "max_steps": 220,
     "advance_index": 1,
     "log_every": 10,
-    "skip_gif": true,
+    "skip_gif": false,
     "live_show": true,
     "live_refresh_every": 2,
     "output_dir": "outputs",

@@ -204,7 +204,7 @@ def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0
 
 # ===================================== 优化的方法 ==========================================
 def optimize_velocity_profile(L, T, dt, v_start, a_start, v_end, a_end, v_min=0.0, v_max=7.0, a_min=-3.0, a_max=5.0,
-                              w_jerk=1.0, w_acc=0.0):
+                              w_jerk=1.0, w_acc=0.0, w_start_acc=1.0):
     """
     通过二次规划优化速度曲线，满足运动学约束和边界条件。
 
@@ -217,6 +217,7 @@ def optimize_velocity_profile(L, T, dt, v_start, a_start, v_end, a_end, v_min=0.
         v_min, v_max: 速度上下限
         a_min, a_max: 加速度上下限
         w_jerk, w_acc: 目标函数中 jerk 和加速度项的权重
+        w_start_acc: 首个离散区间加速度跟踪当前加速度的软约束权重
 
     返回：
         t: 时间数组 (N,)
@@ -253,11 +254,18 @@ def optimize_velocity_profile(L, T, dt, v_start, a_start, v_end, a_end, v_min=0.
     Q_acc = (D1.T @ D1) / dt
 
     Q = w_jerk * Q_jerk + w_acc * Q_acc
+    # 滚动规划每帧只执行轨迹第一个区间。如果把起始加速度写成硬等式，
+    # 上一帧加速度会在后续每帧被重复执行，无法向新的终端速度收敛。
+    # 这里保留加速度连续性偏好，但允许优化器在当前帧调整首区间加速度。
+    start_acc_row = np.zeros(n_vars)
+    start_acc_row[0] = -1.0 / dt
+    start_acc_row[1] = 1.0 / dt
+    Q = Q + float(w_start_acc) * np.outer(start_acc_row, start_acc_row)
     # OSQP 需要稀疏矩阵形式
     Q = csc_matrix(Q)
 
-    # 线性项系数（通常为零）
-    q = np.zeros(n_vars)
+    # OSQP 目标为 0.5*x'Px + q'x，线性项与上面的起始加速度软约束配对。
+    q = -float(w_start_acc) * float(a_start) * start_acc_row
 
     # ---------- 约束 ----------
     # 我们将所有约束组装成 A x = b 或 A x <= b
@@ -272,27 +280,20 @@ def optimize_velocity_profile(L, T, dt, v_start, a_start, v_end, a_end, v_min=0.
     A_eq_list.append(eq1)
     b_eq_list.append(v_start)
 
-    # 2. 起点加速度：a_0 = (v_1 - v_0)/dt = a_start  => v_1 - v_0 = a_start * dt
-    eq2 = np.zeros(n_vars)
-    eq2[0] = -1.0
-    eq2[1] = 1.0
-    A_eq_list.append(eq2)
-    b_eq_list.append(a_start * dt)
-
-    # 3. 终点速度
+    # 2. 终点速度
     eq3 = np.zeros(n_vars)
     eq3[-1] = 1.0
     A_eq_list.append(eq3)
     b_eq_list.append(v_end)
 
-    # 4. 终点加速度：a_{N-2} = (v_{N-1} - v_{N-2})/dt = a_end  => v_{N-1} - v_{N-2} = a_end * dt
+    # 3. 终点加速度：a_{N-2} = (v_{N-1} - v_{N-2})/dt = a_end  => v_{N-1} - v_{N-2} = a_end * dt
     eq4 = np.zeros(n_vars)
     eq4[-2] = -1.0
     eq4[-1] = 1.0
     A_eq_list.append(eq4)
     b_eq_list.append(a_end * dt)
 
-    # 5. 总路程约束：s_{N-1} = L
+    # 4. 总路程约束：s_{N-1} = L
     # s_i = sum_{j=0}^{i-1} v_j * dt,  s_0 = 0
     # 构造累积和矩阵
     M = np.tril(np.ones((N, N)), k=-1)  # 下三角，主对角线为0，因为 s_i 不包括当前 v_i
@@ -362,9 +363,11 @@ def optimize_velocity_profile(L, T, dt, v_start, a_start, v_end, a_end, v_min=0.
     res = prob.solve()
 
     if res.info.status != 'solved':
-        info_list=[L, T, dt, v_start, a_start, v_end, a_end, v_min, v_max, a_min, a_max, w_jerk, w_acc]
-        np.save("info.npy",info_list,allow_pickle=True)
-        raise RuntimeError(f"OSQP failed to solve: {res.info.status}")
+        raise RuntimeError(
+            "OSQP failed to solve: "
+            f"{res.info.status}; L={L:.3f}, T={T:.3f}, "
+            f"v_start={v_start:.3f}, v_end={v_end:.3f}"
+        )
 
     v_opt = res.x
 
