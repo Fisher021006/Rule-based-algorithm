@@ -126,6 +126,9 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--obu-topic", default=_default(defaults, "obu_topic", os.getenv("ROS_OBU_TOPIC", "/obu/source")))
     parser.add_argument("--scene-main-ptc-id", default=_default(defaults, "scene_main_ptc_id", os.getenv("ROS_SCENE_MAIN_PTC_ID", "")))
     parser.add_argument("--scene-exposed-ptc-id", default=_default(defaults, "scene_exposed_ptc_id", os.getenv("ROS_SCENE_EXPOSED_PTC_ID", "")))
+    # scene_environment 是 YAML 中的字典，不暴露为多组易混淆的命令行参数。
+    # argparse 的自定义默认值会保留到 Namespace，供启动算法子进程时使用。
+    parser.set_defaults(scene_environment=dict(_default(defaults, "scene_environment", {}) or {}))
     parser.add_argument("--scene-main-start-xy", nargs=2, type=float, default=_default_pair(defaults, "scene_main_start_xy"))
     parser.add_argument("--scene-main-start-latlon", nargs=2, type=float, default=_default_pair(defaults, "scene_main_start_latlon"))
     parser.add_argument("--scene-main-goal-xy", nargs=2, type=float, default=_default_pair(defaults, "scene_main_goal_xy"))
@@ -463,6 +466,7 @@ class VirtualRedisRosAdapter:
             obu_self_ptc_id=self.args.vehicle_id,
             scene_main_ptc_id=self.args.scene_main_ptc_id,
             scene_exposed_ptc_id=self.args.scene_exposed_ptc_id,
+            scene_environment=self.args.scene_environment,
             scene_main_start_xy=self.args.scene_main_start_xy,
             scene_main_start_latlon=self.args.scene_main_start_latlon,
             scene_main_goal_xy=self.args.scene_main_goal_xy,

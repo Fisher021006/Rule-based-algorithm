@@ -26,11 +26,21 @@ ros:
   trajectory_topic: /domain_3810/planning/trajectory
   obu_topic: /domain_3810/obu/source
 
-# 3810 先作为可独立 A-B 行驶的背景车域控。
 direct_control:
   node_name: direct_control_node_3810
-  planner_mode: local_sampling
-  scene_algorithm_symbol: ""
-  scene_main_ptc_id: ""
+  planner_mode: scene_target
+  scene_algorithm_symbol: "scenarios.companion_algorithm.companion_algorithm"
+  scene_main_ptc_id: "200005"
   scene_exposed_ptc_id: ""
+  # 不继承 platform_real.yaml 中交叉口场景的固定主车路线。
+  scene_main_start_xy:
+  scene_main_goal_xy:
+  scene_environment:
+    ROS_SCENE_COMPANION_POSITION: "left"
+    ROS_SCENE_COMPANION_REL_S_MIN_M: "-4.0"
+    ROS_SCENE_COMPANION_REL_S_TARGET_M: "0.0"
+    ROS_SCENE_COMPANION_REL_S_MAX_M: "4.0"
+    # 关联 3710 切入车，用于主场景空间释放。
+    ROS_SCENE_COMPANION_PRIMARY_PTC_ID: "3710"
+    ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE: "cut_in"
   max_speed_kph: 15

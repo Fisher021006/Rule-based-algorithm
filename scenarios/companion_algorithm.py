@@ -1110,8 +1110,12 @@ def _compute_companion_metrics(
     side_lateral = _signed_left_lateral_offset(main, ego)
     heading_diff = _heading_diff_deg(float(main.heading), float(ego.heading))
     same_direction = heading_diff <= float(CFG["max_heading_diff_deg"])
-    ego_centered = abs(float(ego.lane_d)) <= float(CFG["lane_center_tolerance_m"])
-    main_centered = abs(float(main.lane_d)) <= float(CFG["lane_center_tolerance_m"])
+    # ``lane_d`` 是对单个当前 lane segment 中心线的投影。当 VUT 比 GVT
+    # 先进入 successor 时，候选走廊的 lane_id 仍可能是前驱段，导致
+    # ``lane_d`` 被误算为到前驱段终点的大偏差。``d`` 投影在包含
+    # predecessor/successor 的延伸参考线上，更符合伴行跨段连续语义。
+    ego_centered = _is_vehicle_centered_on_extended_line(ego)
+    main_centered = _is_vehicle_centered_on_extended_line(main)
     ego_route_lane_ids = _locked_or_current_route_lane_ids(
         memory,
         "locked_ego_route_lane_ids",
@@ -1224,6 +1228,10 @@ def _compute_companion_metrics(
         "inside_slot": bool(inside_slot),
         "same_direction": bool(same_direction),
         "heading_diff_deg": float(heading_diff),
+        "ego_current_d_m": float(ego.d),
+        "main_current_d_m": float(main.d),
+        "ego_single_lane_d_m": float(ego.lane_d),
+        "main_single_lane_d_m": float(main.lane_d),
         "ego_centered": bool(ego_centered),
         "main_centered": bool(main_centered),
         "ego_v_mps": float(ego.v),
@@ -1320,9 +1328,13 @@ def _compute_primary_interaction(
     )
     longitudinal_distance = abs(float(primary_s) - float(ego_s))
     longitudinal_near = longitudinal_distance <= float(CFG["primary_interaction_distance_m"])
-    may_use_formation_line = bool(
-        longitudinal_near
-        and (currently_on_line or predicted_on_line or proactive_approach)
+    may_use_formation_line = _primary_may_use_formation_line(
+        scene_type=scene_type,
+        formation_lane_relation=str(metrics.get("expected_lane_relation", "")),
+        longitudinal_near=longitudinal_near,
+        currently_on_line=currently_on_line,
+        predicted_on_line=predicted_on_line,
+        proactive_approach=proactive_approach,
     )
 
     primary_length = float(primary.length if primary.length > 0.0 else 4.5)
@@ -1394,6 +1406,31 @@ def _compute_primary_interaction(
         "release_target_rel_s_m": float(release_target_rel_s),
         "release_reference_v_mps": float(reference_v),
     }
+
+
+def _primary_may_use_formation_line(
+    *,
+    scene_type: str,
+    formation_lane_relation: str,
+    longitudinal_near: bool,
+    currently_on_line: bool,
+    predicted_on_line: bool,
+    proactive_approach: bool,
+) -> bool:
+    """判断主场景 GVT 是否可能占用当前伴行路线。
+
+    cut-in 的目标是 VUT 所在车道。对左/右侧伴行车，不能将切入车
+    短时横向速度线性外推成“穿越 VUT 车道后继续进入另一侧车道”。
+    侧车道只在 GVT 已经实际占用该伴行线时释放空间；VUT 同车道
+    伴行车仍保留预测和提前释放逻辑。
+    """
+
+    if not bool(longitudinal_near):
+        return False
+    normalized_scene_type = str(scene_type or "").strip().lower()
+    if normalized_scene_type in {"cut_in", "cutin"} and formation_lane_relation != "same":
+        return bool(currently_on_line)
+    return bool(currently_on_line or predicted_on_line or proactive_approach)
 
 
 def _evaluate_hard_collision(
@@ -1827,6 +1864,12 @@ def _rel_s_direction_ok(spec: PositionSpec, rel_s: float) -> bool:
     if spec.longitudinal_relation == "rear":
         return rel_s < 0.0
     return True
+
+
+def _is_vehicle_centered_on_extended_line(vehicle: Any) -> bool:
+    """按跨段延伸参考线判断车辆是否位于车道中心附近。"""
+
+    return abs(float(vehicle.d)) <= float(CFG["lane_center_tolerance_m"])
 
 
 def _mission_duration_reached(memory: dict[str, Any], now: float) -> bool:

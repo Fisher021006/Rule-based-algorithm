@@ -54,9 +54,38 @@ platform_integration/scripts/run_platform_adapter.sh
 platform_integration/scripts/run_platform_domain_3810.sh
 ```
 
-如需让原域控和 3810 同时在线，先保持同一个 ROS Docker 容器运行，
-再在两个 Mac 终端分别执行上述两个启动脚本。3810 配置使用
-`/domain_3810/*` 话题和独立 ROS 节点名，可与原实例共用同一个 `roscore`。
+启动伴行车域控：
+
+```bash
+# lxy-伴行车1（设备 3900）
+platform_integration/scripts/run_platform_domain_3900.sh
+
+# lxy-伴行车2（设备 3910）
+platform_integration/scripts/run_platform_domain_3910.sh
+```
+
+如需让原域控和任意虚拟域控同时在线，先保持同一个 ROS Docker 容器运行，
+再在不同 Mac 终端分别执行对应启动脚本。每台虚拟域控使用独立的
+`/domain_<device_id>/*` 话题和 ROS 节点名，可与原实例共用同一个 `roscore`。
+
+场景算法的专用环境变量配置在 `direct_control.scene_environment`。
+只允许透传 `ROS_SCENE_*` 标量变量，并在每次平台任务启动
+`direct_control_node.py` 时写入该算法子进程：
+
+```yaml
+direct_control:
+  scene_main_ptc_id: "<VUT ptcId>"
+  scene_environment:
+    ROS_SCENE_COMPANION_POSITION: "front"
+    ROS_SCENE_COMPANION_REL_S_MIN_M: "8.0"
+    ROS_SCENE_COMPANION_REL_S_TARGET_M: "12.0"
+    ROS_SCENE_COMPANION_REL_S_MAX_M: "16.0"
+    ROS_SCENE_COMPANION_PRIMARY_PTC_ID: "<主场景 GVT ptcId>"
+    ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE: "cut_in"
+```
+
+`scene_main_ptc_id` 锁定被伴行 VUT；`ROS_SCENE_COMPANION_PRIMARY_PTC_ID`
+锁定需要协同释放空间的主测试场景 GVT。两者不是同一角色。
 
 只验证 ROS 算法闭环：
 

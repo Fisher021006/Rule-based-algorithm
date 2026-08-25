@@ -455,11 +455,19 @@ class SceneTargetProvider:
             for actor_state in [build_planning_actor_state(obstacle)]
             if actor_state is not None
         ]
-        # 若用户显式指定了 ptc_id，则优先锁定该目标。
+        # 若用户显式指定了 ptc_id，则严格锁定该目标。目标短时未接入时
+        # 返回 None 让场景等待，不在多车环境中切换到最近背景车。
         if self.main_vehicle_ptc_id:
             for actor_state in candidates:
                 if actor_state.ptc_id == self.main_vehicle_ptc_id:
                     return actor_state
+            fallback_actor = build_planning_actor_state(self.main_vehicle)
+            if (
+                fallback_actor is not None
+                and fallback_actor.ptc_id == self.main_vehicle_ptc_id
+            ):
+                return fallback_actor
+            return None
 
         # 未指定时，默认选离自车最近的障碍物作为主关注车。
         if candidates:

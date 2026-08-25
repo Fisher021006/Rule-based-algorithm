@@ -8,8 +8,42 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
+
+
+_SCENE_ENV_NAME_PATTERN = re.compile(r"^ROS_SCENE_[A-Z0-9_]+$")
+
+
+def normalize_scene_environment(value: Any) -> dict[str, str]:
+    """校验并字符串化场景算法子进程环境变量。
+
+    平台配置只允许透传 ``ROS_SCENE_*`` 变量，避免 YAML 无意覆盖
+    ``PATH``、``PYTHONPATH`` 等子进程基础环境。标量值统一转换为
+    ``subprocess`` 可接收的字符串。
+    """
+
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("direct_control.scene_environment must be an object")
+
+    normalized: dict[str, str] = {}
+    for raw_name, raw_value in value.items():
+        name = str(raw_name or "").strip()
+        if not _SCENE_ENV_NAME_PATTERN.fullmatch(name):
+            raise ValueError(
+                "scene environment variable names must match ROS_SCENE_[A-Z0-9_]+: "
+                f"{raw_name!r}"
+            )
+        if raw_value is None or isinstance(raw_value, (dict, list, tuple, set)):
+            raise ValueError(f"scene environment variable {name} must be a scalar value")
+        if isinstance(raw_value, bool):
+            normalized[name] = "true" if raw_value else "false"
+        else:
+            normalized[name] = str(raw_value)
+    return normalized
 
 
 def _load_yaml_or_json(path: Path) -> dict[str, Any]:
@@ -60,7 +94,11 @@ def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[s
     merged = dict(base)
     for key, value in override.items():
         base_value = merged.get(key)
-        if isinstance(base_value, dict) and isinstance(value, dict):
+        # 场景环境变量属于单个算法实例，子域控必须整体替换；
+        # 与父场景递归合并会把无关算法参数带入子进程。
+        if key == "scene_environment":
+            merged[key] = value
+        elif isinstance(base_value, dict) and isinstance(value, dict):
             merged[key] = _deep_merge_config(base_value, value)
         else:
             merged[key] = value
@@ -144,6 +182,9 @@ def flatten_adapter_config(data: dict[str, Any]) -> dict[str, Any]:
         "scene_algorithm_symbol": direct_control.get("scene_algorithm_symbol"),
         "scene_main_ptc_id": direct_control.get("scene_main_ptc_id"),
         "scene_exposed_ptc_id": direct_control.get("scene_exposed_ptc_id"),
+        "scene_environment": normalize_scene_environment(
+            direct_control.get("scene_environment")
+        ),
         "scene_main_start_xy": direct_control.get("scene_main_start_xy"),
         "scene_main_start_latlon": direct_control.get("scene_main_start_latlon"),
         "scene_main_goal_xy": direct_control.get("scene_main_goal_xy"),

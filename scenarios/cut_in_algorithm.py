@@ -33,7 +33,7 @@ class VehicleLimits:
 
 CFG: dict[str, Any] = {
     "cutin_side": "auto",
-    "target_thw_s": 8.0,
+    "target_thw_s": 4.0,
     "thw_tol_s": 0.1,
     "cruise_target_v": 5.0,
     "lane_change_time_s": 4.0,

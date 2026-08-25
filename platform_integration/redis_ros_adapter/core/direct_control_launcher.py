@@ -8,6 +8,7 @@ Adapter 自己负责平台 Redis 和 ROS 桥接，但真正的规划控制算法
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -15,7 +16,9 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from redis_ros_adapter.core.config import normalize_scene_environment
 from redis_ros_adapter.core.types import PreparedTask
 
 
@@ -84,6 +87,7 @@ class DirectControlLauncher:
         obu_self_ptc_id: str,
         scene_main_ptc_id: str,
         scene_exposed_ptc_id: str,
+        scene_environment: dict[str, Any] | None,
         scene_main_start_xy: list[float] | None,
         scene_main_start_latlon: list[float] | None,
         scene_main_goal_xy: list[float] | None,
@@ -169,11 +173,26 @@ class DirectControlLauncher:
         if scene_main_goal_latlon:
             command.extend(["--scene-main-goal-latlon", str(scene_main_goal_latlon[0]), str(scene_main_goal_latlon[1])])
         env = os.environ.copy()
+        normalized_scene_environment = normalize_scene_environment(scene_environment)
+        env.update(normalized_scene_environment)
+        # 显式字段优先于通用环境变量，保证旧配置语义稳定。
         if scene_exposed_ptc_id:
             env["ROS_SCENE_EXPOSED_PTC_ID"] = str(scene_exposed_ptc_id)
         print(f"[launcher] log_path={log_path}", file=self.log_file, flush=True)
         if str(planner_mode).strip().lower() == "scene_target" and scene_algorithm_symbol:
             print(f"[launcher] trajectory_log_path={trajectory_log_path}", file=self.log_file, flush=True)
+        if normalized_scene_environment:
+            print(
+                "[launcher] scene_environment="
+                + json.dumps(
+                    normalized_scene_environment,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                file=self.log_file,
+                flush=True,
+            )
         print(f"[launcher] command={' '.join(command)}", file=self.log_file, flush=True)
         self.process = subprocess.Popen(
             command,

@@ -1,0 +1,48 @@
+# 平台注册的 3910 域控实例（lxy-伴行车2）。
+# 共用 platform_real.yaml 中的 Redis、地图和车辆尺寸配置，
+# 仅覆盖该域控独有的身份、通道、ROS topic 和规划模式。
+extends: platform_real.yaml
+
+platform:
+  device_id: 3910
+  device_name: lxy-伴行车2
+  control_channel: control08022channel
+  data_channel_hint: data08022channel
+
+adapter:
+  node_name: virtual_redis_ros_adapter_3910
+  log_dir: /workspace/direct_control_bundle/platform_integration/logs/platform_redis_ros_adapter_3910
+
+vehicle:
+  id_from_device_id: true
+  name: lxy-伴行车2
+
+ros:
+  adapter_cache_path: /tmp/platform_adapter_3910_xodr_cache.pkl
+  direct_cache_path: /tmp/platform_direct_3910_xodr_cache.pkl
+  sensorgps_topic: /domain_3910/sensorgps
+  actuator_topic: /domain_3910/actuator
+  controlcmd_topic: /domain_3910/controlcmd
+  trajectory_topic: /domain_3910/planning/trajectory
+  obu_topic: /domain_3910/obu/source
+
+# 伴行场景控制。scene_main_ptc_id 必须填 VUT 的 OBU ptcId。
+# 3910 默认配置为 VUT 后方伴行车。
+direct_control:
+  node_name: direct_control_node_3910
+  planner_mode: scene_target
+  scene_algorithm_symbol: "scenarios.companion_algorithm.companion_algorithm"
+  scene_main_ptc_id: "200005"
+  scene_exposed_ptc_id: ""
+  # 不继承 platform_real.yaml 中交叉口场景的固定主车路线。
+  scene_main_start_xy:
+  scene_main_goal_xy:
+  scene_environment:
+    ROS_SCENE_COMPANION_POSITION: "rear"
+    ROS_SCENE_COMPANION_REL_S_MIN_M: "-12.0"
+    ROS_SCENE_COMPANION_REL_S_TARGET_M: "-8.0"
+    ROS_SCENE_COMPANION_REL_S_MAX_M: "-4.0"
+    # 关联 3710 切入车，用于主场景空间释放。
+    ROS_SCENE_COMPANION_PRIMARY_PTC_ID: "3710"
+    ROS_SCENE_COMPANION_PRIMARY_SCENE_TYPE: "cut_in"
+  max_speed_kph: 15
