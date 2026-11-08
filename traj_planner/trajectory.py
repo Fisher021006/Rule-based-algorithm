@@ -159,7 +159,7 @@ def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0
     if total_s < 1e-6:
         x, y, heading = float(path[-1, 0]), float(path[-1, 1]), float(path[-1, 2])
         # 生成从 0 到 T 的每个时间点（速度加速度设为 0）
-        t_points = np.arange(0, T + dt, dt)  # 包含起点
+        t_points = np.linspace(0.0, float(T), steps + 1)  # 包含起点
         trajectory = []
         for t in t_points:
             # 速度加速度为零
@@ -182,7 +182,7 @@ def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0
     )
 
     # 生成时间序列（包含起点和终点）
-    t_points = np.arange(0, T + dt, dt)  # 步长 dt，共 steps+1 个点
+    t_points = np.linspace(0.0, float(T), steps + 1)  # 步长 dt，共 steps+1 个点
     s_profile, v_profile, a_profile = eval_quintic(coeffs, t_points)
 
     # 数值保护：确保 s 不超出 [0, total_s]

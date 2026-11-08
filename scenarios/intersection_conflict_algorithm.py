@@ -1,20 +1,15 @@
-"""Intersection conflict scene algorithm.
+"""交叉口场景：控制场景车与主车的几何中心近同时进入固定圆形冲突区。
 
-V1 scene semantics:
-- Controlled vehicle is GVT, mapped to ``context.ego_vehicle``.
-- Tested vehicle is VUT, mapped to ``context.main_vehicle``.
-- Only two configured subtypes are supported:
-  ``vut_straight_cross`` and ``vut_left_oncoming``.
-- The subtype is a test-case label. The algorithm validates it by checking
-  whether the selected GVT/VUT reference lines have a forward geometric
-  conflict point.
-- The main control metric is ``delta_t = T_gvt - T_vut`` at the conflict point.
-  A small conflict-zone PET-like metric is reported for debug/success logging.
+GVT 对应 ego_vehicle，VUT 对应 main_vehicle；两种 conflict_type 只标识测试类型。
+成功指标为两次实际入区事件的时差，预测只用于调速。位置点沿用运行时的车身
+几何中心约定，不是车头、后轴或原始 GPS 点。车身尺寸不膨胀入区半径，碰撞和
+过点时差作为独立交互结果。同步判定成立后继续通行与观测，不增加提前触发器。
 """
 
 from __future__ import annotations
 
 import copy
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -25,9 +20,28 @@ from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
 
 
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量；读取失败时回退默认值。"""
+
+    raw_value = os.getenv(name, "")
+    if raw_value == "":
+        return float(default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_str(name: str, default: str = "") -> str:
+    """读取字符串环境变量；空值时回退默认值。"""
+
+    value = os.getenv(name, "")
+    return str(value if value != "" else default)
+
+
 @dataclass(frozen=True)
 class VehicleLimits:
-    """Vehicle size and platform constraints used by this scene."""
+    """本场景使用的车身尺寸和平台限值。"""
 
     ego_length: float
     main_length: float
@@ -42,38 +56,30 @@ SUPPORTED_CONFLICT_TYPES = {"vut_straight_cross", "vut_left_oncoming"}
 
 
 CFG: dict[str, Any] = {
-    # Semantic label configured by the test case. It is not auto-detected.
-    "conflict_type": "vut_straight_cross",
-    # GVT should arrive this many seconds after VUT. Negative means GVT first.
-    "target_delta_t_s": 0.0,
-    "success_time_tol_s": 0.5,
+    # 外部参数仍可单独配置，不依赖技能注册或研究模块。
+    "conflict_type": _env_str("ROS_SCENE_INTERSECTION_CONFLICT_TYPE", "vut_straight_cross"),
+    # 入区时差 = 场景车实际入区时刻 - 主车实际入区时刻；正值表示场景车更晚。
+    "target_delta_t_s": _env_float("ROS_SCENE_INTERSECTION_TARGET_DELTA_T_S", 0.0),
+    "success_time_tol_s": _env_float("ROS_SCENE_INTERSECTION_SUCCESS_TOL_S", 0.5),
     "conflict_zone_radius_m": 2.5,
     "conflict_point_match_tolerance_m": 1.2,
     "min_conflict_angle_deg": 25.0,
     "min_forward_conflict_distance_m": 2.0,
-    "max_forward_conflict_distance_m": 120.0,
-    "post_conflict_target_buffer_m": 8.0,
-    "clear_after_conflict_m": 4.0,
-    "cruise_target_v": 5.0,
-    "speed_floor_mps": 0.5,
+    "max_forward_conflict_distance_m": _env_float(
+        "ROS_SCENE_INTERSECTION_MAX_CONFLICT_DISTANCE_M", 120.0
+    ),
+    "cruise_target_v": _env_float("ROS_SCENE_INTERSECTION_CRUISE_TARGET_V", 5.0),
     # VUT 到冲突点的预测：短时使用 OBU 纵向加速度，随后保持预测末速度。
     # 避免将一帧噪声或瞬时制动无限外推到整个路口。
     "vut_accel_prediction_horizon_s": 1.5,
     "vut_accel_min_mps2": -3.0,
     "vut_accel_max_mps2": 2.0,
-    "target_speed_min_mps": 0.2,
     "sync_plan_t_min_s": 0.2,
-    "sync_plan_t_max_s": 8.0,
     "sync_timeout_s": 15.0,
     "invalid_stop_plan_t_s": 1.0,
-    "complete_decel_mps2": 2.5,
-    "stop_complete_v_mps": 0.05,
-    "stop_hold_s": 10.0,
     "min_target_progress_m": 0.05,
     # 局部规划只消费当前路线走廊上的近端目标，不能直接追踪冲突区后的全局点。
     "local_target_preview_time_s": 1.5,
-    "local_target_preview_min_m": 8.0,
-    "local_target_preview_max_m": 12.0,
     "local_output_plan_t_min_s": 0.8,
     "local_output_plan_t_max_s": 4.0,
 }
@@ -89,6 +95,8 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "last_observation_time_s": None,
     "last_gvt_signed_distance_m": None,
     "last_vut_signed_distance_m": None,
+    "last_gvt_center_xy": None,
+    "last_vut_center_xy": None,
     "gvt_cross_time_s": None,
     "vut_cross_time_s": None,
     "gvt_zone_enter_time_s": None,
@@ -96,6 +104,8 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "vut_zone_enter_time_s": None,
     "vut_zone_exit_time_s": None,
     "actual_result_printed": False,
+    "execution_complete": False,
+    "execution_end_reason": "",
 }
 
 
@@ -106,7 +116,7 @@ SCENE_MEMORY: dict[str, Any] = copy.deepcopy(SCENE_MEMORY_TEMPLATE)
 
 
 def intersection_conflict_algorithm(context: SceneContext) -> dict[str, Any]:
-    """Intersection conflict scene algorithm entrypoint."""
+    """交叉口场景的统一公开入口。"""
     global SCENE_MEMORY
     start_ms = time.time() * 1000.0
     if int(context.step_index) == 0:
@@ -120,187 +130,97 @@ def intersection_conflict_algorithm(context: SceneContext) -> dict[str, Any]:
 # ==================== FSM ====================
 
 
-def _scene_fsm_step(
-    context: SceneContext,
-    memory: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run one frame of the intersection-conflict state machine."""
+def _scene_fsm_step(context: SceneContext, memory: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """执行统一的准备、同步、通行观测和完成四阶段。"""
     now = float(context.time_s)
-    mode = str(memory.get("mode", "APPROACH"))
+    handlers = {"APPROACH": _handle_approach, "SYNC_ARRIVAL": _handle_sync_arrival,
+                "CONFLICT_ACTIVE": _handle_conflict_active, "COMPLETE": _handle_complete}
+    handler = handlers.get(str(memory.get("mode", "APPROACH")))
+    return handler(context, memory, now) if handler else _handle_unknown_mode(context, memory)
 
-    if mode == "APPROACH":
-        return _handle_approach(context, memory, now)
-    if mode == "SYNC_ARRIVAL":
-        return _handle_sync_arrival(context, memory, now)
-    if mode == "CONFLICT_ACTIVE":
+
+def _handle_approach(context: SceneContext, memory: dict[str, Any], now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """验证并锁定冲突几何；每次新尝试清空旧事件。"""
+    memory.clear()
+    memory.update(copy.deepcopy(SCENE_MEMORY_TEMPLATE))
+    conflict = _build_conflict_context(context)
+    if not bool(conflict.get("valid", False)):
+        return _build_invalid_scene_output(context, str(conflict.get("reason", "intersection_invalid_scene")), conflict), memory
+    memory.update(mode="SYNC_ARRIVAL", sync_start_time_s=now,
+                  locked_conflict=_compact_conflict_context(conflict))
+    return _handle_sync_arrival(context, memory, now)
+
+
+def _handle_sync_arrival(context: SceneContext, memory: dict[str, Any], now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """持续修正尚未发生的自车入区时刻，实际事件不再反推。"""
+    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
+    if not bool(metrics.get("valid", False)):
+        # 短时丢车保留已锁几何和事件；没有新观测时不拿旧位置伪造事件。
+        elapsed = max(0.0, now - float(memory["sync_start_time_s"]))
+        if elapsed >= float(CFG["sync_timeout_s"]):
+            memory.update(mode="CONFLICT_ACTIVE", active_start_time_s=now,
+                          timing_control_end_reason="observation_unavailable")
+            return _handle_conflict_active(context, memory, now)
+        debug = copy.deepcopy(memory.get("last_metrics") or {})
+        debug.update(observation_available=False, observation_missing_reason=metrics.get("reason"),
+                     execution_complete=False, execution_phase="syncing")
+        return _build_keep_lane_output(context, "intersection_waiting_observation", "sync_arrival", scene_debug=debug), memory
+    metrics = _update_actual_conflict_observation(memory, metrics, now)
+    elapsed = max(0.0, now - float(memory["sync_start_time_s"]))
+    # 自车已经入区时，自己的入区时刻已固定；主车出区本身不是错失判据。
+    if memory.get("gvt_zone_enter_time_s") is not None or elapsed >= float(CFG["sync_timeout_s"]):
+        memory.update(mode="CONFLICT_ACTIVE", active_start_time_s=now)
+        memory["timing_control_end_reason"] = "gvt_entered" if memory.get("gvt_zone_enter_time_s") is not None else "sync_timeout"
         return _handle_conflict_active(context, memory, now)
-    if mode == "COMPLETE_BRAKE":
-        return _handle_complete_brake(context, memory, now)
-    if mode == "COMPLETE":
+    memory["last_metrics"] = copy.deepcopy(metrics)
+    return _build_sync_output(context, memory, metrics, "intersection_sync_arrival", "sync_arrival"), memory
+
+
+def _handle_conflict_active(context: SceneContext, memory: dict[str, Any], now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """停止追赶已发生的入区时刻，按明确巡航策略通过并继续观测。"""
+    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
+    if not bool(metrics.get("valid", False)):
+        # 已锁定的事件保留；临时缺车时不伪造新的入区或通行结果。
+        metrics = copy.deepcopy(memory.get("last_metrics") or metrics)
+        metrics["observation_available"] = False
+    else:
+        metrics = _update_actual_conflict_observation(memory, metrics, now)
+        metrics["observation_available"] = True
+    elapsed = max(0.0, now - float(memory.get("active_start_time_s", now)))
+    cleared = bool(metrics.get("observation_available", False) and all(
+        memory.get(f"{actor}_zone_exit_time_s") is not None
+        and float(metrics.get(f"{actor}_body_zone_clearance_m", -1.0)) > 0.0
+        for actor in ("gvt", "vut")))
+    timed_out = elapsed >= float(CFG["sync_timeout_s"])
+    if cleared or timed_out:
+        memory["last_metrics"] = copy.deepcopy(metrics)
+        memory.update(mode="COMPLETE", execution_complete=True, complete_start_time_s=now,
+                      execution_end_reason="both_bodies_cleared" if cleared else "observation_timeout")
         return _handle_complete(context, memory, now)
-    return _handle_unknown_mode(context, memory)
-
-
-def _handle_approach(
-    context: SceneContext,
-    memory: dict[str, Any],
-    now: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build and validate conflict semantics before any timing control."""
-    conflict_result = _build_conflict_context(context)
-    if not bool(conflict_result.get("valid", False)):
-        memory["mode"] = "APPROACH"
-        memory["locked_conflict"] = None
-        return _build_invalid_scene_output(
-            context,
-            reason=str(conflict_result.get("reason", "intersection_invalid_scene")),
-            scene_debug=conflict_result,
-        ), memory
-
-    memory["mode"] = "SYNC_ARRIVAL"
-    memory["sync_start_time_s"] = float(now)
-    memory["locked_conflict"] = _compact_conflict_context(conflict_result)
-
-    metrics = _compute_conflict_metrics(context, memory["locked_conflict"])
-    metrics = _update_actual_conflict_observation(memory, metrics, now)
+    metrics.update(execution_complete=False, execution_phase="interaction",
+                   timing_control_end_reason=memory.get("timing_control_end_reason", ""))
     memory["last_metrics"] = copy.deepcopy(metrics)
-    return _build_sync_output(
-        context,
-        memory,
-        metrics,
-        reason="intersection_sync_enter",
-        scene_status="sync_arrival",
-    ), memory
+    return _build_keep_lane_output(context, "intersection_observing_interaction", "conflict_active", scene_debug=metrics), memory
 
 
-def _handle_sync_arrival(
-    context: SceneContext,
-    memory: dict[str, Any],
-    now: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Synchronize GVT arrival time at the locked conflict point."""
-    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
-
-    if not bool(metrics.get("valid", False)):
-        memory["last_metrics"] = copy.deepcopy(metrics)
-        memory["mode"] = "APPROACH"
-        return _build_invalid_scene_output(
-            context,
-            reason=str(metrics.get("reason", "intersection_conflict_lost")),
-            scene_debug=metrics,
-        ), memory
-
-    metrics = _update_actual_conflict_observation(memory, metrics, now)
+def _handle_complete(context: SceneContext, memory: dict[str, Any], now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """终态只表示执行结束；同步结果不与碰撞或过点结果混合。"""
+    metrics = copy.deepcopy(memory.get("last_metrics") or {})
+    if not bool(metrics.get("actual_result_ready", False)):
+        metrics["sync_result"] = "not_observed"
+    metrics.update(execution_complete=True, execution_phase="finished",
+                   execution_end_time_s=float(memory.get("complete_start_time_s", now)),
+                   execution_end_reason=memory.get("execution_end_reason", ""))
     memory["last_metrics"] = copy.deepcopy(metrics)
-
-    if _gvt_cleared_conflict(metrics):
-        _print_conflict_clear_metrics(metrics)
-        _enter_complete_brake(memory, now)
-        return _build_complete_brake_output(context, metrics, reason="intersection_conflict_cleared"), memory
-
-    if _is_predicted_timing_aligned(metrics):
-        memory["mode"] = "CONFLICT_ACTIVE"
-        memory["active_start_time_s"] = float(now)
-        return _build_active_output(
-            context,
-            memory,
-            metrics,
-            reason="intersection_conflict_triggered",
-            scene_status="conflict_active",
-        ), memory
-
-    elapsed = max(0.0, now - float(memory.get("sync_start_time_s", now)))
-    if elapsed >= float(CFG["sync_timeout_s"]):
-        memory["mode"] = "APPROACH"
-        debug = copy.deepcopy(metrics)
-        debug["sync_timeout_s"] = float(CFG["sync_timeout_s"])
-        debug["sync_elapsed_s"] = float(elapsed)
-        debug["invalid_scene_reasons"] = ["sync_timeout"]
-        return _build_invalid_scene_output(
-            context,
-            reason="intersection_sync_timeout",
-            scene_debug=debug,
-        ), memory
-
-    return _build_sync_output(
-        context,
-        memory,
-        metrics,
-        reason="intersection_sync_arrival",
-        scene_status="sync_arrival",
-    ), memory
-
-
-def _handle_conflict_active(
-    context: SceneContext,
-    memory: dict[str, Any],
-    now: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Keep sending GVT through the conflict point until it clears."""
-    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
-    if not bool(metrics.get("valid", False)):
-        memory["last_metrics"] = copy.deepcopy(metrics)
-        memory["mode"] = "APPROACH"
-        return _build_invalid_scene_output(
-            context,
-            reason=str(metrics.get("reason", "intersection_conflict_lost")),
-            scene_debug=metrics,
-        ), memory
-
-    metrics = _update_actual_conflict_observation(memory, metrics, now)
-    memory["last_metrics"] = copy.deepcopy(metrics)
-
-    if _gvt_cleared_conflict(metrics):
-        _print_conflict_clear_metrics(metrics)
-        _enter_complete_brake(memory, now)
-        return _build_complete_brake_output(context, metrics, reason="intersection_conflict_cleared"), memory
-
-    return _build_active_output(
-        context,
-        memory,
-        metrics,
-        reason="intersection_conflict_active",
-        scene_status="conflict_active",
-    ), memory
-
-
-def _handle_complete_brake(
-    context: SceneContext,
-    memory: dict[str, Any],
-    now: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """After conflict construction, switch to emergency-stop style braking."""
-    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
-    if bool(metrics.get("valid", False)):
-        metrics = _update_actual_conflict_observation(memory, metrics, now)
-    memory["last_metrics"] = copy.deepcopy(metrics)
-    if float(context.ego_vehicle.v) <= float(CFG["stop_complete_v_mps"]):
-        memory["mode"] = "COMPLETE"
-        memory["complete_start_time_s"] = float(now)
-        return _build_stopped_output(context, metrics, reason="intersection_complete_stop"), memory
-    return _build_complete_brake_output(context, metrics, reason="intersection_complete_brake"), memory
-
-
-def _handle_complete(
-    context: SceneContext,
-    memory: dict[str, Any],
-    now: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Hold completed state to avoid repeated triggering in one run."""
-    metrics = _compute_conflict_metrics(context, memory.get("locked_conflict"))
-    if bool(metrics.get("valid", False)):
-        metrics = _update_actual_conflict_observation(memory, metrics, now)
-    complete_start = float(memory.get("complete_start_time_s", now))
-    metrics["complete_elapsed_s"] = max(0.0, float(now) - complete_start)
-    memory["last_metrics"] = copy.deepcopy(metrics)
-    return _build_stopped_output(context, metrics, reason="intersection_complete_hold"), memory
+    status = "complete" if metrics.get("sync_result") == "met" else "intersection_sync_missed"
+    return _build_keep_lane_output(context, "intersection_execution_finished", status, scene_debug=metrics), memory
 
 
 def _handle_unknown_mode(
     context: SceneContext,
     memory: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Reset unknown states to APPROACH."""
+    """未知状态回到准备阶段，并输出明确错误。"""
     memory["mode"] = "APPROACH"
     memory["locked_conflict"] = None
     return _build_keep_lane_output(
@@ -308,11 +228,6 @@ def _handle_unknown_mode(
         reason="intersection_unknown_mode",
         scene_status="baseline_keep_lane",
     ), memory
-
-
-def _enter_complete_brake(memory: dict[str, Any], now: float) -> None:
-    memory["mode"] = "COMPLETE_BRAKE"
-    memory["complete_start_time_s"] = float(now)
 
 
 def _reset_scene_memory() -> None:
@@ -323,28 +238,21 @@ def _reset_scene_memory() -> None:
 # ==================== Output builders ====================
 
 
-def _build_keep_lane_output(
-    context: SceneContext,
-    reason: str,
-    scene_status: str,
-    scene_detail: str | None = None,
-    scene_debug: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a conservative keep-lane target."""
+def _build_keep_lane_output(context: SceneContext, reason: str, scene_status: str,
+                            scene_detail: str | None = None, scene_debug: dict[str, Any] | None = None) -> dict[str, Any]:
+    """沿路线继续巡航；这是场景输出策略，不表示切换到了自主避障控制器。"""
     limits = _read_vehicle_limits(context)
+    horizon = max(float(context.dt), float(CFG["local_target_preview_time_s"]))
     target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
-    return _build_line_target_output(
-        context=context,
-        target_line=context.ego_vehicle.current_ref_line,
-        target_s=float(context.ego_vehicle.current_ref_line.current_s) + max(2.0, 2.0 * target_v),
-        target_v=target_v,
-        target_a=0.0,
-        plan_t=2.0,
-        reason=reason,
-        scene_status=scene_status,
-        scene_detail=scene_detail or reason,
-        scene_debug=scene_debug,
-    )
+    target_a = _clamp((target_v - float(context.ego_vehicle.v)) / horizon, limits.min_acc, limits.max_acc)
+    debug = copy.deepcopy(scene_debug or {})
+    debug["post_entry_policy"] = "route_cruise"
+    output = _build_conflict_target_output(
+        context=context, metrics=debug,
+        sync_target={"target_v_mps": target_v, "target_a_mps2": target_a},
+        reason=reason, scene_status=scene_status, scene_debug=debug)
+    output["scene_detail"] = scene_detail or reason
+    return output
 
 
 def _build_invalid_scene_output(
@@ -352,7 +260,7 @@ def _build_invalid_scene_output(
     reason: str,
     scene_debug: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return explicit scene construction failure and ask GVT to stop."""
+    """报告明确的场景几何错误并请求场景车停车。"""
     limits = _read_vehicle_limits(context)
     plan_t = float(CFG["invalid_stop_plan_t_s"])
     target_v = 0.0
@@ -387,11 +295,12 @@ def _build_sync_output(
     reason: str,
     scene_status: str,
 ) -> dict[str, Any]:
-    """Build the target that synchronizes GVT arrival at the conflict point."""
+    """构造对准实际入区事件的速度目标。"""
     del memory
     sync_target = _solve_sync_target(context, metrics)
     debug = copy.deepcopy(metrics)
     debug.update(sync_target)
+    debug.update(execution_phase="syncing", execution_complete=False)
     return _build_conflict_target_output(
         context=context,
         metrics=metrics,
@@ -402,196 +311,45 @@ def _build_sync_output(
     )
 
 
-def _build_active_output(
-    context: SceneContext,
-    memory: dict[str, Any],
-    metrics: dict[str, Any],
-    reason: str,
-    scene_status: str,
-) -> dict[str, Any]:
-    """Build the through-conflict target after the timing window is hit."""
-    del memory
-    sync_target = _solve_sync_target(context, metrics)
-    debug = copy.deepcopy(metrics)
-    debug.update(sync_target)
-    return _build_conflict_target_output(
-        context=context,
-        metrics=metrics,
-        sync_target=sync_target,
-        reason=reason,
-        scene_status=scene_status,
-        scene_debug=debug,
-    )
-
-
-def _build_conflict_target_output(
-    *,
-    context: SceneContext,
-    metrics: dict[str, Any],
-    sync_target: dict[str, Any],
-    reason: str,
-    scene_status: str,
-    scene_debug: dict[str, Any],
-) -> dict[str, Any]:
-    """Build a local preview target while retaining global post-conflict intent for timing."""
-    route_line = _route_line(context.ego_vehicle)
-    global_post_conflict_s = float(sync_target.get("target_s_m", metrics.get("gvt_s_conflict_m", 0.0)))
-    global_post_conflict_xy = np.asarray(
-        metrics.get("conflict_xy", [context.ego_vehicle.x, context.ego_vehicle.y]),
-        dtype=float,
-    )
-    if route_line is not None:
-        route_lower_s = float(route_line.current_s) + float(CFG["min_target_progress_m"])
-        route_upper_s = max(route_lower_s, float(route_line.cumulative_s[-1]))
-        global_post_conflict_s = _clamp(global_post_conflict_s, route_lower_s, route_upper_s)
-        global_post_conflict_xy, _route_target_heading = get_path_point_at_s(
-            route_line.line,
-            global_post_conflict_s,
-            route_line.cumulative_s,
-        )
-
-    # The global point is only a through-conflict semantic marker.  The local
-    # planner must receive a near target on the route-aligned local corridor.
-    line, selection_debug = _select_route_aligned_local_line(context)
-    target_v = float(sync_target.get("target_v_mps", context.ego_vehicle.v))
-    global_sync_plan_t = float(sync_target.get("plan_t_s", 1.0))
+def _build_conflict_target_output(*, context: SceneContext, metrics: dict[str, Any],
+                                  sync_target: dict[str, Any], reason: str, scene_status: str,
+                                  scene_debug: dict[str, Any]) -> dict[str, Any]:
+    """近端距离、末速度和时域来自同一受限剖面，避免混用远端终速和近端距离。"""
     limits = _read_vehicle_limits(context)
-    _, ego_s_on_local_line, ego_d_on_local_line = project_point_to_path(
-        np.asarray([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float),
-        line.line,
-    )
-    local_preview_m = _clamp(
-        target_v * float(CFG["local_target_preview_time_s"]),
-        float(CFG["local_target_preview_min_m"]),
-        float(CFG["local_target_preview_max_m"]),
-    )
-    local_target_s = _clamp(
-        float(ego_s_on_local_line) + local_preview_m,
-        float(ego_s_on_local_line) + float(CFG["min_target_progress_m"]),
-        float(line.cumulative_s[-1]) - 0.5,
-    )
-    local_target_distance_m = max(0.0, float(local_target_s) - float(ego_s_on_local_line))
-    local_plan_t = _solve_local_output_plan_t(
-        distance_m=local_target_distance_m,
-        current_v=float(context.ego_vehicle.v),
-        target_v=target_v,
-        limits=limits,
-    )
-    target_a = _clamp(
-        (target_v - float(context.ego_vehicle.v)) / max(local_plan_t, 1e-3),
-        limits.min_acc,
-        limits.max_acc,
-    )
-    scene_debug["target_acc_mps2"] = float(target_a)
-    scene_debug["global_post_conflict_target_s_m"] = float(global_post_conflict_s)
-    scene_debug["global_post_conflict_target_xy"] = [
-        float(global_post_conflict_xy[0]),
-        float(global_post_conflict_xy[1]),
-    ]
-    scene_debug.update(selection_debug)
-    scene_debug["ego_s_on_selected_local_line_m"] = float(ego_s_on_local_line)
-    scene_debug["ego_d_on_selected_local_line_m"] = float(ego_d_on_local_line)
-    scene_debug["local_target_preview_m"] = float(local_preview_m)
-    scene_debug["local_output_target_distance_m"] = float(local_target_distance_m)
-    scene_debug["local_output_target_s_m"] = float(local_target_s)
-    scene_debug["global_sync_plan_t_s"] = float(global_sync_plan_t)
-    scene_debug["local_output_plan_t_s"] = float(local_plan_t)
-    scene_debug["output_target_line_source"] = "route_aligned_local_preview"
-    return _build_line_target_output(
-        context=context,
-        target_line=line,
-        target_s=local_target_s,
-        target_v=target_v,
-        target_a=target_a,
-        plan_t=local_plan_t,
-        reason=reason,
-        scene_status=scene_status,
-        scene_detail=reason,
-        scene_debug=scene_debug,
-        min_plan_t=float(context.dt),
-        min_target_progress=float(CFG["min_target_progress_m"]),
-    )
-
-
-def _build_complete_brake_output(
-    context: SceneContext,
-    metrics: dict[str, Any],
-    reason: str,
-) -> dict[str, Any]:
-    """Build emergency-stop output after GVT clears the conflict point."""
-    limits = _read_vehicle_limits(context)
-    requested_decel = abs(float(CFG["complete_decel_mps2"]))
-    target_a = _clamp(-requested_decel, limits.min_acc, limits.max_acc)
-    effective_decel = abs(min(target_a, 0.0))
-    current_v = max(0.0, float(context.ego_vehicle.v))
-    if effective_decel > 1e-6:
-        plan_t = max(float(context.dt), current_v / effective_decel)
-        stop_distance = (current_v ** 2) / (2.0 * effective_decel)
-    else:
-        plan_t = 1.0
-        stop_distance = current_v * plan_t
-    debug = copy.deepcopy(metrics)
-    debug.update(
-        {
-            "complete_policy": "emergency_stop_after_conflict",
-            "complete_decel_mps2": float(requested_decel),
-            "complete_target_acc_mps2": float(target_a),
-            "complete_stop_distance_m": float(stop_distance),
-            "complete_plan_t_s": float(plan_t),
-        }
-    )
-    output = _build_line_target_output(
-        context=context,
-        target_line=context.ego_vehicle.current_ref_line,
-        target_s=float(context.ego_vehicle.current_ref_line.current_s) + max(
-            float(CFG["min_target_progress_m"]),
-            float(stop_distance),
-        ),
-        target_v=0.0,
-        target_a=target_a,
-        plan_t=plan_t,
-        reason=reason,
-        scene_status="complete_brake",
-        scene_detail=reason,
-        scene_debug=debug,
-    )
-    output.update(
-        {
-            "control_mode": "emergency_stop",
-            "emergency_decel_mps2": abs(float(target_a)),
-            "stop_hold_s": float(CFG["stop_hold_s"]),
-        }
-    )
-    return output
-
-
-def _build_stopped_output(
-    context: SceneContext,
-    metrics: dict[str, Any],
-    reason: str,
-) -> dict[str, Any]:
-    """Build zero-speed hold output after the scene is complete."""
-    debug = copy.deepcopy(metrics)
-    debug["complete_policy"] = "hold_stopped_after_conflict"
-    output = _build_line_target_output(
-        context=context,
-        target_line=context.ego_vehicle.current_ref_line,
-        target_s=float(context.ego_vehicle.current_ref_line.current_s) + float(CFG["min_target_progress_m"]),
-        target_v=0.0,
-        target_a=0.0,
-        plan_t=1.0,
-        reason=reason,
-        scene_status="complete",
-        scene_detail=reason,
-        scene_debug=debug,
-    )
-    output.update(
-        {
-            "control_mode": "emergency_stop",
-            "emergency_decel_mps2": abs(float(CFG["complete_decel_mps2"])),
-            "stop_hold_s": float(CFG["stop_hold_s"]),
-        }
-    )
+    line, selection = _select_route_aligned_local_line(context)
+    _, current_s, lateral = project_point_to_path(np.array([context.ego_vehicle.x, context.ego_vehicle.y]), line.line)
+    minimum = max(float(context.dt), float(CFG["local_output_plan_t_min_s"]))
+    horizon = max(minimum, min(float(CFG["local_target_preview_time_s"]), float(CFG["local_output_plan_t_max_s"])))
+    desired = float(sync_target.get("desired_gvt_arrival_t_s", float("inf")))
+    if np.isfinite(desired) and desired > 0.0:
+        horizon = max(minimum, min(horizon, desired))
+    # 生成器按固定 0.1 秒采样；先吸附时域再积分，禁止把 0.142 秒距离交给 0.1 秒轨迹。
+    horizon = float(np.ceil((horizon - 1e-9) / 0.1) * 0.1)
+    acceleration = float(sync_target.get("target_a_mps2", 0.0))
+    distance, terminal_v, limited = _smooth_local_profile(
+        float(context.ego_vehicle.v), float(context.ego_vehicle.a), acceleration, horizon, limits)
+    if limited and "sync_target_feasible" in scene_debug:
+        scene_debug.update(sync_target_feasible=False, sync_target_infeasible_reason="local_time_parameterization_limited")
+    available = max(0.0, float(line.cumulative_s[-1]) - 0.5 - current_s)
+    if distance > available + 1e-6:
+        # 局部走廊不足时明确标记，不把裁短后的目标继续称作原时序可行。
+        scene_debug.update(sync_target_feasible=False, sync_target_infeasible_reason="local_corridor_too_short")
+        distance = available
+        terminal_v = min(terminal_v, max(0.0, 2.0 * distance / horizon - float(context.ego_vehicle.v)))
+    scene_debug.update(selection)
+    scene_debug.update(requested_sync_acc_mps2=acceleration, target_acc_mps2=0.0,
+                       local_mean_acc_mps2=(terminal_v-float(context.ego_vehicle.v))/horizon,
+                       local_output_target_distance_m=distance,
+                       local_output_target_s_m=current_s + distance, local_output_plan_t_s=horizon,
+                       ego_s_on_selected_local_line_m=float(current_s), ego_d_on_selected_local_line_m=float(lateral),
+                       output_target_line_source="route_aligned_bounded_profile")
+    output = _build_line_target_output(context=context, target_line=line,
+                                    target_s=current_s + distance, target_v=terminal_v,
+                                    target_a=0.0, plan_t=horizon, reason=reason,
+                                    scene_status=scene_status, scene_debug=scene_debug,
+                                    min_plan_t=float(context.dt), min_target_progress=0.0)
+    # 仅本场景请求最终动态限值复核，其他既有外部目标场景保持原入口行为。
+    output["enforce_external_dynamic_limits"] = True
     return output
 
 
@@ -610,7 +368,7 @@ def _build_line_target_output(
     min_plan_t: float | None = None,
     min_target_progress: float | None = None,
 ) -> dict[str, Any]:
-    """Build a terminal target on the selected GVT reference line."""
+    """在选中的场景车参考线上构造终端目标。"""
     min_progress = float(CFG["min_target_progress_m"]) if min_target_progress is None else float(min_target_progress)
     lower_s = float(target_line.current_s) + max(0.0, min_progress)
     upper_s = float(target_line.cumulative_s[-1]) - 0.5
@@ -655,7 +413,7 @@ def _annotate_output(
 
 
 def _build_conflict_context(context: SceneContext) -> dict[str, Any]:
-    """Build the scene semantic context and validate forward conflict point."""
+    """验证双方前方冲突点，并锁定同一圆形区域的路线几何。"""
     conflict_type = str(CFG.get("conflict_type", "")).strip()
     if conflict_type not in SUPPORTED_CONFLICT_TYPES:
         return {
@@ -703,6 +461,15 @@ def _build_conflict_context(context: SceneContext) -> dict[str, Any]:
     best_result["main_lane_sequence"] = _normalize_lane_sequence(main_line.lane_sequence)
 
     conflict_xy = best_result["conflict_xy"]
+    center = np.asarray(conflict_xy, dtype=float)
+    radius = float(CFG["conflict_zone_radius_m"])
+    if radius <= 0.0 or any(np.linalg.norm(np.array([vehicle.x, vehicle.y])-center) <= radius
+                            for vehicle in (context.ego_vehicle, context.main_vehicle)):
+        return {"valid": False, "reason": "initial_center_not_outside_conflict_zone"}
+    zone_geometry = {actor: _route_zone_profile(line, center, radius)
+                     for actor, line in (("gvt", gvt_line), ("vut", main_line))}
+    if any(profile is None for profile in zone_geometry.values()):
+        return {"valid": False, "reason": "route_does_not_cover_conflict_zone"}
     print(
         "[intersection_conflict] conflict_xy="
         f"({float(conflict_xy[0]):.3f}, {float(conflict_xy[1]):.3f})",
@@ -712,6 +479,8 @@ def _build_conflict_context(context: SceneContext) -> dict[str, Any]:
     return {
         "valid": True,
         "reason": "conflict_point_locked",
+        "conflict_zone_radius_m": radius,
+        "zone_geometry": zone_geometry,
         "conflict_type": conflict_type,
         "conflict_xy": list(conflict_xy),
         "conflict_angle_deg": float(best_result["conflict_angle_deg"]),
@@ -730,122 +499,203 @@ def _build_conflict_context(context: SceneContext) -> dict[str, Any]:
 
 
 def _compact_conflict_context(conflict: dict[str, Any]) -> dict[str, Any]:
-    """Keep only stable conflict fields in memory."""
-    return {
-        "conflict_type": str(conflict.get("conflict_type", "")),
-        "conflict_xy": list(conflict.get("conflict_xy", [0.0, 0.0])),
-        "gvt_line_index": int(conflict.get("gvt_line_index", 0)),
-        "gvt_lane_id": str(conflict.get("gvt_lane_id", "")),
-        "gvt_lane_sequence": _normalize_lane_sequence(conflict.get("gvt_lane_sequence", [])),
-        "main_line_index": int(conflict.get("main_line_index", 0)),
-        "main_lane_id": str(conflict.get("main_lane_id", "")),
-        "main_lane_sequence": _normalize_lane_sequence(conflict.get("main_lane_sequence", [])),
-        "conflict_angle_deg": float(conflict.get("conflict_angle_deg", 0.0)),
-    }
+    """保留固定圆和锁定路线，避免后续前向裁切把已通过的冲突点夹到零。"""
+    keys = ("conflict_type", "conflict_xy", "conflict_angle_deg", "gvt_line_index", "gvt_lane_id",
+            "gvt_lane_sequence", "main_line_index", "main_lane_id", "main_lane_sequence",
+            "conflict_zone_radius_m", "zone_geometry")
+    return {key: copy.deepcopy(conflict[key]) for key in keys if key in conflict}
 
 
-def _compute_conflict_metrics(
-    context: SceneContext,
-    locked_conflict: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Compute TTA, delta_t and PET-like metrics for the locked conflict point."""
-    if locked_conflict is None:
-        return {
-            "valid": False,
-            "reason": "no_locked_conflict",
-            "invalid_scene_reasons": ["no_locked_conflict"],
-        }
-    if context.main_vehicle is None:
-        return {
-            "valid": False,
-            "reason": "no_main_vehicle",
-            "invalid_scene_reasons": ["no_main_vehicle"],
-        }
+def _segment_circle_roots(start: np.ndarray, end: np.ndarray, center: np.ndarray, radius: float) -> list[float]:
+    """返回线段与圆周的交点比例，按运动顺序排列并去除相切重复根。"""
+    movement, offset = end - start, start - center
+    a = float(np.dot(movement, movement))
+    if a <= 1e-12:
+        return []
+    b, c = 2.0 * float(np.dot(offset, movement)), float(np.dot(offset, offset)) - radius * radius
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < -1e-9:
+        return []
+    root = np.sqrt(max(0.0, discriminant))
+    values = sorted(_clamp(float(t), 0.0, 1.0) for t in ((-b-root)/(2*a), (-b+root)/(2*a)) if -1e-9 <= t <= 1.0+1e-9)
+    return [t for i, t in enumerate(values) if i == 0 or abs(t-values[i-1]) > 1e-8]
 
-    gvt_line = _route_line(context.ego_vehicle)
-    main_line = _route_line(context.main_vehicle)
-    if gvt_line is None or main_line is None:
-        return {
-            "valid": False,
-            "reason": "route_intent_missing",
-            "gvt_route_reason": _route_intent_reason(context.ego_vehicle),
-            "main_route_reason": _route_intent_reason(context.main_vehicle),
-            "invalid_scene_reasons": ["route_intent_missing"],
-        }
 
-    conflict_xy = np.asarray(locked_conflict.get("conflict_xy", [0.0, 0.0]), dtype=float)
-    _, gvt_s_conflict, gvt_d_conflict = project_point_to_path(conflict_xy, gvt_line.line)
-    _, main_s_conflict, main_d_conflict = project_point_to_path(conflict_xy, main_line.line)
-    gvt_distance = float(gvt_s_conflict) - float(gvt_line.current_s)
-    vut_distance = float(main_s_conflict) - float(main_line.current_s)
-    gvt_rel_xy = conflict_xy - np.array([float(context.ego_vehicle.x), float(context.ego_vehicle.y)], dtype=float)
-    gvt_forward = np.array(
-        [np.cos(float(context.ego_vehicle.heading)), np.sin(float(context.ego_vehicle.heading))],
-        dtype=float,
-    )
-    gvt_longitudinal_to_conflict = float(np.dot(gvt_rel_xy, gvt_forward))
-    vut_rel_xy = conflict_xy - np.array([float(context.main_vehicle.x), float(context.main_vehicle.y)], dtype=float)
-    vut_forward = np.array(
-        [np.cos(float(context.main_vehicle.heading)), np.sin(float(context.main_vehicle.heading))],
-        dtype=float,
-    )
-    vut_longitudinal_to_conflict = float(np.dot(vut_rel_xy, vut_forward))
+def _route_zone_profile(line: ReferenceLineView, center: np.ndarray, radius: float) -> dict[str, Any] | None:
+    """求包含已选冲突点的那一段圆内路线，锁定真实入区/出区弧长。"""
+    xy, cumulative = np.asarray(line.line, dtype=float)[:, :2], np.asarray(line.cumulative_s, dtype=float)
+    _, conflict_s, _ = project_point_to_path(center, xy)
+    roots = []
+    for i in range(len(xy)-1):
+        length = float(cumulative[i+1]-cumulative[i])
+        roots.extend(float(cumulative[i])+fraction*length for fraction in _segment_circle_roots(xy[i], xy[i+1], center, radius))
+    roots = sorted(set(round(value, 10) for value in roots))
+    for entry, exit_ in zip(roots, roots[1:]):
+        midpoint, _ = get_path_point_at_s(xy, 0.5*(entry+exit_), cumulative)
+        if entry <= conflict_s <= exit_ and np.linalg.norm(midpoint-center) < radius+1e-8:
+            return {"route_xy": xy.tolist(), "s_conflict": float(conflict_s), "s_enter": entry, "s_exit": exit_}
+    return None
 
-    speed_floor = max(float(CFG["speed_floor_mps"]), 1e-3)
-    gvt_v = max(0.0, float(context.ego_vehicle.v))
-    vut_v = max(0.0, float(context.main_vehicle.v))
-    gvt_tta = gvt_distance / max(gvt_v, speed_floor) if gvt_distance >= 0.0 else 0.0
-    vut_tta, vut_prediction = _predict_vut_arrival_time(
-        distance_m=vut_distance,
-        speed_mps=vut_v,
-        accel_mps2=float(context.main_vehicle.a),
-    )
-    delta_t = float(gvt_tta) - float(vut_tta)
-    zone = _compute_pet_like(
-        gvt_distance=gvt_distance,
-        gvt_v=max(gvt_v, speed_floor),
-        vut_distance=vut_distance,
-        vut_v=max(vut_v, speed_floor),
-    )
-    target_delta = float(CFG["target_delta_t_s"])
-    delta_error = delta_t - target_delta
 
-    return {
-        "valid": True,
-        "reason": "metrics_ok",
-        "conflict_type": str(locked_conflict.get("conflict_type", "")),
-        "conflict_xy": [float(conflict_xy[0]), float(conflict_xy[1])],
-        "conflict_angle_deg": float(locked_conflict.get("conflict_angle_deg", 0.0)),
-        "gvt_line_index": int(gvt_line.line_index),
-        "gvt_lane_id": str(gvt_line.lane_id),
-        "gvt_lane_sequence": _normalize_lane_sequence(gvt_line.lane_sequence),
-        "main_line_index": int(main_line.line_index),
-        "main_lane_id": str(main_line.lane_id),
-        "main_lane_sequence": _normalize_lane_sequence(main_line.lane_sequence),
-        "gvt_s_now_m": float(gvt_line.current_s),
-        "gvt_s_conflict_m": float(gvt_s_conflict),
-        "gvt_d_to_conflict_line_m": float(gvt_d_conflict),
-        "gvt_distance_to_conflict_m": float(gvt_distance),
-        "gvt_longitudinal_to_conflict_m": float(gvt_longitudinal_to_conflict),
-        "vut_s_now_m": float(main_line.current_s),
-        "vut_s_conflict_m": float(main_s_conflict),
-        "vut_d_to_conflict_line_m": float(main_d_conflict),
-        "vut_distance_to_conflict_m": float(vut_distance),
-        "vut_longitudinal_to_conflict_m": float(vut_longitudinal_to_conflict),
-        "gvt_v_mps": float(gvt_v),
-        "vut_v_mps": float(vut_v),
-        "vut_a_mps2": float(vut_prediction["accel_used_mps2"]),
-        "vut_arrival_prediction_mode": str(vut_prediction["mode"]),
-        "vut_accel_phase_distance_m": float(vut_prediction["accel_phase_distance_m"]),
-        "vut_accel_phase_end_speed_mps": float(vut_prediction["accel_phase_end_speed_mps"]),
-        "gvt_tta_s": float(gvt_tta),
-        "vut_tta_s": float(vut_tta),
-        "target_delta_t_s": float(target_delta),
-        "delta_t_s": float(delta_t),
-        "delta_t_error_s": float(delta_error),
-        "success_time_tol_s": float(CFG["success_time_tol_s"]),
-        **zone,
-    }
+def _body_zone_clearance(xy: np.ndarray, heading: float, length: float, width: float,
+                         center: np.ndarray, radius: float) -> float:
+    """圆到有向车身矩形的净距；仅用于通行观测，不膨胀中心入区判据。"""
+    delta = center-xy
+    local = np.array([np.cos(heading)*delta[0]+np.sin(heading)*delta[1],
+                      -np.sin(heading)*delta[0]+np.cos(heading)*delta[1]])
+    return float(np.linalg.norm(np.maximum(np.abs(local)-np.array([length/2, width/2]), 0.0))-radius)
+
+
+def _finite_difference(first: Any, second: Any) -> float:
+    """未知或无限的到达时间不做无穷减无穷。"""
+    a, b = _optional_float(first), _optional_float(second)
+    return a-b if a is not None and b is not None else float("nan")
+
+
+def _smooth_local_profile(speed: float, start_acc: float, requested_acc: float,
+                          duration: float, limits: VehicleLimits) -> tuple[float, float, bool]:
+    """让局部末状态兼容现有五次时参：初加速度来自观测，末加速度为零。
+
+    用三次速度剖面积分得到距离，并在速度/加速度极值处检查平台限值。
+    这比只约束平均加速度更严格，可避免平均值达标但五次回退峰值越限。
+    """
+    def violation(end_speed: float) -> float:
+        change = end_speed - speed
+        velocity = np.array([speed, duration*start_acc,
+                             3*change-2*duration*start_acc, duration*start_acc-2*change])
+        acceleration = np.array([start_acc, 6*change/duration-4*start_acc,
+                                 3*start_acc-6*change/duration])
+        profiles = [(velocity, acceleration)]
+        if start_acc < 0.0:
+            # 既有五次回退会把末速裁到 2d/T-v0；制动初态下需同时检查这条实际剖面。
+            distance = duration*0.5*(speed+end_speed)+start_acc*duration*duration/12.0
+            clipped_end = max(0.0, end_speed+start_acc*duration/6.0)
+            delta_s = distance-speed*duration-0.5*start_acc*duration*duration
+            delta_v = (clipped_end-speed)*duration-start_acc*duration*duration
+            delta_a = -start_acc*duration*duration
+            c3 = 10*delta_s-4*delta_v+0.5*delta_a
+            c4 = -15*delta_s+7*delta_v-delta_a
+            c5 = 6*delta_s-3*delta_v+0.5*delta_a
+            profiles.append((np.array([speed, duration*start_acc, 3*c3/duration,
+                                       4*c4/duration, 5*c5/duration]),
+                             np.array([start_acc, 6*c3/duration**2,
+                                       12*c4/duration**2, 20*c5/duration**2])))
+        error = -float("inf")
+        for velocity, acceleration in profiles:
+            speed_times, acc_times = [0.0, 1.0], [0.0, 1.0]
+            for root in np.polynomial.polynomial.polyroots(acceleration):
+                if abs(root.imag) < 1e-8 and 0.0 < root.real < 1.0:
+                    speed_times.append(float(root.real))
+            for root in np.polynomial.polynomial.polyroots(np.polynomial.polynomial.polyder(acceleration)):
+                if abs(root.imag) < 1e-8 and 0.0 < root.real < 1.0:
+                    acc_times.append(float(root.real))
+            speeds = np.polynomial.polynomial.polyval(speed_times, velocity)
+            accs = np.polynomial.polynomial.polyval(acc_times, acceleration)
+            error = max(error, float(-np.min(speeds)), float(np.max(speeds)-limits.max_v),
+                        float(limits.min_acc-np.min(accs)), float(np.max(accs)-limits.max_acc))
+        return error
+
+    def within(end_speed: float) -> bool:
+        return violation(end_speed) <= 1e-8
+
+    desired = _clamp(speed+requested_acc*duration, 0.0, limits.max_v)
+    terminal = desired
+    if not within(terminal):
+        # 裁速拐点两侧的速度/加速度均对末速呈仿射关系，各自最大越限量为凸函数。
+        split = _clamp(-start_acc*duration/6.0, 0.0, limits.max_v)
+        boundaries = sorted({0.0, split, limits.max_v})
+        feasible, attempted = [], []
+        for lower, upper in zip(boundaries, boundaries[1:]):
+            wanted = _clamp(desired, lower, upper)
+            if within(wanted):
+                feasible.append(wanted)
+                continue
+            baseline = _clamp(speed+0.5*start_acc*duration, lower, upper)
+            if not within(baseline):
+                # 基准不可行不代表初态无解；在这一段合法末速范围内寻找可行锚点。
+                left_bound, right_bound = lower, upper
+                for _ in range(60):
+                    left, right = (2*left_bound+right_bound)/3, (left_bound+2*right_bound)/3
+                    left_error, right_error = violation(left), violation(right)
+                    if min(left_error, right_error) <= 1e-8:
+                        baseline = left if left_error <= right_error else right
+                        break
+                    if left_error <= right_error:
+                        right_bound = right
+                    else:
+                        left_bound = left
+                else:
+                    baseline = min((lower, 0.5*(left_bound+right_bound), upper), key=violation)
+            attempted.append(baseline)
+            if within(baseline):
+                low, high = 0.0, 1.0
+                for _ in range(28):
+                    ratio = 0.5*(low+high)
+                    if within(baseline+ratio*(wanted-baseline)):
+                        low = ratio
+                    else:
+                        high = ratio
+                feasible.append(baseline+low*(wanted-baseline))
+        if feasible:
+            terminal = min(feasible, key=lambda value: abs(value-desired))
+        elif attempted:
+            # 本时域和剖面内没有找到合法末速，仍由最终检查拒绝，不放松限值。
+            terminal = min(attempted, key=violation)
+    distance = duration*0.5*(speed+terminal)+start_acc*duration*duration/12.0
+    return max(0.0, distance), terminal, abs(terminal-desired) > 1e-5
+
+
+def _compute_conflict_metrics(context: SceneContext, locked_conflict: dict[str, Any] | None) -> dict[str, Any]:
+    """用同一固定圆预测中心入区；过点时差仅作独立诊断。"""
+    if locked_conflict is None or context.main_vehicle is None:
+        return {"valid": False, "reason": "no_locked_conflict" if locked_conflict is None else "no_main_vehicle"}
+    point = np.asarray(locked_conflict["conflict_xy"], dtype=float)
+    radius = float(locked_conflict.get("conflict_zone_radius_m", CFG["conflict_zone_radius_m"]))
+    geometries = locked_conflict.get("zone_geometry", {})
+    limits = _read_vehicle_limits(context)
+    result = {"valid": True, "reason": "metrics_ok", "time_s": float(context.time_s),
+              "conflict_xy": point.tolist(), "conflict_type": locked_conflict.get("conflict_type", ""),
+              "conflict_angle_deg": locked_conflict.get("conflict_angle_deg", 0.0),
+              "conflict_zone_radius_m": radius, "position_reference": "body_center",
+              "intersection_metrics_version": 2, "timing_metric": "center_entry_delta_t_s",
+              "entry_event_definition": "body_center_crosses_fixed_circle",
+              "target_delta_t_s": float(CFG["target_delta_t_s"]),
+              "success_time_tol_s": float(CFG["success_time_tol_s"])}
+    for actor, vehicle in (("gvt", context.ego_vehicle), ("vut", context.main_vehicle)):
+        geometry = geometries.get(actor)
+        if geometry is None:
+            line = _route_line(vehicle)
+            geometry = _route_zone_profile(line, point, radius) if line is not None else None
+        if geometry is None:
+            return {"valid": False, "reason": "conflict_zone_route_missing"}
+        xy = np.asarray([vehicle.x, vehicle.y], dtype=float)
+        _, current_s, lateral_d = project_point_to_path(xy, np.asarray(geometry["route_xy"]))
+        distance = float(geometry["s_conflict"]) - current_s
+        enter_distance = float(geometry["s_enter"]) - current_s
+        exit_distance = float(geometry["s_exit"]) - current_s
+        enter_t, prediction = _predict_vut_arrival_time(distance_m=enter_distance, speed_mps=vehicle.v, accel_mps2=vehicle.a)
+        cross_t, _ = _predict_vut_arrival_time(distance_m=distance, speed_mps=vehicle.v, accel_mps2=vehicle.a)
+        exit_t, _ = _predict_vut_arrival_time(distance_m=exit_distance, speed_mps=vehicle.v, accel_mps2=vehicle.a)
+        length = limits.ego_length if actor == "gvt" else limits.main_length
+        width = limits.ego_width if actor == "gvt" else limits.main_width
+        forward = np.array([np.cos(vehicle.heading), np.sin(vehicle.heading)])
+        result.update({f"{actor}_center_xy": xy.tolist(), f"{actor}_s_now_m": float(current_s),
+                       f"{actor}_s_conflict_m": float(geometry["s_conflict"]),
+                       f"{actor}_distance_to_conflict_m": distance,
+                       f"{actor}_distance_to_zone_entry_m": enter_distance,
+                       f"{actor}_distance_to_zone_exit_m": exit_distance,
+                       f"{actor}_d_to_conflict_line_m": float(lateral_d),
+                       f"{actor}_longitudinal_to_conflict_m": float(np.dot(point - xy, forward)),
+                       f"{actor}_v_mps": float(vehicle.v), f"{actor}_tta_s": cross_t,
+                       f"{actor}_zone_enter_t_s": enter_t, f"{actor}_zone_exit_t_s": exit_t,
+                       f"{actor}_zone_enter_prediction": str(prediction["mode"]),
+                       f"{actor}_body_zone_clearance_m": _body_zone_clearance(xy, vehicle.heading, length, width, point, radius)})
+    entry_delta = _finite_difference(result["gvt_zone_enter_t_s"], result["vut_zone_enter_t_s"])
+    result.update(predicted_entry_delta_t_s=entry_delta, entry_delta_t_s=entry_delta,
+                  zone_delta_t_s=entry_delta, delta_t_s=entry_delta,
+                  delta_t_error_s=entry_delta - float(CFG["target_delta_t_s"]),
+                  predicted_cross_delta_t_s=_finite_difference(result["gvt_tta_s"], result["vut_tta_s"]))
+    return result
 
 
 def _predict_vut_arrival_time(
@@ -854,13 +704,7 @@ def _predict_vut_arrival_time(
     speed_mps: float,
     accel_mps2: float,
 ) -> tuple[float, dict[str, float | str]]:
-    """Predict VUT arrival with bounded short-horizon constant acceleration.
-
-    The OBU acceleration is useful near the conflict point but should not be
-    extrapolated indefinitely.  This model applies it for a short horizon and
-    then keeps the resulting speed constant.  A vehicle predicted to stop
-    before the conflict point has no finite arrival time.
-    """
+    """短时使用有界加速度预测，随后保持速度；到达前停车时返回无穷。"""
     raw_distance = float(distance_m)
     raw_speed = float(speed_mps)
     raw_accel = float(accel_mps2)
@@ -880,25 +724,22 @@ def _predict_vut_arrival_time(
         float(CFG["vut_accel_max_mps2"]),
     )
     horizon = max(0.0, float(CFG["vut_accel_prediction_horizon_s"]))
-    speed_floor = max(float(CFG["speed_floor_mps"]), 1e-3)
     if horizon <= 1e-6 or abs(accel) <= 1e-6:
-        return distance / max(speed, speed_floor), {
+        return (distance / speed if speed > 1e-3 else float("inf")), {
             "mode": "constant_speed",
             "accel_used_mps2": 0.0,
             "accel_phase_distance_m": 0.0,
             "accel_phase_end_speed_mps": speed,
         }
 
-    # Under braking, the constant-acceleration phase ends once the vehicle
-    # stops, even when that happens before the configured horizon.
+    # 制动预测在车辆停下时结束，不能把负速度外推到预测时域末端。
     accel_duration = horizon
     if accel < 0.0:
         accel_duration = min(horizon, speed / abs(accel))
     accel_end_speed = max(0.0, speed + accel * accel_duration)
     accel_distance = max(0.0, speed * accel_duration + 0.5 * accel * accel_duration * accel_duration)
 
-    # The conflict lies inside the bounded acceleration phase.  Solve
-    # 0.5*a*t^2 + v*t - distance = 0 and select its non-negative root.
+    # 目标在加速段内，解 0.5*a*t^2 + v*t - distance = 0 并取非负根。
     if distance <= accel_distance + 1e-6:
         discriminant = max(0.0, speed * speed + 2.0 * accel * distance)
         if abs(accel) > 1e-6:
@@ -928,101 +769,47 @@ def _predict_vut_arrival_time(
     }
 
 
-def _compute_pet_like(
-    *,
-    gvt_distance: float,
-    gvt_v: float,
-    vut_distance: float,
-    vut_v: float,
-) -> dict[str, Any]:
-    radius = max(0.0, float(CFG["conflict_zone_radius_m"]))
-
-    gvt_enter = max(0.0, float(gvt_distance) - radius) / max(float(gvt_v), 1e-3)
-    gvt_exit = max(0.0, float(gvt_distance) + radius) / max(float(gvt_v), 1e-3)
-    vut_enter = max(0.0, float(vut_distance) - radius) / max(float(vut_v), 1e-3)
-    vut_exit = max(0.0, float(vut_distance) + radius) / max(float(vut_v), 1e-3)
-
-    if gvt_exit < vut_enter:
-        pet_like = float(vut_enter - gvt_exit)
-        first_actor = "gvt"
-        overlap = 0.0
-    elif vut_exit < gvt_enter:
-        pet_like = float(gvt_enter - vut_exit)
-        first_actor = "vut"
-        overlap = 0.0
-    else:
-        pet_like = 0.0
-        first_actor = "overlap"
-        overlap = min(gvt_exit, vut_exit) - max(gvt_enter, vut_enter)
-
-    return {
-        "conflict_zone_radius_m": float(radius),
-        "gvt_zone_enter_t_s": float(gvt_enter),
-        "gvt_zone_exit_t_s": float(gvt_exit),
-        "vut_zone_enter_t_s": float(vut_enter),
-        "vut_zone_exit_t_s": float(vut_exit),
-        "pet_like_s": float(pet_like),
-        "zone_first_actor": str(first_actor),
-        "zone_overlap_s": float(max(0.0, overlap)),
-    }
-
-
 def _solve_sync_target(context: SceneContext, metrics: dict[str, Any]) -> dict[str, Any]:
-    """Solve GVT speed/target needed to hit configured delta_t."""
+    """求入区时序所需的受限加速度，禁止把过去的目标夹成未来可行目标。"""
     limits = _read_vehicle_limits(context)
-    target_delta = float(CFG["target_delta_t_s"])
-    desired_arrival_t = float(metrics.get("vut_tta_s", float("inf"))) + target_delta
-    min_t = max(float(CFG["sync_plan_t_min_s"]), float(context.dt), 1e-3)
-    gvt_distance = float(metrics.get("gvt_distance_to_conflict_m", 0.0))
-    target_s_conflict = float(metrics.get("gvt_s_conflict_m", context.ego_vehicle.current_ref_line.current_s))
-    buffer_s = max(0.0, float(CFG["post_conflict_target_buffer_m"]))
-    target_s = target_s_conflict + buffer_s
-
-    if not np.isfinite(desired_arrival_t) or desired_arrival_t < min_t or gvt_distance <= 0.0:
-        raw_v = float("inf")
-        feasible = False
-        infeasible_reason = "invalid_desired_arrival_time"
-        target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
-        plan_t = max(min_t, min(float(CFG["sync_plan_t_max_s"]), buffer_s / max(target_v, 1e-3)))
-    else:
-        raw_v = gvt_distance / max(desired_arrival_t, 1e-3)
-        target_v = _clamp(raw_v, float(CFG["target_speed_min_mps"]), limits.max_v)
-        plan_t = desired_arrival_t + buffer_s / max(target_v, float(CFG["speed_floor_mps"]))
-        plan_t = _clamp(plan_t, min_t, float(CFG["sync_plan_t_max_s"]))
-        avg_acc = (target_v - float(context.ego_vehicle.v)) / max(desired_arrival_t, 1e-3)
-        feasible = bool(
-            np.isfinite(raw_v)
-            and abs(target_v - raw_v) <= 1e-3
-            and limits.min_acc <= avg_acc <= limits.max_acc
-        )
-        if target_v < raw_v - 1e-3:
-            infeasible_reason = "required_speed_above_limit"
-        elif target_v > raw_v + 1e-3:
-            infeasible_reason = "required_speed_below_min"
-        elif avg_acc < limits.min_acc:
-            infeasible_reason = "required_decel_below_limit"
-        elif avg_acc > limits.max_acc:
-            infeasible_reason = "required_acc_above_limit"
+    desired = float(metrics.get("vut_zone_enter_t_s", float("inf"))) + float(CFG["target_delta_t_s"])
+    minimum = max(float(CFG["sync_plan_t_min_s"]), float(context.dt))
+    distance = float(metrics.get("gvt_distance_to_zone_entry_m",
+                                 float(metrics.get("gvt_distance_to_conflict_m", 0.0)) - float(CFG["conflict_zone_radius_m"])))
+    speed = max(0.0, float(context.ego_vehicle.v))
+    feasible, reason = False, "invalid_desired_arrival_time"
+    required_v, required_a, average = float("inf"), 0.0, float("inf")
+    if np.isfinite(desired) and desired >= minimum and distance > 0.0:
+        average = distance / desired
+        required_v = 2.0 * average - speed
+        required_a = (required_v - speed) / desired
+        if required_v > limits.max_v:
+            reason = "required_speed_above_limit"
+        elif required_v < 0.0:
+            reason = "required_speed_below_zero"
+        elif required_a < limits.min_acc:
+            reason = "required_decel_below_limit"
+        elif required_a > limits.max_acc:
+            reason = "required_acc_above_limit"
         else:
-            infeasible_reason = ""
-
-    return {
-        "sync_control_mode": "delta_t_speed_sync",
-        "desired_gvt_arrival_t_s": float(desired_arrival_t),
-        "raw_required_v_mps": float(raw_v),
-        "target_v_mps": float(target_v),
-        "target_s_m": float(target_s),
-        "plan_t_s": float(plan_t),
-        "sync_target_feasible": bool(feasible),
-        "sync_target_infeasible_reason": str(infeasible_reason),
-    }
+            feasible, reason = True, ""
+    else:
+        # 无可达时刻时只输出有界的通行速度，不宣称命中原目标。
+        required_a = (float(CFG["cruise_target_v"]) - speed) / max(float(CFG["local_target_preview_time_s"]), minimum)
+    acceleration = _clamp(required_a, limits.min_acc, limits.max_acc)
+    return {"sync_control_mode": "entry_time_speed_sync", "desired_gvt_arrival_t_s": desired,
+            "raw_required_v_mps": average, "required_terminal_v_mps": required_v,
+            "target_v_mps": _clamp(required_v if np.isfinite(required_v) else float(CFG["cruise_target_v"]), 0.0, limits.max_v),
+            "target_a_mps2": acceleration,
+            "plan_t_s": desired, "sync_target_feasible": feasible,
+            "sync_target_infeasible_reason": reason}
 
 
 def _find_forward_conflict_point(
     gvt_line: ReferenceLineView,
     main_line: ReferenceLineView,
 ) -> dict[str, Any]:
-    """Find the first forward geometric conflict point between two reference lines."""
+    """搜索双方参考线前方有效的几何冲突点。"""
     gvt_path = np.asarray(gvt_line.line, dtype=float)
     main_path = np.asarray(main_line.line, dtype=float)
     if len(gvt_path) < 2 or len(main_path) < 2:
@@ -1094,7 +881,7 @@ def _segment_pair_conflict_candidate(
     q1: np.ndarray,
     q2: np.ndarray,
 ) -> tuple[float, np.ndarray, float, float] | None:
-    """Return distance, midpoint and segment parameters for a crossing/near-crossing pair."""
+    """返回相交或近交线段的距离、中点及段内比例。"""
     exact = _segment_intersection(p1, p2, q1, q2)
     if exact is not None:
         point, u, v = exact
@@ -1134,7 +921,7 @@ def _closest_points_on_segments(
     q1: np.ndarray,
     q2: np.ndarray,
 ) -> tuple[np.ndarray | None, np.ndarray | None, float, float]:
-    """Closest points between two 2D line segments."""
+    """计算两条二维线段的最近点。"""
     d1 = p2 - p1
     d2 = q2 - q1
     r = p1 - q1
@@ -1177,164 +964,105 @@ def _closest_points_on_segments(
 # ==================== Actual conflict observation ====================
 
 
-def _update_actual_conflict_observation(
-    memory: dict[str, Any],
-    metrics: dict[str, Any],
-    now: float,
-) -> dict[str, Any]:
-    """Record actual crossing/zone timestamps without changing control targets."""
+def _update_actual_conflict_observation(memory: dict[str, Any], metrics: dict[str, Any], now: float) -> dict[str, Any]:
+    """按实际中心运动与固定圆的交点锁存事件，随后复用绝对时间。"""
     if not bool(metrics.get("valid", False)):
         return metrics
-
-    prev_time = _optional_float(memory.get("last_observation_time_s"))
-    gvt_signed = _signed_conflict_distance(metrics, "gvt")
-    vut_signed = _signed_conflict_distance(metrics, "vut")
-
-    _update_actor_actual_observation(
-        memory=memory,
-        actor="gvt",
-        signed_distance=gvt_signed,
-        prev_signed_distance=_optional_float(memory.get("last_gvt_signed_distance_m")),
-        prev_time=prev_time,
-        now=now,
-    )
-    _update_actor_actual_observation(
-        memory=memory,
-        actor="vut",
-        signed_distance=vut_signed,
-        prev_signed_distance=_optional_float(memory.get("last_vut_signed_distance_m")),
-        prev_time=prev_time,
-        now=now,
-    )
-
-    memory["last_observation_time_s"] = float(now)
-    memory["last_gvt_signed_distance_m"] = float(gvt_signed) if np.isfinite(gvt_signed) else None
-    memory["last_vut_signed_distance_m"] = float(vut_signed) if np.isfinite(vut_signed) else None
-
-    actual = _build_actual_result_metrics(memory)
-    metrics.update(actual)
-    if bool(actual.get("actual_result_ready", False)) and not bool(memory.get("actual_result_printed", False)):
+    previous_time = _optional_float(memory.get("last_observation_time_s"))
+    radius = float(metrics.get("conflict_zone_radius_m", CFG["conflict_zone_radius_m"]))
+    for actor in ("gvt", "vut"):
+        center = metrics.get(f"{actor}_center_xy")
+        if center is not None:
+            _update_actor_actual_observation(memory=memory, actor=actor,
+                center_xy=np.asarray(center, dtype=float), previous_xy=memory.get(f"last_{actor}_center_xy"),
+                conflict_xy=np.asarray(metrics["conflict_xy"], dtype=float), radius=radius,
+                prev_time=previous_time, now=now)
+            memory[f"last_{actor}_center_xy"] = list(center)
+        signed = _signed_conflict_distance(metrics, actor)
+        previous_signed = _optional_float(memory.get(f"last_{actor}_signed_distance_m"))
+        if memory.get(f"{actor}_cross_time_s") is None and previous_signed is not None and previous_signed > 0.0 and signed <= 0.0:
+            memory[f"{actor}_cross_time_s"] = _threshold_cross_time(previous_signed, signed, previous_time, now, 0.0)
+        memory[f"last_{actor}_signed_distance_m"] = signed
+        for event in ("enter", "exit"):
+            observed = _optional_float(memory.get(f"{actor}_zone_{event}_time_s"))
+            if observed is not None:
+                metrics[f"{actor}_zone_{event}_t_s"] = observed - now
+                if event == "enter":
+                    metrics[f"{actor}_zone_enter_prediction"] = "observed"
+    memory["last_observation_time_s"] = now
+    metrics.update(_build_actual_result_metrics(memory))
+    if bool(metrics["actual_entry_delta_t_ready"]):
+        delta, source = float(metrics["actual_entry_delta_t_s"]), "latched"
+    else:
+        delta = _finite_difference(metrics.get("gvt_zone_enter_t_s"), metrics.get("vut_zone_enter_t_s"))
+        source = "mixed" if any(memory.get(f"{actor}_zone_enter_time_s") is not None for actor in ("gvt", "vut")) else "predicted"
+    metrics.update(entry_delta_t_s=delta, zone_delta_t_s=delta, delta_t_s=delta,
+                   delta_t_error_s=delta - float(CFG["target_delta_t_s"]), zone_delta_source=source)
+    if metrics["actual_result_ready"] and not memory.get("actual_result_printed", False):
         _print_actual_conflict_result(metrics)
         memory["actual_result_printed"] = True
     return metrics
 
 
-def _update_actor_actual_observation(
-    *,
-    memory: dict[str, Any],
-    actor: str,
-    signed_distance: float,
-    prev_signed_distance: float | None,
-    prev_time: float | None,
-    now: float,
-) -> None:
-    if not np.isfinite(signed_distance):
+def _update_actor_actual_observation(*, memory: dict[str, Any], actor: str, center_xy: np.ndarray,
+                                     previous_xy: list[float] | None, conflict_xy: np.ndarray,
+                                     radius: float, prev_time: float | None, now: float) -> None:
+    """同一帧可记录入区和出区；首帧已经在区内时不捏造历史进入时刻。"""
+    if previous_xy is None or prev_time is None or now <= prev_time:
+        if np.linalg.norm(center_xy - conflict_xy) < radius - 1e-8 and memory.get(f"{actor}_zone_enter_time_s") is None:
+            memory[f"{actor}_entry_censored"] = True
         return
-
-    radius = max(0.0, float(CFG["conflict_zone_radius_m"]))
-    enter_key = f"{actor}_zone_enter_time_s"
-    exit_key = f"{actor}_zone_exit_time_s"
-    cross_key = f"{actor}_cross_time_s"
-
-    if memory.get(enter_key) is None and signed_distance <= radius:
-        memory[enter_key] = _threshold_cross_time(
-            prev_signed_distance,
-            signed_distance,
-            prev_time,
-            now,
-            radius,
-        )
-
-    if memory.get(cross_key) is None and signed_distance <= 0.0:
-        memory[cross_key] = _threshold_cross_time(
-            prev_signed_distance,
-            signed_distance,
-            prev_time,
-            now,
-            0.0,
-        )
-        if memory.get(enter_key) is None:
-            memory[enter_key] = memory[cross_key]
-
-    if memory.get(exit_key) is None and memory.get(enter_key) is not None and signed_distance <= -radius:
-        memory[exit_key] = _threshold_cross_time(
-            prev_signed_distance,
-            signed_distance,
-            prev_time,
-            now,
-            -radius,
-        )
+    previous = np.asarray(previous_xy, dtype=float)
+    movement = center_xy - previous
+    for fraction in _segment_circle_roots(previous, center_xy, conflict_xy, radius):
+        hit = previous + fraction * movement
+        direction = float(np.dot(hit - conflict_xy, movement))
+        event = "enter" if direction < -1e-9 else "exit" if direction > 1e-9 else ""
+        if event:
+            key = f"{actor}_zone_{event}_time_s"
+            if memory.get(key) is None:
+                memory[key] = float(prev_time) + fraction * (now - float(prev_time))
 
 
 def _build_actual_result_metrics(memory: dict[str, Any]) -> dict[str, Any]:
-    gvt_cross = _optional_float(memory.get("gvt_cross_time_s"))
-    vut_cross = _optional_float(memory.get("vut_cross_time_s"))
-    actual_delta = float("nan")
-    actual_error = float("nan")
-    actual_abs_error = float("nan")
-    delta_ready = gvt_cross is not None and vut_cross is not None
-    if delta_ready:
-        actual_delta = float(gvt_cross) - float(vut_cross)
-        actual_error = actual_delta - float(CFG["target_delta_t_s"])
-        actual_abs_error = abs(actual_error)
-
-    gvt_enter = _optional_float(memory.get("gvt_zone_enter_time_s"))
-    gvt_exit = _optional_float(memory.get("gvt_zone_exit_time_s"))
-    vut_enter = _optional_float(memory.get("vut_zone_enter_time_s"))
-    vut_exit = _optional_float(memory.get("vut_zone_exit_time_s"))
-    pet_ready = all(value is not None for value in [gvt_enter, gvt_exit, vut_enter, vut_exit])
-    actual_pet = float("nan")
-    actual_overlap = float("nan")
-    first_actor = "pending"
+    """同步字段全部对应入区时差，过点和占用区间另有字段。"""
+    times = {f"{actor}_{event}": _optional_float(memory.get(f"{actor}_{event}_time_s"))
+             for actor in ("gvt", "vut") for event in ("zone_enter", "zone_exit", "cross")}
+    g_enter, v_enter = times["gvt_zone_enter"], times["vut_zone_enter"]
+    entry_ready = g_enter is not None and v_enter is not None
+    delta = g_enter - v_enter if entry_ready else float("nan")
+    error = delta - float(CFG["target_delta_t_s"])
+    result = "pending" if not entry_ready else "within_tolerance" if abs(error) <= float(CFG["success_time_tol_s"]) else "outside_tolerance"
+    cross_ready = times["gvt_cross"] is not None and times["vut_cross"] is not None
+    cross_delta = times["gvt_cross"] - times["vut_cross"] if cross_ready else float("nan")
+    pet_ready = entry_ready and times["gvt_zone_exit"] is not None and times["vut_zone_exit"] is not None
+    pet, overlap, first = float("nan"), float("nan"), "pending"
     if pet_ready:
-        if float(gvt_exit) < float(vut_enter):
-            actual_pet = float(vut_enter) - float(gvt_exit)
-            actual_overlap = 0.0
-            first_actor = "gvt"
-        elif float(vut_exit) < float(gvt_enter):
-            actual_pet = float(gvt_enter) - float(vut_exit)
-            actual_overlap = 0.0
-            first_actor = "vut"
+        if times["gvt_zone_exit"] <= v_enter:
+            pet, overlap, first = v_enter - times["gvt_zone_exit"], 0.0, "gvt"
+        elif times["vut_zone_exit"] <= g_enter:
+            pet, overlap, first = g_enter - times["vut_zone_exit"], 0.0, "vut"
         else:
-            actual_pet = 0.0
-            actual_overlap = min(float(gvt_exit), float(vut_exit)) - max(float(gvt_enter), float(vut_enter))
-            first_actor = "overlap"
-
-    if not delta_ready:
-        result = "pending"
-    elif actual_abs_error <= float(CFG["success_time_tol_s"]):
-        result = "within_tolerance"
-    else:
-        result = "outside_tolerance"
-
-    return {
-        "actual_delta_t_ready": bool(delta_ready),
-        "actual_pet_ready": bool(pet_ready),
-        "actual_result_ready": bool(delta_ready and pet_ready),
-        "actual_delta_t_s": float(actual_delta),
-        "actual_delta_t_error_s": float(actual_error),
-        "actual_delta_t_abs_error_s": float(actual_abs_error),
-        "actual_delta_t_result": str(result),
-        "actual_pet_like_s": float(actual_pet),
-        "actual_zone_overlap_s": float(max(0.0, actual_overlap)) if np.isfinite(actual_overlap) else float("nan"),
-        "actual_zone_first_actor": str(first_actor),
-        "gvt_cross_time_s": float(gvt_cross) if gvt_cross is not None else float("nan"),
-        "vut_cross_time_s": float(vut_cross) if vut_cross is not None else float("nan"),
-        "gvt_zone_enter_time_s": float(gvt_enter) if gvt_enter is not None else float("nan"),
-        "gvt_zone_exit_time_s": float(gvt_exit) if gvt_exit is not None else float("nan"),
-        "vut_zone_enter_time_s": float(vut_enter) if vut_enter is not None else float("nan"),
-        "vut_zone_exit_time_s": float(vut_exit) if vut_exit is not None else float("nan"),
-    }
+            pet, overlap, first = 0.0, min(times["gvt_zone_exit"], times["vut_zone_exit"]) - max(g_enter, v_enter), "overlap"
+    output = {"actual_entry_delta_t_ready": entry_ready, "actual_entry_delta_t_s": delta,
+              "actual_entry_delta_t_error_s": error, "actual_entry_delta_t_result": result,
+              "actual_cross_delta_t_ready": cross_ready, "actual_cross_delta_t_s": cross_delta,
+              "actual_zone_delta_ready": entry_ready, "actual_zone_delta_t_s": delta,
+              "actual_delta_t_ready": entry_ready, "actual_delta_t_s": delta,
+              "actual_delta_t_error_s": error, "actual_delta_t_abs_error_s": abs(error),
+              "actual_delta_t_result": result, "actual_result_ready": entry_ready,
+              "actual_interaction_result_ready": pet_ready, "actual_pet_ready": pet_ready,
+              "actual_pet_like_s": pet, "actual_zone_overlap_s": overlap,
+              "actual_zone_first_actor": first,
+              "sync_result": "pending" if not entry_ready else "met" if result == "within_tolerance" else "missed"}
+    output.update({key + "_time_s": value if value is not None else float("nan") for key, value in times.items()})
+    return output
 
 
 def _signed_conflict_distance(metrics: dict[str, Any], actor: str) -> float:
-    longitudinal_key = f"{actor}_longitudinal_to_conflict_m"
-    distance_key = f"{actor}_distance_to_conflict_m"
-    longitudinal = _optional_float(metrics.get(longitudinal_key))
-    if longitudinal is not None:
-        return float(longitudinal)
-    distance = _optional_float(metrics.get(distance_key))
-    return float(distance) if distance is not None else float("nan")
+    """用锁定路线的有符号弧长观测过点，不使用车头方向投影替代。"""
+    value = _optional_float(metrics.get(f"{actor}_distance_to_conflict_m"))
+    return value if value is not None else float("nan")
 
 
 def _threshold_cross_time(
@@ -1378,45 +1106,12 @@ def _optional_float(value: Any) -> float | None:
 # ==================== Conditions and helpers ====================
 
 
-def _is_predicted_timing_aligned(metrics: dict[str, Any]) -> bool:
-    delta_error = abs(float(metrics.get("delta_t_error_s", float("inf"))))
-    return bool(delta_error <= float(CFG["success_time_tol_s"]))
-
-
 def _print_actual_conflict_result(metrics: dict[str, Any]) -> None:
-    """Print the actual crossing/PET-like result once it is observable."""
-    print(
-        "[intersection_conflict] actual_result "
-        f"conflict_type={metrics.get('conflict_type', '')} "
-        f"actual_delta_t={float(metrics.get('actual_delta_t_s', float('nan'))):.3f}s "
-        f"target={float(metrics.get('target_delta_t_s', float('nan'))):.3f}s "
-        f"error={float(metrics.get('actual_delta_t_error_s', float('nan'))):.3f}s "
-        f"actual_pet_like={float(metrics.get('actual_pet_like_s', float('nan'))):.3f}s "
-        f"zone_overlap={float(metrics.get('actual_zone_overlap_s', float('nan'))):.3f}s "
-        f"gvt_cross_time={float(metrics.get('gvt_cross_time_s', float('nan'))):.3f}s "
-        f"vut_cross_time={float(metrics.get('vut_cross_time_s', float('nan'))):.3f}s "
-        f"result={metrics.get('actual_delta_t_result', 'pending')}",
-        flush=True,
-    )
-
-
-def _print_conflict_clear_metrics(metrics: dict[str, Any]) -> None:
-    """Print once when GVT has cleared the conflict point and braking starts."""
-    print(
-        "[intersection_conflict] cleared "
-        f"conflict_type={metrics.get('conflict_type', '')} "
-        f"gvt_longitudinal_to_conflict={float(metrics.get('gvt_longitudinal_to_conflict_m', float('nan'))):.3f}m "
-        f"delta_t={float(metrics.get('delta_t_s', float('nan'))):.3f}s "
-        "switching_to=complete_brake",
-        flush=True,
-    )
-
-
-def _gvt_cleared_conflict(metrics: dict[str, Any]) -> bool:
-    clear_after = float(CFG["clear_after_conflict_m"])
-    distance = float(metrics.get("gvt_distance_to_conflict_m", float("inf")))
-    longitudinal = float(metrics.get("gvt_longitudinal_to_conflict_m", float("inf")))
-    return bool(distance <= -clear_after or longitudinal <= -clear_after)
+    """只打印入区同步判定；后续交互继续写入每帧指标。"""
+    print("[intersection_conflict] actual_entry_result "
+          f"delta_t={float(metrics.get('actual_entry_delta_t_s', float('nan'))):.3f}s "
+          f"target={float(CFG['target_delta_t_s']):.3f}s "
+          f"result={metrics.get('sync_result', 'pending')}", flush=True)
 
 
 def _route_line(vehicle: Any | None) -> ReferenceLineView | None:
@@ -1502,33 +1197,6 @@ def _select_route_aligned_local_line(context: SceneContext) -> tuple[ReferenceLi
         "route_desired_path_index": int(desired_path_index),
         "selected_local_lane_sequence": _normalize_lane_sequence(selected_line.lane_sequence),
     }
-
-
-def _solve_local_output_plan_t(
-    *,
-    distance_m: float,
-    current_v: float,
-    target_v: float,
-    limits: VehicleLimits,
-) -> float:
-    """Derive a local trajectory horizon that is consistent with a near terminal point."""
-
-    distance = max(0.0, float(distance_m))
-    start_v = max(0.0, float(current_v))
-    end_v = max(0.0, float(target_v))
-    average_v = max(0.5 * (start_v + end_v), float(CFG["speed_floor_mps"]))
-    distance_time = distance / average_v
-
-    if end_v >= start_v:
-        accel_time = (end_v - start_v) / max(float(limits.max_acc), 1e-3)
-    else:
-        accel_time = (start_v - end_v) / max(abs(float(limits.min_acc)), 1e-3)
-
-    return _clamp(
-        max(distance_time, accel_time, float(CFG["local_output_plan_t_min_s"])),
-        float(CFG["local_output_plan_t_min_s"]),
-        float(CFG["local_output_plan_t_max_s"]),
-    )
 
 
 def _normalize_lane_sequence(lane_sequence: list[str] | tuple[str, ...] | None) -> list[str]:

@@ -1,8 +1,7 @@
-"""离线多车场景算法实例隔离。
+"""场景算法共享加载器与临时环境隔离。
 
-实车和虚拟域控中，每辆算法车由独立进程运行，模块全局变量
-天然隔离。只有单进程多车离线仿真需要为每辆车创建独立的
-场景算法模块，避免共享 ``CFG`` 和 ``SCENE_MEMORY``。
+离线多车仿真和其他场景调用方共用此模块。为每个实例创建独立算法模块，
+避免共享 ``CFG`` 和 ``SCENE_MEMORY``；本模块不依赖仿真器、报告或测试入口。
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ _INSTANCE_COUNTER = itertools.count()
 
 @contextmanager
 def scoped_scene_environment(environment: dict[str, Any]):
-    """在单辆离线算法车的初始化或规划期间隔离场景参数。"""
+    """在单个算法实例的初始化或执行期间隔离场景参数。"""
 
     overrides = {str(key): str(value) for key, value in environment.items()}
     isolated_keys = {
@@ -47,7 +46,7 @@ def load_isolated_scene_algorithm(
     instance_key: str,
     environment: dict[str, Any],
 ):
-    """从场景源文件加载一个仅属于指定离线车辆的算法实例。"""
+    """从场景源文件加载一个仅属于指定调用方的算法实例。"""
 
     normalized = str(symbol_path or "").strip()
     if not normalized or "." not in normalized:

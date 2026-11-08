@@ -33,6 +33,7 @@ from planning_runtime.scene.types import (
     SceneRouteIntent,
     SceneVehicleState,
 )
+from planning_runtime.scene.relative_geometry import relative_lane_coordinates
 from traj_planner.config import VehicleState
 from traj_planner.tools import calculate_path_cumulative_distance, get_path_point_at_s, project_point_to_path
 from traj_planner.types import ExternalTarget, PlanningInput
@@ -617,10 +618,12 @@ class SceneTargetProvider:
             line_index=-1,
             cache=self._ensure_main_route_cache(),
         )
-        # 主车相对自车的 s / d 关系统一投影到自车当前主参考线上。
-        _, main_s_on_ego, main_d_on_ego = project_point_to_path(
+        # 车辆关系使用含前驱/后继的完整共同轴，不使用规划用前向裁切线。
+        # 两车在同一轴上重新投影，避免后车被夹到s=0并把后向距离算入d。
+        relative_s, relative_d = relative_lane_coordinates(
+            self.parser, ego_vehicle,
             np.array([main_actor.x, main_actor.y], dtype=float),
-            ego_vehicle.current_ref_line.line,
+            planning_frame.planned_path, self.max_lane_segments,
         )
         return SceneVehicleState(
             role="main",
@@ -638,8 +641,8 @@ class SceneTargetProvider:
             candidate_ref_lines=main_views,
             relative_x_to_ego=float(main_actor.x - ego_vehicle.x),
             relative_y_to_ego=float(main_actor.y - ego_vehicle.y),
-            relative_s_to_ego=float(main_s_on_ego - ego_vehicle.current_ref_line.current_s),
-            relative_d_to_ego=float(main_d_on_ego),
+            relative_s_to_ego=float(relative_s),
+            relative_d_to_ego=float(relative_d),
             lane_s=float(main_lane_s),
             lane_d=float(main_lane_d),
             lane_heading=float(main_lane_heading),

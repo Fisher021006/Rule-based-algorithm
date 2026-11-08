@@ -27,6 +27,7 @@ from traj_planner.behavior import decide_behavior, update_behavior_memory
 from traj_planner.context import build_planning_context
 from traj_planner.evaluator import evaluate_candidates
 from traj_planner.generator import (
+    TIME_PARAM_DT,
     apply_time_param_to_candidate,
     build_candidate_smooth_path,
 )
@@ -106,6 +107,24 @@ class LocalPlanner:
         }
         self.last_module_timing_ms = normalized
         self.attribute["module_timing_ms"] = dict(normalized)
+
+    @staticmethod
+    def _external_dynamics_valid(context, trajectory: np.ndarray | None) -> bool:
+        """检查外部目标最终轨迹，防止优化回退把越限轨迹当作可行结果。"""
+        if trajectory is None or len(trajectory) == 0 or not np.all(np.isfinite(trajectory)):
+            return False
+        limits = context.config["constrain"]
+        speed, acceleration = trajectory[:, 3], trajectory[:, 4]
+        tolerance = 0.01
+        finite_acc = np.diff(speed)/TIME_PARAM_DT
+        return bool(np.min(speed) >= -tolerance
+                    and abs(float(speed[0])-float(context.ego_state.v)) <= tolerance
+                    and np.max(speed) <= float(limits["max_v"])+tolerance
+                    and np.min(acceleration) >= float(limits["min_acc"])-tolerance
+                    and np.max(acceleration) <= float(limits["max_acc"])+tolerance
+                    and (len(finite_acc) == 0 or (
+                        np.min(finite_acc) >= float(limits["min_acc"])-tolerance
+                        and np.max(finite_acc) <= float(limits["max_acc"])+tolerance)))
 
     def plan(self, planning_input: PlanningInput):
         """执行一次完整的局部规划周期。
@@ -255,7 +274,9 @@ class LocalPlanner:
             candidate,
             method="osqp",
         )
-        if candidate_osqp.trajectory is not None and len(candidate_osqp.trajectory) > 0:
+        enforce_limits = bool(metadata.get("enforce_external_dynamic_limits", False))
+        if (candidate_osqp.trajectory is not None and len(candidate_osqp.trajectory) > 0
+                and (not enforce_limits or self._external_dynamics_valid(context, candidate_osqp.trajectory))):
             candidate = candidate_osqp
         else:
             candidate = apply_time_param_to_candidate(
@@ -264,6 +285,11 @@ class LocalPlanner:
                 method="quintic",
             )
         timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
+        if enforce_limits and not self._external_dynamics_valid(context, candidate.trajectory):
+            self.attribute["failure_reason"] = "external_trajectory_dynamic_limit_violation"
+            timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
+            self._set_last_module_timing(timings)
+            return None
         if candidate.trajectory is None or len(candidate.trajectory) == 0:
             timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
             self._set_last_module_timing(timings)

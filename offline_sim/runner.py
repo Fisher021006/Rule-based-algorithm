@@ -208,6 +208,9 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         scene_algorithm_symbol=scene_algorithm_symbol,
     )
     provider.set_main_vehicle_ptc_id(str(getattr(args, "main_ptc_id", "main")))
+    # 与 direct_control_node.py 保持一致：把主车的起终点路线意图交给场景算法。
+    # 只有 intersection / companion 读取该字段，其余算法不受影响。
+    provider.set_main_route_points(main_start_xy, main_goal_xy)
     ego_vehicle.scene_target_provider = provider
     ego_vehicle.set_planner_mode(str(args.planner_mode))
     output_dir = Path(args.output_dir)
@@ -444,6 +447,15 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                 if provider.history
                 else ""
             )
+            latest_scene_debug = provider.history[-1].get("scene_debug", {}) if provider.history else {}
+            if (
+                latest_scene_status in {"complete", "intersection_sync_missed"}
+                and bool(latest_scene_debug.get("execution_complete", False))
+            ):
+                # 路口的入区成绩先锁定，执行结束标志在后续通行观测完成后才置位。
+                status = "scene_completed" if latest_scene_status == "complete" else latest_scene_status
+                log_status(f"[sim] intersection execution finished at step {step_label} status={status}")
+                break
             if (
                 latest_scene_status in {"complete", "complete_thw_miss"}
                 and latest_control_mode == "emergency_stop"
@@ -472,7 +484,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             "persisting partial outputs"
         )
 
+    # 记录本次实际生效的场景环境参数，便于通过原始算法入口重演。
+    scene_environment = {
+        key: value for key, value in os.environ.items() if key.startswith("ROS_SCENE_")
+    }
+
     summary = {
+        "scene_environment": scene_environment,
         "timing_frame_count": len(timing_frames),
         "avg_plan_total_ms": round(
             float(np.mean([frame["module_timing_ms"]["end_to_end_total_ms"] for frame in timing_frames])),

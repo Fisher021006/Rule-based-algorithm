@@ -27,7 +27,7 @@ from offline_sim.runner import (
     install_interrupt_handlers,
     log_status,
 )
-from offline_sim.scene_algorithm_loader import (
+from planning_runtime.scene.algorithm_loader import (
     load_isolated_scene_algorithm,
     scoped_scene_environment,
 )
@@ -47,6 +47,7 @@ DEFAULT_TERMINAL_SCENE_STATUSES = {
     "cutout_hard_metric_fail",
     "complete",
     "complete_thw_miss",
+    "intersection_sync_missed",
     "scene_completed",
     "degraded_exit",
     "fail_safe",

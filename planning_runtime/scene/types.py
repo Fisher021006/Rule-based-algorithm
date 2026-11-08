@@ -41,7 +41,11 @@ class SceneRouteIntent:
 
 @dataclass
 class SceneVehicleState:
-    """面向场景算法的车辆状态快照。"""
+    """面向场景算法的车辆状态快照。
+
+    x、y 沿用运行时的车辆几何中心约定；不是车头或后轴点。自车实车入口
+    已校正 GPS 安装偏移，外部主车坐标由上游直接提供，Provider 不另作偏移。
+    """
 
     role: str
     x: float
@@ -58,7 +62,9 @@ class SceneVehicleState:
     candidate_ref_lines: list[ReferenceLineView]
     relative_x_to_ego: float = 0.0
     relative_y_to_ego: float = 0.0
+    # 两车投影到同一条完整自车车道走廊后的弧长差；后方为负。
     relative_s_to_ego: float = 0.0
+    # 主车相对该中心线的带符号横向偏移（左正）；保留原口径，不减自车d。
     relative_d_to_ego: float = 0.0
     lane_s: float = 0.0
     lane_d: float = 0.0
