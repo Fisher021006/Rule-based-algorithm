@@ -19,6 +19,11 @@ from typing import Any
 import numpy as np
 
 from planning_runtime.frame import PlanningActorState, build_planning_actor_state
+from planning_runtime.scene.target_feasibility import (
+    DEFAULT_MAX_PLAN_T_S,
+    MIN_EXTERNAL_PLAN_T_S,
+    resolve_target,
+)
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from traj_planner.tools import calculate_path_cumulative_distance, get_path_point_at_s, normalize_angle, project_point_to_path
 
@@ -80,6 +85,8 @@ CFG: dict[str, Any] = {
     "hold_t_grid": [round(0.05 * i, 2) for i in range(0, 161)],
     "activation_hold_t_max_s": 0.3,
     "prepare_plan_t_s": 1.5,
+    # 目标不可达时允许延长规划时域的上限；正常目标不会用到。
+    "target_max_plan_t_s": _env_float("ROS_SCENE_TARGET_MAX_PLAN_T_S", DEFAULT_MAX_PLAN_T_S),
     "prepare_wait_time_buffer_s": 0.5,
     "prepare_target_extra_progress_m": 0.0,
     "prepare_timeout_s": 10.0,
@@ -134,9 +141,11 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "locked_metric_name": "",
     "locked_expected_metric": float("inf"),
     "locked_target_xy": None,
+    "locked_target_s": None,
     "locked_target_v": 0.0,
     "locked_target_a": 0.0,
     "locked_target_heading": 0.0,
+    "last_locked_output": None,
     "execute_complete_hits": 0,
     "stable_until_time_s": -1.0,
     "actual_finish_metric": None,
@@ -396,11 +405,14 @@ def _handle_active(
             scene_debug=finish_metric["debug"],
         ), memory
 
+    final_debug = copy.deepcopy(memory.get("last_debug") or {})
+    if isinstance(active_output.get("scene_debug"), dict):
+        final_debug.update(active_output["scene_debug"])
     return _annotate_output(
         active_output,
         scene_status="active_cutout",
         scene_detail="active_locked_execute",
-        scene_debug=copy.deepcopy(memory.get("last_debug")),
+        scene_debug=final_debug,
     ), memory
 
 
@@ -495,6 +507,7 @@ def _enter_active_mode(
     memory["locked_metric_name"] = str(trigger["metric_name"])
     memory["locked_expected_metric"] = float(trigger["metric_value"])
     memory["locked_target_xy"] = [float(active_solution["x"]), float(active_solution["y"])]
+    memory["locked_target_s"] = float(active_solution.get("target_s", 0.0))
     memory["locked_target_v"] = float(active_solution["v"])
     memory["locked_target_a"] = float(active_solution["a"])
     memory["locked_target_heading"] = float(active_solution["theta"])
@@ -540,9 +553,11 @@ def _reset_execute_memory(memory: dict[str, Any]) -> None:
     memory["locked_metric_name"] = ""
     memory["locked_expected_metric"] = float("inf")
     memory["locked_target_xy"] = None
+    memory["locked_target_s"] = None
     memory["locked_target_v"] = 0.0
     memory["locked_target_a"] = 0.0
     memory["locked_target_heading"] = 0.0
+    memory["last_locked_output"] = None
     memory["execute_complete_hits"] = 0
     memory["stable_until_time_s"] = -1.0
     memory["actual_finish_metric"] = None
@@ -1531,7 +1546,7 @@ def _build_prepare_step_output(
     debug["prepare_target_v_mps"] = float(target_v)
     debug["prepare_target_a_mps2"] = float(target_a)
 
-    return _build_line_target_output(
+    output = _build_line_target_output(
         context=context,
         line=context.ego_vehicle.current_ref_line,
         target_v=target_v,
@@ -1542,6 +1557,13 @@ def _build_prepare_step_output(
         scene_status=scene_status,
         scene_debug=debug,
     )
+    # 公共 helper 可能裁剪末速度或延长时间域，回填实际下发值。
+    output_debug = output.get("scene_debug")
+    if isinstance(output_debug, dict):
+        output_debug["prepare_target_v_mps"] = float(output["v"])
+        output_debug["prepare_target_a_mps2"] = float(output["a"])
+        output_debug["prepare_plan_t_s"] = float(output["t"])
+    return output
 
 
 def _build_active_solution(
@@ -1561,13 +1583,27 @@ def _build_active_solution(
     if abs(float(ego_d_on_target)) > float(CFG["max_ego_to_target_line_d_m"]):
         return None
 
-    target_v = _scene_cruise_target_v(context, limits)
+    requested_v = _scene_cruise_target_v(context, limits)
+    resolution = resolve_target(
+        v_start=float(ego.v),
+        v_end=float(requested_v),
+        plan_t=float(plan_t),
+        a_min=float(limits.min_acc),
+        a_max=float(limits.max_acc),
+        v_max=float(limits.max_v),
+        dt=float(context.dt),
+        min_progress=float(CFG["min_target_progress_m"]),
+        extra_progress=0.0,
+        max_plan_t=max(float(CFG["target_max_plan_t_s"]), float(plan_t)),
+    )
+    target_v = float(resolution.v_end)
+    plan_t = float(resolution.plan_t)
+    travel_s = float(resolution.travel_s)
     target_a = _clamp((target_v - float(ego.v)) / max(plan_t, 1e-3), limits.min_acc, limits.max_acc)
-    travel_s = max(float(CFG["min_target_progress_m"]), 0.5 * (float(ego.v) + target_v) * plan_t)
     target_s = float(ego_s_on_target) + float(travel_s)
     target_s = _clamp(
         target_s,
-        float(ego_s_on_target) + float(CFG["min_target_progress_m"]),
+        float(ego_s_on_target) + min(float(CFG["min_target_progress_m"]), float(travel_s)),
         float(target_line.cumulative_s[-1]) - float(CFG["post_cutout_buffer_m"]),
     )
     if target_s <= float(ego_s_on_target) + 1e-6:
@@ -1584,10 +1620,12 @@ def _build_active_solution(
             "t": float(plan_t),
             "target_line_index": int(target_line.line_index),
             "hold_t": 0.0,
+            "target_s": float(target_s),
             "reason": "cutout_active_dry_run",
         }
 
     solution_debug = copy.deepcopy(debug)
+    solution_debug.update(resolution.diagnostics)
     solution_debug.update(
         {
             "active_target_s": float(target_s),
@@ -1607,6 +1645,7 @@ def _build_active_solution(
         "t": float(plan_t),
         "target_line_index": int(target_line.line_index),
         "hold_t": 0.0,
+        "target_s": float(target_s),
         "reason": "cutout_active_locked",
         "scene_debug": solution_debug,
     }
@@ -1618,31 +1657,111 @@ def _build_locked_active_output(
     target_line: ReferenceLineView,
     now: float,
 ) -> dict[str, Any] | None:
-    """ACTIVE 阶段复用锁定终端点，按剩余时间推进。"""
+    """ACTIVE 阶段复用锁定终端点，按剩余时间推进。
+
+    锁定点固定后，剩余距离随自车前进不断缩短。原来把剩余时间硬撑到
+    0.5s、并强制保留 3m 前进量，会让 ``(距离, 时间, 末速度)`` 在末段变得
+    不可行。这里按真实剩余距离做可行性校验，必要时延长时域；确实凑不出
+    精确距离时退化为沿目标车道的前视目标，而不是返回 None 触发冷却。
+    """
 
     target_xy = memory.get("locked_target_xy")
     if target_xy is None:
         return None
 
-    _, target_s, _ = project_point_to_path(np.asarray(target_xy, dtype=float), target_line.line)
-    target_s = max(float(target_s), float(target_line.current_s) + float(CFG["min_target_progress_m"]))
-    target_s = min(float(target_s), float(target_line.cumulative_s[-1]) - 0.5)
-    if target_s <= float(target_line.current_s) + 1e-6:
-        return None
+    limits = _read_vehicle_limits(context, exposed_actor=None)
+    # 目标点最终会落在锁定目标车道上，规划器也按该车道重投影。用自车当前
+    # 参考线量距离会受车道段截断影响（末段只剩几米时必然不可行）。
+    ego_xy = np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float)
+    _, ego_s_target, _ = project_point_to_path(ego_xy, target_line.line)
+    _, projected_s, _ = project_point_to_path(np.asarray(target_xy, dtype=float), target_line.line)
+    target_s = min(float(projected_s), float(target_line.cumulative_s[-1]) - 0.5)
 
-    target_xy_projected, target_heading = get_path_point_at_s(target_line.line, target_s, target_line.cumulative_s)
-    remaining_t = max(0.5, float(memory["active_end_time_s"]) - float(now))
-    return {
-        "x": float(target_xy_projected[0]),
-        "y": float(target_xy_projected[1]),
-        "v": float(memory.get("locked_target_v", 0.0)),
-        "a": float(memory.get("locked_target_a", 0.0)),
-        "theta": float(target_heading),
-        "t": float(remaining_t),
-        "target_line_index": int(target_line.line_index),
-        "hold_t": 0.0,
-        "reason": "cutout_active_locked",
-    }
+    # 与规划器一致：路径从参考线原点或自车投影中更靠后的位置起算。
+    travel_s = float(target_s) - max(float(ego_s_target), 0.0)
+    remaining_t = max(float(context.dt), float(memory["active_end_time_s"]) - float(now))
+    locked_v = float(memory.get("locked_target_v", 0.0))
+
+    def fallback(reason_detail: str) -> dict[str, Any]:
+        """锁定点不可用时，沿锁定目标车道给一个自洽的前视目标。"""
+
+        fallback_debug = copy.deepcopy(memory.get("last_debug") or {})
+        fallback_debug["active_locked_fallback"] = str(reason_detail)
+        fallback_debug["active_locked_travel_s_m"] = float(travel_s)
+        fallback_debug["active_locked_remaining_t_s"] = float(remaining_t)
+        output = _build_line_target_output(
+            context=context,
+            line=target_line,
+            target_v=locked_v,
+            target_a=0.0,
+            plan_t=remaining_t,
+            reason="cutout_active_locked_fallback",
+            scene_status="active_cutout",
+            scene_detail=str(reason_detail),
+            scene_debug=fallback_debug,
+            extra_progress_m=0.0,
+        )
+        memory["last_locked_output"] = copy.deepcopy(output)
+        return output
+
+    if travel_s <= 1e-6:
+        # 已经越过锁定点：继续沿目标车道巡航，等待完成判定。
+        return fallback("active_locked_passed")
+
+    resolution = resolve_target(
+        v_start=float(context.ego_vehicle.v),
+        v_end=locked_v,
+        plan_t=remaining_t,
+        a_min=float(limits.min_acc),
+        a_max=float(limits.max_acc),
+        v_max=float(limits.max_v),
+        dt=float(context.dt),
+        fixed_travel_s=travel_s,
+        max_plan_t=float(CFG["target_max_plan_t_s"]),
+        # provider 会把 plan_T 抬到 MIN_EXTERNAL_PLAN_T_S，这里必须同口径。
+        min_plan_t=MIN_EXTERNAL_PLAN_T_S,
+    )
+    if not resolution.feasible:
+        return fallback("active_locked_target_unreachable")
+
+    target_xy_projected, target_heading = get_path_point_at_s(
+        target_line.line, target_s, target_line.cumulative_s
+    )
+    resolved_v = float(resolution.v_end)
+    resolved_t = float(resolution.plan_t)
+    debug = copy.deepcopy(memory.get("last_debug") or {})
+    debug.update(resolution.diagnostics)
+    debug.update(
+        {
+            "active_locked_travel_s_m": float(travel_s),
+            "active_locked_remaining_t_s": float(remaining_t),
+            "active_locked_v_mps": float(resolved_v),
+            "active_locked_t_s": float(resolved_t),
+        }
+    )
+    output = _annotate_output(
+        {
+            "x": float(target_xy_projected[0]),
+            "y": float(target_xy_projected[1]),
+            "v": float(resolved_v),
+            "a": _clamp(
+                (resolved_v - float(context.ego_vehicle.v)) / max(resolved_t, 1e-3),
+                limits.min_acc,
+                limits.max_acc,
+            ),
+            "theta": float(target_heading),
+            "t": float(resolved_t),
+            "target_line_index": int(target_line.line_index),
+            "hold_t": 0.0,
+            "target_s": float(target_s),
+            "reason": "cutout_active_locked",
+        },
+        "active_cutout",
+        "cutout_active_locked",
+        debug,
+    )
+    memory["last_locked_output"] = copy.deepcopy(output)
+    return output
 
 
 def _build_stabilize_output(
@@ -1731,7 +1850,7 @@ def _build_cutout_safe_keep_lane_output(
             "safe_keep_lane_reason": "follow_exposed",
         }
     )
-    return _build_line_target_output(
+    output = _build_line_target_output(
         context=context,
         line=context.ego_vehicle.current_ref_line,
         target_v=target_v,
@@ -1743,6 +1862,11 @@ def _build_cutout_safe_keep_lane_output(
         scene_detail=scene_detail,
         scene_debug=debug,
     )
+    output_debug = output.get("scene_debug")
+    if isinstance(output_debug, dict):
+        output_debug["safe_keep_lane_target_v_mps"] = float(output["v"])
+        output_debug["safe_keep_lane_target_a_mps2"] = float(output["a"])
+    return output
 
 
 def _build_keep_lane_output(
@@ -1782,27 +1906,113 @@ def _build_line_target_output(
     scene_debug: dict[str, Any] | None = None,
     extra_progress_m: float = 2.0,
 ) -> dict[str, Any]:
-    """在指定参考线上构造场景算法终端目标。"""
+    """在指定参考线上构造场景算法终端目标。
 
-    travel_s = max(float(CFG["min_target_progress_m"]), float(target_v) * float(plan_t) + float(extra_progress_m))
-    target_s = _clamp(
-        float(line.current_s) + float(travel_s),
-        float(line.current_s) + float(CFG["min_target_progress_m"]),
-        float(line.cumulative_s[-1]) - 0.5,
+    距离按 ``(v0 + vT) / 2 * T`` 计算，并交给公共 helper 处理终点速度不可达
+    和最小前进量不足的情况；不能再用 ``vT * T``，否则减速目标会低估刹车
+    距离、加速目标会高估可达距离，最终让规划器报 infeasible。
+    """
+
+    limits = _read_vehicle_limits(context, exposed_actor=None)
+    resolution = resolve_target(
+        v_start=float(context.ego_vehicle.v),
+        v_end=float(target_v),
+        plan_t=float(plan_t),
+        a_min=float(limits.min_acc),
+        a_max=float(limits.max_acc),
+        v_max=float(limits.max_v),
+        dt=float(context.dt),
+        min_progress=float(CFG["min_target_progress_m"]),
+        extra_progress=float(extra_progress_m),
+        max_plan_t=float(CFG["target_max_plan_t_s"]),
     )
+    resolved_v = float(resolution.v_end)
+    resolved_t = float(resolution.plan_t)
+    travel_s = float(resolution.travel_s)
+
+    # 规划器截取同线路径时会把起点裁到参考线原点（``max(current_s, 0)``），
+    # 场景侧量剩余距离必须同口径，否则参考线起点在自车后方时会多算一段。
+    origin_s = max(float(line.current_s), 0.0)
+    max_target_s = float(line.cumulative_s[-1]) - 0.5
+    available_s = max(0.0, max_target_s - origin_s)
+    if travel_s > available_s + 1e-6:
+        # 参考线剩余长度不够：保持终端点不动，反解该距离下可行的时域/末速度。
+        limited = resolve_target(
+            v_start=float(context.ego_vehicle.v),
+            v_end=resolved_v,
+            plan_t=resolved_t,
+            a_min=float(limits.min_acc),
+            a_max=float(limits.max_acc),
+            v_max=float(limits.max_v),
+            dt=float(context.dt),
+            fixed_travel_s=available_s,
+            max_plan_t=float(CFG["target_max_plan_t_s"]),
+            # 必须与 provider 的 plan_T 下限一致，否则场景内可行的 T 会被抬到
+            # 0.5s 后重新变得不可行。
+            min_plan_t=MIN_EXTERNAL_PLAN_T_S,
+        )
+        if limited.feasible:
+            resolution = limited
+            resolved_v = float(limited.v_end)
+            resolved_t = float(limited.plan_t)
+            travel_s = float(limited.travel_s)
+
+    target_s = _clamp(
+        origin_s + float(travel_s),
+        origin_s + min(float(CFG["min_target_progress_m"]), float(travel_s)),
+        max_target_s,
+    )
+    actual_travel_s = float(target_s) - origin_s
+    if abs(actual_travel_s - float(travel_s)) > 1e-6:
+        # 夹取改变了实际距离时，必须按真实距离重新解析；否则场景校验过的
+        # ``(L, T, vT)`` 会和规划器实际走的几何长度不一致。
+        limited = resolve_target(
+            v_start=float(context.ego_vehicle.v),
+            v_end=resolved_v,
+            plan_t=resolved_t,
+            a_min=float(limits.min_acc),
+            a_max=float(limits.max_acc),
+            v_max=float(limits.max_v),
+            dt=float(context.dt),
+            fixed_travel_s=actual_travel_s,
+            max_plan_t=float(CFG["target_max_plan_t_s"]),
+            min_plan_t=MIN_EXTERNAL_PLAN_T_S,
+        )
+        if limited.feasible:
+            resolution = limited
+            resolved_v = float(limited.v_end)
+            resolved_t = float(limited.plan_t)
+            travel_s = float(limited.travel_s)
     target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
+    resolved_a = _clamp(
+        (resolved_v - float(context.ego_vehicle.v)) / max(resolved_t, 1e-3),
+        limits.min_acc,
+        limits.max_acc,
+    )
+    debug = copy.deepcopy(scene_debug or {})
+    debug.update(resolution.diagnostics)
+    debug.update(
+        {
+            "line_target_requested_v_mps": float(target_v),
+            "line_target_requested_a_mps2": float(target_a),
+            "line_target_resolved_v_mps": float(resolved_v),
+            "line_target_resolved_a_mps2": float(resolved_a),
+            "line_target_travel_s_m": float(travel_s),
+            "line_target_s_m": float(target_s),
+        }
+    )
     output = {
         "x": float(target_xy[0]),
         "y": float(target_xy[1]),
-        "v": float(target_v),
-        "a": float(target_a),
+        "v": float(resolved_v),
+        "a": float(resolved_a),
         "theta": float(target_heading),
-        "t": float(plan_t),
+        "t": float(resolved_t),
         "target_line_index": int(line.line_index),
         "hold_t": 0.0,
         "reason": str(reason),
     }
-    return _annotate_output(output, scene_status, scene_detail or reason, scene_debug)
+    return _annotate_output(output, scene_status, scene_detail or reason, debug)
 
 
 def _compute_prepare_target_v(

@@ -80,7 +80,7 @@ class GVT:
                 "target_v": target_max_v,
                 "min_acc": -sportParams.get("minAcc", 2.0),
                 "max_acc": sportParams.get("maxAcc", 3.0),
-                "max_jerk": 2.5,
+                "max_jerk": float("inf"),  # 默认不限制；设置有限值即可启用 jerk 硬约束
                 "overspeed_eps": 0.05,
                 "max_acc_h": 3.0,
                 "max_kappa": 0.3,
@@ -298,8 +298,21 @@ class GVT:
                 )
 
                 if is_emergency_stop_input(planning_input):
+                    self.traj_planner.invalidate_external_trajectory()
+                    self.traj_planner._reset_generator_diagnostics()
                     stop_start = time.perf_counter()
-                    trajectory = build_emergency_stop_trajectory(planning_input)
+                    stop_diagnostics = {}
+                    trajectory = build_emergency_stop_trajectory(planning_input, diagnostics=stop_diagnostics)
+                    external_target = planning_input.external_target
+                    metadata = getattr(external_target, "metadata", {}) or {}
+                    stop_dt = max(float(planning_input.config.get("local_fsm", {}).get("planner_cycle_dt", 0.1)), 1e-3)
+                    dynamic_rejected = trajectory is not None and not self.traj_planner._external_dynamics_valid(planning_input, trajectory, dt=stop_dt)
+                    if dynamic_rejected:
+                        trajectory = None
+                    stop_failure_reason = str(stop_diagnostics.get("failure_reason", "")) or (
+                        "emergency_stop_dynamic_limit_violation" if dynamic_rejected
+                        else ("" if trajectory is not None else "emergency_stop_failed")
+                    )
                     elapsed_ms = (time.perf_counter() - stop_start) * 1000.0
                     timings = {
                         "context_ms": 0.0,
@@ -316,13 +329,21 @@ class GVT:
                     self.traj_planner.attribute.update(
                         {
                             "plan_mode": "emergency_stop",
+                            "time_param_method": "emergency_stop" if trajectory is not None else "",
+                            "external_dynamic_limits_enforced": True,
+                            "trajectory_generation_attempts": [{
+                                "method": "emergency_stop", "accepted": trajectory is not None,
+                                "wall_ms": elapsed_ms,
+                                "failure_reason": stop_failure_reason,
+                                "diagnostics": stop_diagnostics,
+                            }],
                             "candidate_count": 1,
                             "feasible_candidate_count": 0 if trajectory is None else 1,
                             "target_point": None if trajectory is None else np.asarray(trajectory[-1, :2], dtype=float).tolist(),
                             "selected_line_id": "",
                             "selected_template": "emergency_stop",
                             "selected_score": None,
-                            "failure_reason": "" if trajectory is not None else "emergency_stop_failed",
+                            "failure_reason": stop_failure_reason,
                             "target_lane_id": "",
                             "must_change": False,
                             "deadline_margin_m": None,

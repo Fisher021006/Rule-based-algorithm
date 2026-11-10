@@ -297,6 +297,10 @@ class TerminalCandidate:
     plan_T: float
     hold_t: float
     template_name: str
+    # Optional world endpoint for explicitly requested within-lane offset keeping.
+    # Ordinary sampling and external-target modes continue to use target_s on centreline.
+    target_xy_override: Optional[np.ndarray] = None
+    target_path_length: Optional[float] = None
 
 
 @dataclass

@@ -299,6 +299,8 @@ class LiveSimulationViewer:
     ) -> None:
         """渲染当前最新规划结果。"""
 
+        if self.output_png is None and not self.window_available:
+            return
         if not force and step_index >= 0 and (step_index + 1) % self.refresh_every != 0:
             return
 

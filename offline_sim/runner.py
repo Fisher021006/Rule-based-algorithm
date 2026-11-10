@@ -238,6 +238,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     obstacle_input_history: list[dict[str, Any]] = []
     status = "running"
     failure_reason = ""
+    failed_planning_frame = None
     viewer.update(
         ego_trace=ego_trace,
         main_trace=main_trace,
@@ -279,11 +280,12 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
             trajectory = ego_vehicle.traj_planning(planner_obstacles)
             if trajectory is None:
                 failure_reason = str(ego_vehicle.traj_planner.attribute.get("failure_reason", ""))
-                status = (
-                    str(ego_vehicle.traj_planner.attribute.get("plan_mode", "planner_failed"))
-                    if args.planner_mode == "scene_target"
-                    else "local_sampling_failed"
-                )
+                status = "planner_failed" if args.planner_mode == "scene_target" else "local_sampling_failed"
+                failed_planning_frame = {
+                    "step_index": step_index, "time_s": time_s,
+                    "failure_reason": failure_reason,
+                    "planner_attr": dict(ego_vehicle.traj_planner.attribute),
+                }
                 log_status(
                     f"[sim] step {step_label} failed "
                     f"status={status} reason={failure_reason or '-'}"
@@ -428,8 +430,8 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
                 )
                 break
-            if latest_scene_status == "cutin_success":
-                status = "scene_completed"
+            if latest_scene_status in {"cutin_success", "cutin_metric_miss", "cutin_metric_unavailable"}:
+                status = "scene_completed" if latest_scene_status == "cutin_success" else latest_scene_status
                 log_status(
                     f"[sim] cut-in scene finished at step {step_label} "
                     f"scene_status={latest_scene_status} ego_v={ego_vehicle.v:.2f}"
@@ -490,6 +492,13 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     summary = {
+        "failed_planning_frame": failed_planning_frame,
+        "vehicle_limits": {
+            key: float(value) if np.isfinite(float(value)) else None
+            for key, value in ego_vehicle.config["constrain"].items()
+        },
+        "vehicle_size": dict(ego_vehicle.config["size"]),
+        "simulation_dt_s": float(args.dt),
         "scene_environment": scene_environment,
         "timing_frame_count": len(timing_frames),
         "avg_plan_total_ms": round(

@@ -42,6 +42,8 @@ ROUTE_MOTIONS = {"idm", "constant", "static", "scripted_lane_change"}
 DEFAULT_TERMINAL_SCENE_STATUSES = {
     "brake_completed_stop",
     "cutin_success",
+    "cutin_metric_miss",
+    "cutin_metric_unavailable",
     "cutout_success",
     "cutout_metric_miss",
     "cutout_hard_metric_fail",

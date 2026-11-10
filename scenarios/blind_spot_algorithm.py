@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from planning_runtime.scene.target_feasibility import DEFAULT_MAX_PLAN_T_S, resolve_target
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
 
@@ -46,6 +47,8 @@ SCENE_CONFIG: dict[str, Any] = {
     "completion_target_thw_s": 3.0,
     "completion_thw_tol_s": 0.2,
     "completion_min_net_gap_m": 1.0,
+    # 目标不可达时允许延长规划时域的上限；正常目标不会用到。
+    "target_max_plan_t_s": DEFAULT_MAX_PLAN_T_S,
 }
 
 
@@ -745,6 +748,8 @@ def _build_invalid_scene_output(
         scene_status="invalid_scene_geometry",
         scene_detail="blind_spot_scene_geometry_invalid",
         scene_debug=debug,
+        # 停车目标不能强制 2m 前进量，否则 v=0 时距离与速度自相矛盾。
+        min_progress=0.0,
     )
     output["scene_error"] = True
     output["control_mode"] = "scene_invalid"
@@ -856,21 +861,48 @@ def _build_precise_completion_output(
 ) -> dict[str, Any]:
     """按反解出的换道完成终端 ``s/v/t`` 构造外部目标。"""
     line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
+    limits = _read_vehicle_limits(context)
+    requested_s = float(precise_target["target_s_m"])
     target_s = _clamp(
-        float(precise_target["target_s_m"]),
+        requested_s,
         float(line.current_s) + float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
         float(line.cumulative_s[-1]) - 0.5,
     )
-    target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
+    resolved_v = float(precise_target["target_v_mps"])
+    resolved_t = float(precise_target["plan_t_s"])
     debug = copy.deepcopy(metrics)
     debug.update(copy.deepcopy(precise_target))
+    requested_travel = requested_s - float(line.current_s)
+    actual_travel = target_s - float(line.current_s)
+    if abs(actual_travel - requested_travel) > 1e-6 and actual_travel > 0.0:
+        # 终端点被几何边界截断，按实际距离反解可行的时域/末速度。
+        resolution = resolve_target(
+            v_start=float(context.ego_vehicle.v),
+            v_end=resolved_v,
+            plan_t=resolved_t,
+            a_min=float(limits.min_acc),
+            a_max=float(limits.max_acc),
+            v_max=float(limits.max_v),
+            dt=float(context.dt),
+            fixed_travel_s=float(actual_travel),
+            max_plan_t=float(SCENE_CONFIG["target_max_plan_t_s"]),
+            min_plan_t=float(context.dt),
+        )
+        debug.update(resolution.diagnostics)
+        debug["precise_target_requested_s_m"] = float(requested_s)
+        debug["precise_target_actual_s_m"] = float(target_s)
+        if resolution.feasible:
+            resolved_v = float(resolution.v_end)
+            resolved_t = float(resolution.plan_t)
+
+    target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
     output = {
         "x": float(target_xy[0]),
         "y": float(target_xy[1]),
-        "v": float(precise_target["target_v_mps"]),
+        "v": float(resolved_v),
         "a": 0.0,
         "theta": float(target_heading),
-        "t": float(precise_target["plan_t_s"]),
+        "t": float(resolved_t),
         "target_line_index": int(line.line_index),
         "hold_t": 0.0,
         "reason": str(reason),
@@ -1009,7 +1041,7 @@ def _build_rel_s_control_output(
     )
     if extra_debug is not None:
         debug.update(copy.deepcopy(extra_debug))
-    return _build_line_target_output(
+    output = _build_line_target_output(
         context=context,
         target_line=target_line if target_line is not None else context.ego_vehicle.current_ref_line,
         target_v=target_v,
@@ -1019,6 +1051,13 @@ def _build_rel_s_control_output(
         scene_status=scene_status,
         scene_debug=debug,
     )
+    # 公共 helper 可能裁剪末速度或延长时间域，回填实际下发值。
+    output_debug = output.get("scene_debug")
+    if isinstance(output_debug, dict):
+        output_debug["control_target_v_mps"] = float(output["v"])
+        output_debug["control_target_a_mps2"] = float(output["a"])
+        output_debug["control_plan_t_s"] = float(output["t"])
+    return output
 
 
 def _build_line_target_output(
@@ -1032,28 +1071,88 @@ def _build_line_target_output(
     scene_status: str,
     scene_detail: str | None = None,
     scene_debug: dict[str, Any] | None = None,
+    min_progress: float = 2.0,
 ) -> dict[str, Any]:
-    """在指定参考线上构造可被 ``ExternalTarget`` 消费的终端目标。"""
-    min_progress = float(2.0)
-    travel_s = max(min_progress, float(target_v) * float(plan_t))
+    """在指定参考线上构造可被 ``ExternalTarget`` 消费的终端目标。
+
+    距离按 ``(v0 + vT) / 2 * T`` 计算。原实现用 ``vT * T``，在自车起步加速
+    时会高估可达距离（例如 0→5 m/s、T=1.5s 会要求 7.497m，实际最多
+    3.375m），导致时间参数化 QP 无解。终点速度不可达时由公共 helper 延长
+    时域或裁剪，并保证 ``(L, T, vT)`` 自洽。
+    """
+
+    limits = _read_vehicle_limits(context)
+    resolution = resolve_target(
+        v_start=float(context.ego_vehicle.v),
+        v_end=float(target_v),
+        plan_t=float(plan_t),
+        a_min=float(limits.min_acc),
+        a_max=float(limits.max_acc),
+        v_max=float(limits.max_v),
+        dt=float(context.dt),
+        min_progress=float(min_progress),
+        max_plan_t=float(SCENE_CONFIG["target_max_plan_t_s"]),
+    )
+    resolved_v = float(resolution.v_end)
+    resolved_t = float(resolution.plan_t)
+    travel_s = float(resolution.travel_s)
+
+    max_target_s = float(target_line.cumulative_s[-1]) - 0.5
+    available_s = max(0.0, max_target_s - float(target_line.current_s))
+    if travel_s > available_s + 1e-6:
+        limited = resolve_target(
+            v_start=float(context.ego_vehicle.v),
+            v_end=resolved_v,
+            plan_t=resolved_t,
+            a_min=float(limits.min_acc),
+            a_max=float(limits.max_acc),
+            v_max=float(limits.max_v),
+            dt=float(context.dt),
+            fixed_travel_s=available_s,
+            max_plan_t=float(SCENE_CONFIG["target_max_plan_t_s"]),
+            min_plan_t=float(context.dt),
+        )
+        if limited.feasible:
+            resolution = limited
+            resolved_v = float(limited.v_end)
+            resolved_t = float(limited.plan_t)
+            travel_s = float(limited.travel_s)
+
     target_s = _clamp(
-        float(target_line.current_s) + travel_s,
-        float(target_line.current_s) + min_progress,
-        float(target_line.cumulative_s[-1]) - 0.5,
+        float(target_line.current_s) + float(travel_s),
+        float(target_line.current_s) + min(float(min_progress), float(travel_s)),
+        max_target_s,
     )
     target_xy, target_heading = get_path_point_at_s(target_line.line, target_s, target_line.cumulative_s)
+    resolved_a = _clamp(
+        (resolved_v - float(context.ego_vehicle.v)) / max(resolved_t, 1e-3),
+        limits.min_acc,
+        limits.max_acc,
+    )
+    debug = copy.deepcopy(scene_debug or {})
+    debug.update(resolution.diagnostics)
+    debug.update(
+        {
+            "line_target_requested_v_mps": float(target_v),
+            "line_target_requested_a_mps2": float(target_a),
+            "line_target_resolved_v_mps": float(resolved_v),
+            "line_target_resolved_a_mps2": float(resolved_a),
+            "line_target_travel_s_m": float(travel_s),
+            "line_target_s_m": float(target_s),
+        }
+    )
     output = {
         "x": float(target_xy[0]),
         "y": float(target_xy[1]),
-        "v": float(target_v),
-        "a": float(target_a),
+        "v": float(resolved_v),
+        "a": float(resolved_a),
         "theta": float(target_heading),
-        "t": float(plan_t),
+        "t": float(resolved_t),
         "target_line_index": int(target_line.line_index),
         "hold_t": 0.0,
         "reason": str(reason),
     }
-    return _annotate_output(output, scene_status, scene_detail or reason, scene_debug)
+    return _annotate_output(output, scene_status, scene_detail or reason, debug)
 
 
 # ==================== 条件判断与指标计算 ====================
@@ -1375,6 +1474,9 @@ def _get_active_completion_target(
     terminal = _solve_completion_thw_terminal(context, line, metrics, plan_t_override_s=remaining_t)
     if not bool(terminal.get("valid", False)):
         return terminal
+    if not bool(terminal.get("completion_target_feasible", False)):
+        # 反解终端在剩余时域内达不到时不能直接下发，退回 rel_s 闭环目标。
+        return {"valid": False, "reason": str(terminal.get("completion_target_infeasible_reason", "completion_target_infeasible"))}
 
     target_s = _clamp(
         float(terminal["target_s_m"]),
@@ -1383,6 +1485,24 @@ def _get_active_completion_target(
     )
     terminal["target_s_m"] = float(target_s)
     terminal["plan_t_s"] = float(remaining_t)
+    # 连续反解的距离在离散 QP 的 a_end=0 约束下不一定可行，交给公共 helper
+    # 按同一时域复核；末速度被改动说明精确终端保不住，退回 rel_s 闭环目标。
+    limits = _read_vehicle_limits(context)
+    terminal_check = resolve_target(
+        v_start=float(context.ego_vehicle.v),
+        v_end=float(terminal["target_v_mps"]),
+        plan_t=float(remaining_t),
+        a_min=float(limits.min_acc),
+        a_max=float(limits.max_acc),
+        v_max=float(limits.max_v),
+        dt=float(context.dt),
+        fixed_travel_s=float(target_s) - max(float(line.current_s), 0.0),
+        max_plan_t=float(remaining_t),
+        min_plan_t=float(remaining_t),
+    )
+    if (not terminal_check.feasible
+            or abs(terminal_check.v_end - float(terminal["target_v_mps"])) > 1e-6):
+        return {"valid": False, "reason": "completion_terminal_discrete_infeasible"}
     terminal["active_completion_target_policy"] = policy
     terminal["active_completion_deadline_s"] = float(deadline)
     terminal["active_completion_candidate_deadline_s"] = float(candidate_deadline)
@@ -1460,8 +1580,10 @@ def _solve_completion_thw_terminal(
             - float(gvt_s)
         ) / plan_t - float(gvt_v)
 
-    reachable_v_min = max(0.0, float(gvt_v) + limits.min_acc * plan_t)
-    reachable_v_max = min(limits.max_v, float(gvt_v) + limits.max_acc * plan_t)
+    # QP 末端加速度为 0，最后两个采样点速度都等于 vT，真实可用窗口是 T - dt。
+    effective_t = max(float(context.dt), float(plan_t) - float(context.dt))
+    reachable_v_min = max(0.0, float(gvt_v) + limits.min_acc * effective_t)
+    reachable_v_max = min(limits.max_v, float(gvt_v) + limits.max_acc * effective_t)
     # 这里保留反解的终端速度；实际可达性单独记录，统一由下游规划器施加约束。
     target_v = _clamp(raw_target_v, 0.0, limits.max_v)
     target_acc = (target_v - float(gvt_v)) / plan_t
@@ -1477,13 +1599,17 @@ def _solve_completion_thw_terminal(
         else 0.0
     )
     thw_error = achieved_thw - target_thw
+    acc_within_limit = bool(limits.min_acc <= target_acc <= limits.max_acc)
+    # 终端速度必须能在 T 内达到，否则精确目标交给规划器一定不可行。
+    speed_reachable = bool(reachable_v_min - 1e-6 <= target_v <= reachable_v_max + 1e-6)
     feasible = bool(
         np.isfinite(raw_target_v)
         and abs(target_v - raw_target_v) <= 1e-3
         and abs(thw_error) <= float(SCENE_CONFIG["completion_thw_tol_s"])
         and target_net_gap >= min_net_gap - 1e-3
+        and acc_within_limit
+        and speed_reachable
     )
-    acc_within_limit = bool(limits.min_acc <= target_acc <= limits.max_acc)
 
     return {
         "valid": True,
@@ -1609,7 +1735,7 @@ def _compute_blind_spot_metrics(
         <= target_line_side_offset
         <= float(5.5)
     )
-    same_direction = heading_diff <= float(20.0)
+    same_direction = heading_diff_to_target <= float(20.0)
     road_remaining = float(target_line.cumulative_s[-1]) - float(ego_s)
     road_remaining_ok = road_remaining >= float(18.0)
     rel_s_search_ok = float(-35.0) <= rel_s <= float(-1.0)

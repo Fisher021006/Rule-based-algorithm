@@ -33,6 +33,10 @@ from traj_planner.generator import (
 )
 from traj_planner.sampling import build_candidate_templates, sample_terminal_states
 from traj_planner.tools import project_point_to_path
+from traj_planner.trajectory import (
+    validate_velocity_profile, VelocityProfileError,
+    PROFILE_EQUALITY_TOLERANCE, DYNAMIC_NUMERIC_TOLERANCE,
+)
 from traj_planner.types import BehaviorMemory, BehaviorMode, CandidateTrajectory, PlanningInput, PlanningOutput, TerminalCandidate
 
 
@@ -96,6 +100,7 @@ class LocalPlanner:
         self.last_terminals = []
         self.last_best_candidate: CandidateTrajectory | None = None
         self.last_module_timing_ms: dict[str, float] = {}
+        self._frozen_external_cache = None
         self.attribute["module_timing_ms"] = {}
 
     def _set_last_module_timing(self, timings: dict[str, float]) -> None:
@@ -108,23 +113,40 @@ class LocalPlanner:
         self.last_module_timing_ms = normalized
         self.attribute["module_timing_ms"] = dict(normalized)
 
+    def _reset_generator_diagnostics(self):
+        self.attribute.update(
+            osqp_diagnostics={}, quintic_diagnostics={}, highs_diagnostics={},
+            osqp_accepted_nonconverged=False, osqp_solver_status="", highs_solver_status="",
+            osqp_failure_reason="", osqp_error_type="", fallback_failure_reason="",
+            fallback_error_type="", highs_failure_reason="", highs_error_type="",
+            trajectory_generation_attempts=[], time_param_method="", target_point=None,
+            feasible_candidate_count=0,
+            frozen_suffix_rejection_reason="",
+        )
+
+    def invalidate_external_trajectory(self):
+        """Discard frozen execution when a separate control mode takes over."""
+        self._frozen_external_cache = None
+
     @staticmethod
-    def _external_dynamics_valid(context, trajectory: np.ndarray | None) -> bool:
-        """检查外部目标最终轨迹，防止优化回退把越限轨迹当作可行结果。"""
-        if trajectory is None or len(trajectory) == 0 or not np.all(np.isfinite(trajectory)):
+    def _external_dynamics_valid(context, trajectory: np.ndarray | None, dt=TIME_PARAM_DT) -> bool:
+        """所有输出使用同一份运行限值，含点加速度、差分加速度及可选 jerk。"""
+        if trajectory is None:
+            return False
+        trajectory = np.asarray(trajectory)
+        if (trajectory.ndim != 2 or trajectory.shape[1] != 6
+                or not np.all(np.isfinite(trajectory))):
             return False
         limits = context.config["constrain"]
-        speed, acceleration = trajectory[:, 3], trajectory[:, 4]
-        tolerance = 0.01
-        finite_acc = np.diff(speed)/TIME_PARAM_DT
-        return bool(np.min(speed) >= -tolerance
-                    and abs(float(speed[0])-float(context.ego_state.v)) <= tolerance
-                    and np.max(speed) <= float(limits["max_v"])+tolerance
-                    and np.min(acceleration) >= float(limits["min_acc"])-tolerance
-                    and np.max(acceleration) <= float(limits["max_acc"])+tolerance
-                    and (len(finite_acc) == 0 or (
-                        np.min(finite_acc) >= float(limits["min_acc"])-tolerance
-                        and np.max(finite_acc) <= float(limits["max_acc"])+tolerance)))
+        try:
+            validate_velocity_profile(
+                trajectory[:, 3], float(context.ego_state.v), float(context.ego_state.a), dt,
+                float(limits.get("min_v", 0.0)), float(limits["max_v"]),
+                float(limits["min_acc"]), float(limits["max_acc"]),
+                max_jerk=limits.get("max_jerk"), acceleration=trajectory[:, 4])
+        except (VelocityProfileError, ValueError, TypeError):
+            return False
+        return True
 
     def plan(self, planning_input: PlanningInput):
         """执行一次完整的局部规划周期。
@@ -137,9 +159,11 @@ class LocalPlanner:
             如果所有候选都未通过硬约束，则返回 ``None``。
         """
 
+        self._reset_generator_diagnostics()
         planning_input.planner_memory = self.memory
         if getattr(planning_input, "external_target", None) is not None:
             return self._plan_with_external_target(planning_input)
+        self._frozen_external_cache = None
         plan_start = time.perf_counter()
         timings = {
             "context_ms": 0.0,
@@ -197,12 +221,23 @@ class LocalPlanner:
         timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
 
         evaluator_start = time.perf_counter()
-        best_candidate, candidates = evaluate_candidates(context, decision, candidates)
+        checked_candidates = []
+        for candidate in candidates:
+            if self._external_dynamics_valid(context, candidate.trajectory):
+                checked_candidates.append(candidate)
+            else:
+                candidate.feasible = False
+                candidate.failure_reason = candidate.failure_reason or "trajectory_dynamic_limit_violation"
+        best_candidate, _ = evaluate_candidates(context, decision, checked_candidates)
         timings["evaluator_ms"] = (time.perf_counter() - evaluator_start) * 1000.0
 
         refine_start = time.perf_counter()
         best_candidate, candidates = self._refine_best_candidate(context, decision, best_candidate, candidates)
         timings["refine_ms"] = (time.perf_counter() - refine_start) * 1000.0
+        if best_candidate is not None and not self._external_dynamics_valid(context, best_candidate.trajectory):
+            best_candidate.feasible = False
+            best_candidate.failure_reason = "trajectory_dynamic_limit_violation"
+            best_candidate = None
         self.memory = update_behavior_memory(context, decision, best_candidate)
 
         output = PlanningOutput(
@@ -223,6 +258,90 @@ class LocalPlanner:
         if best_candidate is None:
             return None
         return np.asarray(best_candidate.trajectory, dtype=float)
+
+    @staticmethod
+    def _frozen_external_contract(context, target):
+        """Only an explicit, time-indexed frozen request can reuse an execution path."""
+        meta = target.metadata or {}
+        if not meta.get("preserve_trajectory", False):
+            return None
+        try:
+            now = float(meta["trajectory_execution_time_s"])
+            deadline = float(meta["trajectory_deadline_s"])
+            duration = float(target.plan_T)
+            route = tuple(str(item) for item in meta["trajectory_route_lane_ids"])
+            xy = np.asarray(target.point_xy, dtype=float)
+            line = context.line_contexts[target.target_line_index]
+            line_id = line.line_id
+            heading = None if target.target_heading is None else float(target.target_heading)
+            values = [now, deadline, duration, target.target_v, target.target_a, target.hold_t, *xy]
+            if heading is not None:
+                values.append(heading)
+            if (xy.shape != (2,) or not np.isfinite(values).all() or not route
+                    or line_id not in route or duration <= 0.0 or target.hold_t != 0.0
+                    or abs(deadline - now - duration) > 1e-6
+                    or abs(duration / TIME_PARAM_DT - round(duration / TIME_PARAM_DT)) > 1e-6):
+                return None
+            key = (deadline, *xy, float(target.target_v), float(target.target_a), heading, route)
+            limit_names = ("min_v", "max_v", "min_acc", "max_acc", "max_jerk", "max_kappa", "max_acc_h")
+            limits = tuple((name, context.config["constrain"].get(name)) for name in limit_names)
+            return {"key": key, "now": now, "limits": limits,
+                    "route_sequence": tuple(line.lane_sequence), "line_id": line_id}
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+
+    def _frozen_external_suffix(self, context, terminal, contract):
+        cache = self._frozen_external_cache
+        if contract is None or cache is None:
+            self._frozen_external_cache = None
+            return None
+
+        def reject(reason):
+            self.attribute["frozen_suffix_rejection_reason"] = reason
+            self._frozen_external_cache = None
+            return None
+
+        if contract["key"] != cache["key"]:
+            return reject("request_changed")
+        if contract["limits"] != cache["limits"]:
+            return reject("limits_changed")
+        old_route, new_route = cache["route_sequence"], contract["route_sequence"]
+        occurrences = [i for i, lane in enumerate(old_route) if lane == contract["line_id"]]
+        if (len(occurrences) != 1 or not new_route or new_route[0] != contract["line_id"]):
+            return reject("route_changed")
+        known_suffix = old_route[occurrences[0]:]
+        if new_route[:len(known_suffix)] != known_suffix:
+            return reject("route_changed")
+        elapsed_steps = (contract["now"] - cache["epoch"]) / TIME_PARAM_DT
+        index = int(round(elapsed_steps))
+        trajectory = cache["trajectory"]
+        previous_index = cache["last_index"]
+        if (abs(elapsed_steps - index) > 1e-6 or index <= previous_index
+                or index >= len(trajectory) - 1
+                or abs((len(trajectory) - 1 - index) * TIME_PARAM_DT - terminal.plan_T) > 1e-6):
+            return reject("time_mismatch")
+        point = trajectory[index]
+        ego = context.ego_state
+        # Runtime feedback reports acceleration over the interval just executed;
+        # trajectory[row,4] describes the next interval, so those are not interchangeable.
+        executed_a = (point[3] - cache["last_observed_v"]) / ((index - previous_index) * TIME_PARAM_DT)
+        tol = PROFILE_EQUALITY_TOLERANCE
+        if (not np.isfinite([ego.x, ego.y, ego.heading, ego.v, ego.a]).all()
+                or np.linalg.norm(point[:2] - [ego.x, ego.y]) > tol
+                or abs(_normalize_angle(point[2] - ego.heading)) > 1e-3
+                or abs(point[3] - ego.v) > tol
+                or abs(executed_a - ego.a) > DYNAMIC_NUMERIC_TOLERANCE):
+            return reject("state_mismatch")
+        suffix = trajectory[index:].copy()
+        if not self._external_dynamics_valid(context, suffix):
+            return reject("dynamic_limits")
+        cache.update(last_index=index, last_observed_v=float(ego.v))
+        return CandidateTrajectory(
+            terminal=terminal, trajectory=suffix, smooth_path=suffix[:, :3].copy(), feasible=True,
+            metrics={"time_param_method": "frozen_suffix", "constraint_check_passed": True,
+                     "frozen_source_method": cache["method"], "frozen_source_time_s": cache["epoch"],
+                     "frozen_suffix_index": index},
+        )
 
     def _plan_with_external_target(self, planning_input: PlanningInput):
         """使用外部终端目标直接生成一条轨迹。"""
@@ -246,12 +365,28 @@ class LocalPlanner:
         timings["context_ms"] = (time.perf_counter() - context_start) * 1000.0
         target_line_index = int(external_target.target_line_index)
         if target_line_index < 0 or target_line_index >= len(context.line_contexts):
+            self._frozen_external_cache = None
             timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
             self._set_last_module_timing(timings)
             return None
 
         target_line = context.line_contexts[target_line_index]
         metadata = dict(getattr(external_target, "metadata", {}) or {})
+        if "time_param_solver_tolerance" in metadata:
+            context.config = {**context.config, "constrain": {
+                **context.config["constrain"],
+                "time_param_solver_tolerance": float(metadata["time_param_solver_tolerance"]),
+            }}
+        self.attribute.update(plan_mode="external_target", failure_reason="",
+                              osqp_failure_reason="", fallback_failure_reason="",
+                              osqp_error_type="", osqp_solver_status="", fallback_error_type="",
+                              osqp_diagnostics={}, osqp_accepted_nonconverged=False,
+                              external_dynamic_limits_enforced=True,
+                              candidate_count=1, feasible_candidate_count=0,
+                              target_point=None, time_param_method="",
+                              selected_line_id=target_line.line_id, target_lane_id=target_line.line_id,
+                              requested_target_point=np.asarray(external_target.point_xy, dtype=float).tolist(),
+                              attempted_time_param_method="")
         min_target_progress = max(0.0, float(metadata.get("min_external_target_progress_m", 1.0)))
         min_plan_t = max(0.0, float(metadata.get("min_external_plan_t_s", 0.5)))
         target_xy = np.asarray(external_target.point_xy, dtype=float)
@@ -267,33 +402,62 @@ class LocalPlanner:
             plan_T=max(min_plan_t, float(external_target.plan_T)),
             hold_t=max(0.0, float(external_target.hold_t)),
             template_name="external_target",
+            target_xy_override=(target_xy.copy() if target_line_index == 0
+                                and bool(metadata.get("maintain_lateral_offset", False)) else None),
+            target_path_length=(float(metadata["lane_path_distance_m"]) if target_line_index == 0
+                                and bool(metadata.get("maintain_lateral_offset", False))
+                                and "lane_path_distance_m" in metadata else None),
         )
-        candidate = build_candidate_smooth_path(context, terminal)
-        candidate_osqp = apply_time_param_to_candidate(
-            context,
-            candidate,
-            method="osqp",
-        )
-        enforce_limits = bool(metadata.get("enforce_external_dynamic_limits", False))
-        if (candidate_osqp.trajectory is not None and len(candidate_osqp.trajectory) > 0
-                and (not enforce_limits or self._external_dynamics_valid(context, candidate_osqp.trajectory))):
-            candidate = candidate_osqp
+        self.attribute.update(external_target_v=float(terminal.target_v),
+                              external_target_plan_T=float(terminal.plan_T))
+        contract = self._frozen_external_contract(context, external_target)
+        candidate = self._frozen_external_suffix(context, terminal, contract)
+        if candidate is not None:
+            self.attribute["attempted_time_param_method"] = "frozen_suffix"
+            self.attribute["trajectory_generation_attempts"].append({
+                "method": "frozen_suffix", "accepted": True, "failure_reason": "",
+                "wall_ms": (time.perf_counter() - generator_start) * 1000.0,
+                "diagnostics": dict(candidate.metrics),
+            })
         else:
-            candidate = apply_time_param_to_candidate(
-                context,
-                candidate,
-                method="quintic",
-            )
+            geometry_candidate = build_candidate_smooth_path(context, terminal)
+            for method in ("osqp", "quintic", "highs"):
+                self.attribute["attempted_time_param_method"] = method
+                attempt_start = time.perf_counter()
+                attempt = apply_time_param_to_candidate(context, geometry_candidate, method=method)
+                accepted = self._external_dynamics_valid(context, attempt.trajectory)
+                diagnostics = dict(attempt.metrics)
+                reason = "" if accepted else (attempt.failure_reason or "external_trajectory_dynamic_limit_violation")
+                self.attribute["trajectory_generation_attempts"].append({
+                    "method": method, "accepted": bool(accepted), "failure_reason": reason,
+                    "wall_ms": (time.perf_counter() - attempt_start) * 1000.0,
+                    "diagnostics": diagnostics,
+                })
+                self.attribute[f"{method}_diagnostics"] = diagnostics
+                if method in ("osqp", "highs"):
+                    self.attribute[f"{method}_solver_status"] = diagnostics.get("solver_status", "")
+                if accepted:
+                    candidate = attempt
+                    self.attribute["osqp_accepted_nonconverged"] = bool(
+                        method == "osqp" and diagnostics.get("accepted_nonconverged", False))
+                    break
+                prefix = "fallback" if method == "quintic" else method
+                self.attribute[f"{prefix}_failure_reason"] = reason
+                self.attribute[f"{prefix}_error_type"] = diagnostics.get("time_param_error_type", "constraint_violation")
         timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
-        if enforce_limits and not self._external_dynamics_valid(context, candidate.trajectory):
+        if candidate is None:
             self.attribute["failure_reason"] = "external_trajectory_dynamic_limit_violation"
             timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
             self._set_last_module_timing(timings)
             return None
-        if candidate.trajectory is None or len(candidate.trajectory) == 0:
-            timings["plan_total_ms"] = (time.perf_counter() - plan_start) * 1000.0
-            self._set_last_module_timing(timings)
-            return None
+
+        if contract is not None and candidate.metrics.get("time_param_method") != "frozen_suffix":
+            self._frozen_external_cache = {
+                **contract, "epoch": contract["now"], "last_index": 0,
+                "last_observed_v": float(context.ego_state.v),
+                "trajectory": np.asarray(candidate.trajectory, dtype=float).copy(),
+                "method": str(candidate.metrics.get("time_param_method", "")),
+            }
 
         self.last_context = context
         self.last_templates = []

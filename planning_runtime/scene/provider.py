@@ -33,7 +33,8 @@ from planning_runtime.scene.types import (
     SceneRouteIntent,
     SceneVehicleState,
 )
-from planning_runtime.scene.relative_geometry import relative_lane_coordinates
+from planning_runtime.scene.relative_geometry import build_relation_reference, relative_lane_coordinates
+from planning_runtime.scene.target_feasibility import MIN_EXTERNAL_PLAN_T_S
 from traj_planner.config import VehicleState
 from traj_planner.tools import calculate_path_cumulative_distance, get_path_point_at_s, project_point_to_path
 from traj_planner.types import ExternalTarget, PlanningInput
@@ -127,7 +128,7 @@ def scene_output_to_external_target(
 
     target_metadata = copy.deepcopy(metadata) if metadata is not None else {}
     target_metadata["reason"] = output.reason
-    min_plan_t = max(0.0, float(target_metadata.get("min_external_plan_t_s", 0.5)))
+    min_plan_t = max(0.0, float(target_metadata.get("min_external_plan_t_s", MIN_EXTERNAL_PLAN_T_S)))
     return ExternalTarget(
         point_xy=np.array([output.x, output.y], dtype=float),
         target_line_index=int(0 if output.target_line_index is None else output.target_line_index),
@@ -671,6 +672,15 @@ class SceneTargetProvider:
                 planning_frame=planning_frame,
                 query_point=ego_point,
             )
+        for view in ego_views:
+            relation_line = build_relation_reference(
+                self.parser, view, planning_frame.planned_path, self.max_lane_segments,
+            ).line
+            # 只补齐规划线起点后方的地图几何；前方必须使用已选中的同一分支。
+            # 全局路线与局部目标线可能在分叉处不同，不能只平移不同曲线的 s。
+            _, origin_s, _ = project_point_to_path(view.line[0, :2], relation_line)
+            prefix = relation_line[calculate_path_cumulative_distance(relation_line) < origin_s - 1e-6]
+            view.relation_line = np.vstack([prefix, view.line[:, :2]])
         current_view = ego_views[0]
         route_intent = None
         if self.uses_route_intent():

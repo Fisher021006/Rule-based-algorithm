@@ -22,6 +22,8 @@ class ReferenceLineView:
     cumulative_s: np.ndarray
     current_s: float
     current_d: float
+    # 完整车道关系轴；line 仍是原有前向规划线，二者的 s 原点不同。
+    relation_line: np.ndarray | None = None
 
 
 @dataclass

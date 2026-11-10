@@ -17,7 +17,9 @@ from typing import Any
 import numpy as np
 
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
+from planning_runtime.scene.relative_geometry import project_signed_on_reference
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
+from traj_planner.trajectory import DYNAMIC_NUMERIC_TOLERANCE
 
 
 @dataclass(frozen=True)
@@ -34,12 +36,13 @@ class VehicleLimits:
 CFG: dict[str, Any] = {
     "cutin_side": "auto",
     "target_thw_s": 4.0,
-    "thw_tol_s": 0.1,
+    "thw_tol_s": 0.5,
     "cruise_target_v": 5.0,
     "lane_change_time_s": 4.0,
     "prepare_plan_t_s": 1.5,
     "prepare_convergence_time_s": 2.0,
     "prepare_merge_lead_m": 1.0,
+    "prepare_lead_tolerance_m": 0.2,
     "launch_delta_s_min_m": 0,
     "prepare_max_speed_adv_mps": 3.0,
     "prepare_max_speed_lag_mps": 2.0,
@@ -63,7 +66,7 @@ CFG: dict[str, Any] = {
     "active_transient_hold_max_frames": 2,
     "active_persistent_infeasible_max_frames": 4,
     "persistent_infeasible_progress_ratio_thresh": 0.5,
-    "enter_target_d_thresh_m": 0.6,
+    "enter_target_d_thresh_m": 0.3,
     "execute_complete_frames": 2,
     "stabilize_duration_s": 1.5,
     "abort_cooldown_s": 2.0,
@@ -74,6 +77,8 @@ CFG: dict[str, Any] = {
 
 SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "mode": "APPROACH",
+    "scenario_target_thw_s": None,
+    "scenario_thw_tolerance_s": None,
     "cooldown_until_time_s": -1.0,
     "prepare_start_time_s": -1.0,
     "prepare_success_hits": 0,
@@ -101,6 +106,8 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "completion_lane_id": "",
     "completion_execution_kind": "",
     "completion_requested_thw_s": 0.0,
+    "completion_execution_target_thw_s": None,
+    "completion_thw_tolerance_s": None,
     "completion_achieved_thw_s": None,
     "completion_thw_error_s": None,
     "completion_metric_reason": "",
@@ -212,8 +219,8 @@ def _handle_approach(
         ), memory
 
     _enter_prepare_mode(memory, target_line, now)
-    launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]))
-    prepare_strategy = _build_prepare_strategy(context, target_line)
+    launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]), requested_thw_s=_scenario_target_thw(memory))
+    prepare_strategy = _build_prepare_strategy(context, target_line, requested_thw_s=_scenario_target_thw(memory))
     return _build_prepare_output(
         context,
         memory,
@@ -239,8 +246,8 @@ def _handle_prepare(
             scene_status="approach_wait_target_line",
         ), memory
 
-    launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]))
-    prepare_strategy = _build_prepare_strategy(context, target_line)
+    launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]), requested_thw_s=_scenario_target_thw(memory))
+    prepare_strategy = _build_prepare_strategy(context, target_line, requested_thw_s=_scenario_target_thw(memory))
 
     if _prepare_should_abort_as_globally_infeasible(memory, launch_plan, now):
         _enter_cooldown(memory, now)
@@ -273,7 +280,7 @@ def _handle_prepare(
                 solution,
                 now,
                 execution_kind="exact",
-                requested_thw_s=float(CFG["target_thw_s"]),
+                requested_thw_s=_scenario_target_thw(memory),
                 degrade_reason="",
             )
             return solution, memory
@@ -300,7 +307,7 @@ def _handle_prepare(
             _print_degrade_event(
                 prefix="prepare",
                 degrade_reason=str(launch_plan["degrade_reason"]),
-                target_thw=float(CFG["target_thw_s"]),
+                target_thw=_scenario_target_thw(memory),
                 degraded_thw=float(launch_plan["degraded_result"]["requested_thw"]),
                 debug=launch_plan["debug"],
             )
@@ -337,60 +344,27 @@ def _handle_active(
     memory: dict[str, Any],
     now: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """处理 ACTIVE：动态重解 exact/degraded，并在末段进入冻结执行。"""
+    """先检查完成并接受当前帧候选，再决定是否冻结。"""
     target_line = _resolve_target_line(context, memory)
     if target_line is None:
         _enter_cooldown(memory, now)
         return _build_keep_lane_output(
-            context,
-            reason="active_no_target_line",
-            scene_status="infeasible_geometry",
+            context, reason="active_no_target_line", scene_status="infeasible_geometry",
         ), memory
-
-    if _should_enter_dead_zone(context, memory, target_line, now):
-        freeze_solution = memory.get("last_dynamic_solution")
-        if freeze_solution is None:
-            freeze_solution, failure_info = _select_active_solution(
-                context,
-                memory,
-                target_line,
-                _remaining_lane_change_time(memory, now),
-            )
-            if freeze_solution is None:
-                _enter_cooldown(memory, now)
-                return _build_keep_lane_output(
-                    context,
-                    reason="active_dead_zone_without_solution",
-                    scene_status=str(failure_info["scene_status"]),
-                    scene_detail=str(failure_info["reason"]),
-                    scene_debug=failure_info["debug"],
-                ), memory
-
-        _enter_frozen_mode(memory, freeze_solution, now)
-        frozen_output = _build_frozen_output(context, memory, target_line)
-        if frozen_output is None:
-            _enter_cooldown(memory, now)
-            return _build_keep_lane_output(
-                context,
-                reason="active_frozen_build_failed",
-                scene_status="infeasible_geometry",
-            ), memory
-        return frozen_output, memory
+    if _is_execute_completed(context, memory, target_line):
+        _enter_stabilize_mode(context, memory, target_line, now)
+        return _build_stabilize_output(context, target_line), memory
 
     active_output, failure_info = _select_active_solution(
-        context,
-        memory,
-        target_line,
-        _remaining_lane_change_time(memory, now),
+        context, memory, target_line, _remaining_lane_change_time(memory, now),
     )
     if active_output is None:
         return _handle_active_infeasible(context, memory, target_line, now, failure_info), memory
 
     memory["active_infeasible_count"] = 0
-    memory["last_dynamic_solution"] = copy.deepcopy(active_output)
-    if _is_execute_completed(context, memory, target_line):
-        _enter_stabilize_mode(context, memory, target_line, now)
-        return _build_stabilize_output(context, target_line), memory
+    if _should_enter_dead_zone(context, memory, target_line, now):
+        _enter_frozen_mode(memory, active_output, now)
+        return _build_frozen_output(context, memory, target_line), memory
     return active_output, memory
 
 
@@ -401,6 +375,11 @@ def _handle_frozen(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """处理 FROZEN：复用冻结解，不再动态重解 THW。"""
     target_line = _resolve_target_line(context, memory)
+    # 已满足几何完成条件时先锁存结果，避免到达终点后继续追逐旧目标。
+    if _is_execute_completed(context, memory, target_line):
+        _enter_stabilize_mode(context, memory, target_line, now)
+        return _build_stabilize_output(context, target_line), memory
+
     frozen_output = _build_frozen_output(context, memory, target_line)
     if frozen_output is None:
         _enter_cooldown(memory, now)
@@ -410,10 +389,6 @@ def _handle_frozen(
             scene_status="infeasible_geometry",
         ), memory
 
-    if _is_execute_completed(context, memory, target_line):
-        _enter_stabilize_mode(context, memory, target_line, now)
-        if target_line is not None:
-            return _build_stabilize_output(context, target_line), memory
     return frozen_output, memory
 
 
@@ -565,7 +540,8 @@ def _enter_stabilize_mode(
     """进入 STABILIZE，并锁存首次确认换道完成时的 THW。"""
 
     achieved_thw, metric_reason = _measure_completion_thw(context)
-    requested_thw = float(memory.get("execution_requested_thw_s", CFG["target_thw_s"]))
+    requested_thw = _scenario_target_thw(memory)
+    execution_thw = memory.get("execution_requested_thw_s")
     memory["mode"] = "STABILIZE"
     memory["stable_until_time_s"] = float(now) + float(CFG["stabilize_duration_s"])
     memory["completion_time_s"] = float(now)
@@ -576,6 +552,9 @@ def _enter_stabilize_mode(
     )
     memory["completion_execution_kind"] = str(memory.get("execution_kind", ""))
     memory["completion_requested_thw_s"] = float(requested_thw)
+    memory["completion_execution_target_thw_s"] = execution_thw
+    tolerance = memory.get("scenario_thw_tolerance_s")
+    memory["completion_thw_tolerance_s"] = float(CFG["thw_tol_s"] if tolerance is None else tolerance)
     memory["completion_achieved_thw_s"] = (
         None if achieved_thw is None else float(achieved_thw)
     )
@@ -650,6 +629,14 @@ def _reset_scene_memory() -> None:
     # 1. 每轮新场景从模板深拷贝，避免跨轮污染。
     global SCENE_MEMORY
     SCENE_MEMORY = copy.deepcopy(SCENE_MEMORY_TEMPLATE)
+    SCENE_MEMORY["scenario_target_thw_s"] = float(CFG["target_thw_s"])
+    SCENE_MEMORY["scenario_thw_tolerance_s"] = float(CFG["thw_tol_s"])
+
+
+def _scenario_target_thw(memory: dict[str, Any]) -> float:
+    """原始场景目标不随退化、恢复或冷却改变。"""
+    target = memory.get("scenario_target_thw_s")
+    return float(CFG["target_thw_s"] if target is None else target)
 
 
 # ==================== Output Builders / 输出封装 ====================
@@ -662,36 +649,13 @@ def _build_keep_lane_output(
     scene_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造沿当前参考线前进的保底目标点。"""
-    ego = context.ego_vehicle
-    line = ego.current_ref_line
-    limits = _read_vehicle_limits(context)
-    target_v = _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
-    plan_t = 2.0
-    # 终点距离必须与当前速度、终端速度和规划时域自洽。
-    # 若固定使用 target_v * plan_t 再额外前推，滚动规划会每帧先加速、
-    # 把减速推迟到时域末端，导致 COMPLETE 巡航速度持续升高。
-    travel_s = max(
-        float(CFG["min_target_progress_m"]),
-        0.5 * (max(float(ego.v), 0.0) + target_v) * plan_t,
+    output, reference_debug = _build_lane_speed_target(
+        context, context.ego_vehicle.current_ref_line, float(CFG["cruise_target_v"]), 2.0,
     )
-    target_s = _clamp(
-        float(line.current_s) + float(travel_s),
-        float(line.current_s) + float(CFG["min_target_progress_m"]),
-        float(line.cumulative_s[-1]) - 0.5,
-    )
-    target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
-    output = {
-        "x": float(target_xy[0]),
-        "y": float(target_xy[1]),
-        "v": float(target_v),
-        "a": float((target_v - float(ego.v)) / max(plan_t, 1e-3)),
-        "theta": float(target_heading),
-        "t": float(plan_t),
-        "target_line_index": int(line.line_index),
-        "hold_t": 0.0,
-        "reason": str(reason),
-    }
-    return _annotate_output(output, scene_status, scene_detail or reason, scene_debug)
+    output["reason"] = str(reason)
+    debug = copy.deepcopy(scene_debug or {})
+    debug.update(reference_debug)
+    return _annotate_output(output, scene_status, scene_detail or reason, debug)
 
 
 def _build_complete_output(
@@ -700,12 +664,17 @@ def _build_complete_output(
 ) -> dict[str, Any]:
     """构造切入完成后的当前车道巡航目标。"""
 
+    debug = _completion_debug(memory)
+    actual = debug["completion_achieved_thw_s"]
+    status = "cutin_metric_unavailable" if actual is None or not np.isfinite(actual) else (
+        "cutin_success" if debug["completion_thw_within_tolerance"] else "cutin_metric_miss"
+    )
     return _build_keep_lane_output(
         context,
         reason="cutin_complete_cruise",
-        scene_status="cutin_success",
+        scene_status=status,
         scene_detail="cutin_complete_latched",
-        scene_debug=_completion_debug(memory),
+        scene_debug=debug,
     )
 
 
@@ -723,48 +692,124 @@ def _build_prepare_output(
     # 2. exact 不可行时，会主动建立纵向优势；degraded 可行时，则为退化切入准备起始态。
     ego = context.ego_vehicle
     line = ego.current_ref_line
-    target_v = float(prepare_strategy["target_v"])
-    plan_t = float(CFG["prepare_plan_t_s"])
-    travel_s = max(float(CFG["min_target_progress_m"]), target_v * plan_t + 1.0)
-    target_s = _clamp(
-        float(line.current_s) + float(travel_s),
-        float(line.current_s) + float(CFG["min_target_progress_m"]),
-        float(line.cumulative_s[-1]) - 0.5,
-    )
-    target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
-    limits = _read_vehicle_limits(context)
-    a_req = _clamp(
-        (target_v - float(ego.v)) / max(plan_t, 1e-3),
-        limits.min_acc,
-        limits.max_acc,
+    output, reference_debug = _build_lane_speed_target(
+        context, line, float(prepare_strategy["target_v"]), float(CFG["prepare_plan_t_s"]),
+        debug_prefix="prepare",
     )
 
     debug = copy.deepcopy(launch_plan["debug"])
     debug.update(prepare_strategy["debug"])
     if scene_debug is not None:
         debug.update(scene_debug)
+    debug.update(reference_debug)
 
-    output = {
-        "x": float(target_xy[0]),
-        "y": float(target_xy[1]),
-        "v": float(target_v),
-        "a": float(a_req),
-        "theta": float(target_heading),
-        "t": float(plan_t),
-        "target_line_index": int(line.line_index),
-        "hold_t": 0.0,
+    output.update({
         "reason": str(reason),
         "prepare_success_hits": int(memory.get("prepare_success_hits", 0)),
         "prepare_delta_s_target": float(prepare_strategy["delta_s_target"]),
         "prepare_delta_s_goal": float(prepare_strategy["delta_s_goal"]),
         "prepare_delta_s_error": float(prepare_strategy["delta_s_error"]),
-    }
+    })
     return _annotate_output(
         output,
         scene_status=str(launch_plan["prepare_state"]),
         scene_detail=str(launch_plan["summary_reason"]),
         scene_debug=debug,
     )
+
+
+def _preparation_offset_reference(
+    context: SceneContext, line: ReferenceLineView, lateral_offset: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the known parallel-lane polyline and measure its own arc length."""
+    start_s = float(line.current_s)
+    end_s = max(start_s, float(line.cumulative_s[-1]) - 0.5)
+    start_xy, _ = get_path_point_at_s(line.line, start_s, line.cumulative_s)
+    end_xy, _ = get_path_point_at_s(line.line, end_s, line.cumulative_s)
+    interior = np.asarray(line.line)[(line.cumulative_s > start_s) & (line.cumulative_s < end_s), :2]
+    points = np.vstack([start_xy, interior, end_xy])
+    points = points[np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 1e-9]]
+    if len(points) < 2:
+        return np.array([[context.ego_vehicle.x, context.ego_vehicle.y]]), np.array([0.0])
+    segments = np.diff(points, axis=0)
+    directions = segments / np.linalg.norm(segments, axis=1)[:, None]
+    tangents = np.vstack([directions[0], directions[:-1] + directions[1:], directions[-1]])
+    tangents /= np.maximum(np.linalg.norm(tangents, axis=1)[:, None], 1e-12)
+    parallel = points + lateral_offset * np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    parallel[0] = [context.ego_vehicle.x, context.ego_vehicle.y]
+    distances = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(parallel, axis=0), axis=1))]
+    return parallel, distances
+
+
+def _build_lane_speed_target(
+    context: SceneContext,
+    line: ReferenceLineView,
+    desired_v: float,
+    plan_t: float,
+    *,
+    debug_prefix: str = "lane_speed",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """将车道内期望速度转换为一致的距离/末状态；不预跑规划器。"""
+    limits = _read_vehicle_limits(context)
+    current_v = float(context.ego_vehicle.v)
+    # 与现有时间参数化的0.1s网格一致。末区间保留零加速度，
+    # 再预留一个采样周期的速度可达余量，避免直接选择极限端点。
+    dt = 0.1
+    steps = max(5, int(round(float(plan_t) / dt)))
+    plan_t = steps * dt
+    reachable_t = max(0.0, plan_t - 2.0 * dt)
+    lower_v = max(0.0, current_v + limits.min_acc * reachable_t)
+    upper_v = min(limits.max_v, current_v + limits.max_acc * reachable_t)
+    # A previously accepted sample may exceed the nominal cap by solver roundoff.
+    # Preserve the measured initial speed, but do not invent an emergency or raise
+    # the requested terminal-speed cap while it is inside the existing validator tolerance.
+    feasible = (lower_v <= upper_v and 0.0 <= current_v
+                <= limits.max_v + DYNAMIC_NUMERIC_TOLERANCE)
+    target_v = _clamp(float(desired_v), lower_v, upper_v) if feasible else 0.0
+    # steps个左端速度样本：前steps-1区间线性趋近期望速度，末区间保持。
+    # 这与规划器的sum(v[:-1])*dt口径一致，末区间加速度为0。
+    travel_s = float(np.sum(np.linspace(current_v, target_v, steps)) * dt)
+    lateral_offset = float(line.current_d)
+    offset_path = offset_distance = None
+    if abs(lateral_offset) > 1e-8:
+        offset_path, offset_distance = _preparation_offset_reference(context, line, lateral_offset)
+        available_s = float(offset_distance[-1])
+    else:
+        available_s = max(0.0, float(line.cumulative_s[-1]) - 0.5 - float(line.current_s))
+    if feasible and travel_s > available_s:
+        adjusted_v = 2.0 * available_s / plan_t - current_v
+        feasible = lower_v - 1e-9 <= adjusted_v <= upper_v + 1e-9
+        if feasible:
+            target_v = _clamp(adjusted_v, lower_v, upper_v)
+            travel_s = float(np.sum(np.linspace(current_v, target_v, steps)) * dt)
+    # Lane-speed commands organise longitudinal motion, not a forced return to centreline.
+    # At low speed its short forward distance cannot support a sharp lateral correction.
+    if offset_path is not None and len(offset_path) >= 2:
+        target_xy, target_heading = get_path_point_at_s(offset_path, min(max(0.0, travel_s), available_s), offset_distance)
+    elif offset_path is not None:
+        target_xy = np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float)
+        target_heading = float(context.ego_vehicle.heading)
+    else:
+        target_s = min(float(line.current_s) + max(0.0, travel_s), float(line.cumulative_s[-1]))
+        target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
+    output = {
+        "x": float(target_xy[0]), "y": float(target_xy[1]),
+        "v": float(target_v), "a": 0.0, "theta": float(target_heading), "t": float(plan_t),
+        "target_line_index": int(line.line_index), "hold_t": 0.0,
+        "min_external_target_progress_m": 0.0,
+        "maintain_lateral_offset": abs(lateral_offset) > 1e-8,
+        "lane_path_distance_m": float(max(0.0, travel_s)),
+    }
+    if not feasible or (current_v <= 1e-6 and target_v <= 1e-6):
+        output.update(control_mode="emergency_stop", emergency_decel_mps2=max(abs(limits.min_acc), 1e-6), v=0.0)
+    debug = {
+        "desired_v_mps": float(desired_v), "terminal_v_mps": float(output["v"]),
+        "reachable_v_min_mps": float(lower_v), "reachable_v_max_mps": float(upper_v),
+        "reference_distance_m": float(travel_s), "available_distance_m": available_s,
+        "reference_feasible": bool(feasible), "reference_dt_s": dt,
+        "lateral_offset_m": lateral_offset,
+    }
+    return output, {f"{debug_prefix}_{key}": value for key, value in debug.items()}
 
 
 def _build_projected_solution_output(
@@ -776,42 +821,48 @@ def _build_projected_solution_output(
     scene_status: str | None = None,
     scene_detail: str | None = None,
     scene_debug: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """把历史解投影到当前目标线上，保持几何连续。"""
-    # 逻辑：
-    # 1. ACTIVE 和 FROZEN 都会复用这里，把上一次有效目标重新贴到当前目标线。
-    x = float(solution["x"])
-    y = float(solution["y"])
-    theta = float(solution["theta"])
-    target_line_index = int(solution.get("target_line_index", 0))
-
-    if target_line is not None:
-        target_s = solution.get("_meta", {}).get("target_s")
-        if target_s is None:
-            target_xy = np.array([float(solution["x"]), float(solution["y"])], dtype=float)
-            _, target_s, _ = project_point_to_path(target_xy, target_line.line)
-        target_s = max(float(target_s), float(target_line.current_s) + 1.0)
-        target_s = min(float(target_s), float(target_line.cumulative_s[-1]) - 0.5)
-        if target_s > float(target_line.current_s) + 1e-6:
-            target_xy, target_heading = get_path_point_at_s(target_line.line, target_s, target_line.cumulative_s)
-            x = float(target_xy[0])
-            y = float(target_xy[1])
-            theta = float(target_heading)
-            target_line_index = int(target_line.line_index)
+) -> dict[str, Any] | None:
+    """ACTIVE复用历史解时保持世界终点，仅重新计算当前参考线坐标。"""
+    if target_line is None or not np.isfinite(remaining_t):
+        return None
+    if remaining_t < float(CFG["dynamic_solution_min_t_s"]) - 1e-9:
+        return None
+    line = np.asarray(target_line.line, dtype=float)
+    target_xy = np.array([solution["x"], solution["y"]], dtype=float)
+    if (
+        line.ndim != 2 or line.shape[0] < 2 or line.shape[1] < 2
+        or not np.all(np.isfinite(line[:, :2])) or not np.all(np.isfinite(target_xy))
+        or not np.isfinite(target_line.current_s)
+        or not np.any(np.linalg.norm(np.diff(line[:, :2], axis=0), axis=1) > 1e-6)
+    ):
+        return None
+    projection_index, target_s, target_d = project_point_to_path(target_xy, line)
+    if projection_index < 0 or not np.all(np.isfinite([target_s, target_d])):
+        return None
+    remaining_s = float(target_s - target_line.current_s)
+    projected_xy, _ = get_path_point_at_s(line, target_s)
+    projection_error = float(np.linalg.norm(projected_xy - target_xy))
+    if remaining_s <= 1e-6 or projection_error > 1e-3:
+        return None
 
     output = copy.deepcopy(solution)
-    output["x"] = float(x)
-    output["y"] = float(y)
-    output["theta"] = float(theta)
-    output["t"] = float(max(float(CFG["dynamic_solution_min_t_s"]), remaining_t))
-    output["target_line_index"] = int(target_line_index)
+    output["t"] = float(remaining_t)
+    output["target_line_index"] = int(target_line.line_index)
     output["hold_t"] = 0.0
     output["reason"] = str(reason)
+    output["min_external_target_progress_m"] = 0.0
+    output.setdefault("_meta", {})["target_s"] = float(target_s)
+    debug = copy.deepcopy(scene_debug if scene_debug is not None else output.get("scene_debug") or {})
+    debug.update(
+        active_reuse_target_world_xy=target_xy.tolist(), active_reuse_target_local_s=float(target_s),
+        active_reuse_remaining_distance_m=remaining_s, active_reuse_remaining_t_s=float(remaining_t),
+        active_reuse_projection_error_m=projection_error,
+    )
     return _annotate_output(
         output,
         scene_status or str(output.get("scene_status", "active_execute")),
         scene_detail or str(output.get("scene_detail", reason)),
-        scene_debug if scene_debug is not None else output.get("scene_debug"),
+        debug,
     )
 
 
@@ -820,17 +871,80 @@ def _build_frozen_output(
     memory: dict[str, Any],
     target_line: ReferenceLineView | None,
 ) -> dict[str, Any] | None:
-    """根据冻结解构造 FROZEN 输出。"""
-    # 逻辑：
-    # 1. 死区后不再重解，只执行最后一次有效解的连续投影。
+    """保持冻结世界终点，仅更新当前参考线标识与剩余时间。"""
+    def exit_frozen(reason: str, status: str = "infeasible_geometry") -> dict[str, Any]:
+        # ACTIVE进入冻结的首帧也调用本函数，因此无效目标必须返回完整退路输出。
+        _enter_cooldown(memory, float(context.time_s))
+        return _build_keep_lane_output(
+            context, reason=reason, scene_status=status,
+            scene_debug={"frozen_exit_reason": reason},
+        )
+
     solution = memory.get("frozen_solution")
     if solution is None:
-        return None
-    return _build_projected_solution_output(
-        target_line=target_line,
-        solution=solution,
-        remaining_t=_remaining_lane_change_time(memory, context.time_s),
-        reason="cutin_frozen_execute",
+        return exit_frozen("frozen_solution_lost")
+    target_lane_ids = set(_normalize_lane_sequence(memory.get("locked_target_lane_sequence", [])))
+    target_lane_ids.add(str(memory.get("locked_target_lane_id", "")))
+    target_lane_ids.discard("")
+    if target_line is None or str(target_line.lane_id) not in target_lane_ids:
+        return exit_frozen("frozen_target_line_invalid")
+
+    deadline = float(memory.get("lane_change_end_time_s", -1.0))
+    remaining_t = deadline - float(context.time_s)
+    if not np.isfinite(remaining_t) or remaining_t <= 0.0:
+        return exit_frozen("frozen_deadline_elapsed", "infeasible_time")
+    # The final samples of an already verified frozen trajectory are execution,
+    # not a new THW solve. Keep the original deadline down to one control step.
+    min_plan_t = float(context.dt)
+    if remaining_t < min_plan_t - 1e-9:
+        return exit_frozen("frozen_horizon_too_short", "infeasible_time")
+
+    line = np.asarray(target_line.line, dtype=float)
+    ego_xy = np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float)
+    target_xy = np.array([solution["x"], solution["y"]], dtype=float)
+    if (
+        line.ndim != 2 or line.shape[0] < 2 or line.shape[1] < 2
+        or not np.all(np.isfinite(line[:, :2]))
+        or not np.all(np.isfinite(ego_xy)) or not np.all(np.isfinite(target_xy))
+        or not np.any(np.linalg.norm(np.diff(line[:, :2], axis=0), axis=1) > 1e-6)
+    ):
+        return exit_frozen("frozen_target_geometry_invalid")
+
+    # 历史_meta.target_s属于旧参考线；只能用不变的世界坐标重新投影。
+    target_index, target_s, target_d = project_point_to_path(target_xy, line)
+    ego_index, ego_s, ego_d = project_point_to_path(ego_xy, line)
+    if min(target_index, ego_index) < 0 or not np.all(np.isfinite([target_s, target_d, ego_s, ego_d])):
+        return exit_frozen("frozen_target_geometry_invalid")
+    remaining_s = float(target_s - ego_s)
+    if remaining_s <= 1e-6:
+        return exit_frozen("frozen_target_not_ahead")
+    projected_xy, _ = get_path_point_at_s(line, target_s)
+    projection_error = float(np.linalg.norm(projected_xy - target_xy))
+    if projection_error > 1e-3:
+        return exit_frozen("frozen_target_off_reference")
+
+    output = copy.deepcopy(solution)
+    output["t"] = float(remaining_t)
+    output["target_line_index"] = int(target_line.line_index)
+    output["hold_t"] = 0.0
+    output["reason"] = "cutin_frozen_execute"
+    output["preserve_trajectory"] = True
+    output["trajectory_execution_time_s"] = float(context.time_s)
+    output["trajectory_deadline_s"] = deadline
+    output["trajectory_route_lane_ids"] = sorted(target_lane_ids)
+    output["min_external_plan_t_s"] = min_plan_t
+    # 阻止下游用默认1m最小前进距离重新改写接近中的冻结终点。
+    output["min_external_target_progress_m"] = 0.0
+    output.setdefault("_meta", {})["target_s"] = float(target_s)
+    debug = copy.deepcopy(solution.get("scene_debug") or {})
+    debug.update(
+        frozen_target_world_xy=target_xy.tolist(), frozen_target_local_s=float(target_s),
+        frozen_remaining_distance_m=remaining_s, frozen_deadline_s=deadline,
+        frozen_remaining_t_s=float(remaining_t), frozen_projection_error_m=projection_error,
+    )
+    return _annotate_output(
+        output, str(solution.get("scene_status", "frozen_execute")),
+        "frozen_world_target", debug,
     )
 
 
@@ -842,26 +956,30 @@ def _build_stabilize_output(
     # 逻辑：
     # 1. STABILIZE 只做短时跟随，不再改变场景定义。
     limits = _read_vehicle_limits(context)
-    target_v = (
+    current_v = max(0.0, float(context.ego_vehicle.v))
+    plan_t = 2.0
+    desired_v = (
         _clamp(float(context.main_vehicle.v), 0.0, limits.max_v)
         if context.main_vehicle is not None
         else _clamp(float(CFG["cruise_target_v"]), 0.0, limits.max_v)
     )
-    travel_s = max(8.0, target_v * 2.0 + 4.0)
-    target_s = min(float(target_line.current_s) + float(travel_s), float(target_line.cumulative_s[-1]) - 0.5)
-    target_xy, target_heading = get_path_point_at_s(target_line.line, target_s, target_line.cumulative_s)
-    output = {
-        "x": float(target_xy[0]),
-        "y": float(target_xy[1]),
-        "v": float(target_v),
-        "a": 0.0,
-        "theta": float(target_heading),
-        "t": 2.0,
-        "target_line_index": int(target_line.line_index),
-        "hold_t": 0.0,
-        "reason": "cutin_stabilize",
-    }
-    return _annotate_output(output, "stabilize_following", "cutin_stabilize")
+    output, debug = _build_lane_speed_target(
+        context, target_line, desired_v, plan_t, debug_prefix="stabilize",
+    )
+    feasible = debug["stabilize_reference_feasible"]
+    output["reason"] = "cutin_stabilize"
+    debug.update(
+        stabilize_current_v_mps=current_v,
+        stabilize_target_v_mps=float(output["v"]),
+        stabilize_target_acc_mps2=float(output["a"]),
+        stabilize_distance_m=debug["stabilize_reference_distance_m"],
+        stabilize_target_feasible=feasible,
+        stabilize_inherited_overspeed_mps=max(0.0, current_v - limits.max_v),
+    )
+    return _annotate_output(
+        output, "stabilize_following" if feasible else "stabilize_distance_infeasible",
+        "cutin_stabilize" if feasible else "stabilize_no_reachable_target", debug,
+    )
 
 
 # ==================== Condition Helpers / 触发与状态判断 ====================
@@ -874,9 +992,30 @@ def _has_valid_main_vehicle(context: SceneContext) -> bool:
         return False
     ego = context.ego_vehicle
     main = context.main_vehicle
-    same_direction = _heading_diff_deg(main.heading, ego.heading) <= float(CFG["max_heading_diff_deg"])
     rel_s_ok = float(CFG["search_rel_s_min"]) <= float(main.relative_s_to_ego) <= float(CFG["search_rel_s_max"])
-    return bool(same_direction and rel_s_ok)
+    if not rel_s_ok:
+        return False
+    # 弯道上的同向车辆可能位于不同路段，不能直接比较两车世界航向。
+    # 先确认候选走廊在GVT处与自身路线同向，再在VUT位置比较局部切线。
+    ego_xy = np.array([ego.x, ego.y], dtype=float)
+    main_xy = np.array([main.x, main.y], dtype=float)
+    try:
+        ego_route_heading = _target_view_heading(ego_xy, ego.current_ref_line)
+    except (ValueError, TypeError, IndexError):
+        return False
+    for line in ego.candidate_ref_lines:
+        if abs(int(line.lateral_step)) > 1:
+            continue
+        try:
+            if _heading_diff_deg(_target_view_heading(ego_xy, line), ego_route_heading) > float(CFG["max_heading_diff_deg"]):
+                continue
+            if _target_view_distance(main_xy, line) > float(CFG["target_lane_match_d_thresh"]):
+                continue
+            if _heading_diff_deg(main.heading, _target_view_heading(main_xy, line)) <= float(CFG["max_heading_diff_deg"]):
+                return True
+        except (ValueError, TypeError, IndexError):
+            continue
+    return False
 
 
 def _prepare_should_activate_exact(
@@ -982,17 +1121,19 @@ def _prepare_window_ok(
     if main is None:
         return False, {"reason": "no_main_vehicle"}
     not_already_on_target = str(ego.current_ref_line.lane_id) != str(target_line.lane_id)
-    _, ego_s_on_target, _ = project_point_to_path(
+    ego_s_on_target, _ = _project_on_target_view(
         np.array([ego.x, ego.y], dtype=float),
-        target_line.line,
+        target_line,
     )
-    _, main_s_on_target, _ = project_point_to_path(
+    main_s_on_target, _ = _project_on_target_view(
         np.array([main.x, main.y], dtype=float),
-        target_line.line,
+        target_line,
     )
     delta_s_target = float(ego_s_on_target) - float(main_s_on_target)
     launch_delta_s_min = float(CFG["launch_delta_s_min_m"])
-    launch_geom_ok = delta_s_target >= launch_delta_s_min
+    ready_lead = max(launch_delta_s_min,
+                     float(prepare_strategy["delta_s_goal"]) - float(CFG["prepare_lead_tolerance_m"]))
+    launch_geom_ok = delta_s_target >= ready_lead
     launch_state_ready = str(prepare_state) in {"prepare_exact_ready", "prepare_degraded_ready"}
     window_ok = bool(
         not_already_on_target
@@ -1007,6 +1148,7 @@ def _prepare_window_ok(
         "main_s_on_target": float(main_s_on_target),
         "delta_s_target": float(delta_s_target),
         "launch_delta_s_min": float(launch_delta_s_min),
+        "launch_required_lead_m": float(ready_lead),
         "launch_geom_ok": bool(launch_geom_ok),
         "launch_state_ready": bool(launch_state_ready),
         "not_already_on_target": bool(not_already_on_target),
@@ -1078,27 +1220,50 @@ def _is_execute_completed(
     memory: dict[str, Any],
     target_line: ReferenceLineView | None,
 ) -> bool:
-    """判断换道是否已经稳定完成。"""
-    # 逻辑：
-    # 1. 优先按目标车道 ID 判断，其次退化到横向偏差阈值。
-    current_lane_id = str(context.ego_vehicle.current_ref_line.lane_id)
-    target_lane_id = str(memory.get("locked_target_lane_id", ""))
-    target_lane_sequence = set(_normalize_lane_sequence(memory.get("locked_target_lane_sequence", [])))
-    if (target_lane_id and current_lane_id == target_lane_id) or (
-        target_lane_sequence and current_lane_id in target_lane_sequence
-    ):
-        memory["execute_complete_hits"] += 1
-        return int(memory["execute_complete_hits"]) >= int(CFG["execute_complete_frames"])
-
-    if target_line is None:
+    """在已确认身份的目标参考线上，连续检查横向几何收敛。"""
+    target_lane_ids = set(_normalize_lane_sequence(memory.get("locked_target_lane_sequence", [])))
+    target_lane_ids.add(str(memory.get("locked_target_lane_id", "")))
+    target_lane_ids.discard("")
+    # ID仅确认测量对象，不能以最近车道归属代替换道完成。
+    # 同一下标可能已对应另一条线；仅共享远端车道段也不能证明当前线正确。
+    if target_line is None or str(target_line.lane_id) not in target_lane_ids:
         memory["execute_complete_hits"] = 0
         return False
 
-    _, _, ego_d_on_target = project_point_to_path(
-        np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float),
-        target_line.line,
+    line = np.asarray(target_line.line, dtype=float)
+    ego_xy = np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float)
+    if (
+        line.ndim != 2 or line.shape[0] < 2 or line.shape[1] < 2
+        or not np.all(np.isfinite(line[:, :2]))
+        or not np.all(np.isfinite(ego_xy))
+        or not np.any(np.linalg.norm(np.diff(line[:, :2], axis=0), axis=1) > 1e-6)
+    ):
+        memory["execute_complete_hits"] = 0
+        return False
+
+    projection_index, ego_s_on_target, ego_d_on_target = project_point_to_path(ego_xy, line)
+    projection_valid = (
+        projection_index >= 0
+        and np.isfinite(ego_s_on_target)
+        and np.isfinite(ego_d_on_target)
     )
-    if abs(float(ego_d_on_target)) <= float(CFG["enter_target_d_thresh_m"]):
+    heading_aligned = False
+    if projection_valid:
+        _, target_heading = get_path_point_at_s(line, ego_s_on_target)
+        heading_aligned = _heading_diff_deg(
+            float(getattr(context.ego_vehicle, "heading", target_heading)), float(target_heading),
+        ) <= float(CFG["max_heading_diff_deg"])
+    # 横向收敛可能早于纵向计划；执行窗口没走完就锁存会把中途的 THW 当成完成指标。
+    deadline = float(memory.get("lane_change_end_time_s", -1.0))
+    time_ready = (
+        not np.isfinite(deadline)
+        or deadline <= 0.0
+        or float(getattr(context, "time_s", 0.0))
+        >= deadline - float(getattr(context, "dt", 0.1)) - 1e-6
+    )
+    if (projection_valid and heading_aligned
+            and abs(float(ego_d_on_target)) <= float(CFG["enter_target_d_thresh_m"])
+            and time_ready):
         memory["execute_complete_hits"] += 1
     else:
         memory["execute_complete_hits"] = 0
@@ -1172,15 +1337,18 @@ def _choose_target_line(context: SceneContext) -> ReferenceLineView | None:
         if cutin_side == "right" and int(line.lateral_step) <= 0:
             continue
 
-        _, main_s_on_line, main_d_on_line = project_point_to_path(np.array([main.x, main.y], dtype=float), line.line)
-        if abs(float(main_d_on_line)) > float(CFG["target_lane_match_d_thresh"]):
+        main_xy = np.array([main.x, main.y], dtype=float)
+        ego_xy = np.array([ego.x, ego.y], dtype=float)
+        main_s_on_line, _ = _project_on_target_view(main_xy, line)
+        main_distance = _target_view_distance(main_xy, line)
+        if main_distance > float(CFG["target_lane_match_d_thresh"]):
             continue
 
-        _, ego_s_on_line, ego_d_on_line = project_point_to_path(np.array([ego.x, ego.y], dtype=float), line.line)
-        if abs(float(ego_d_on_line)) > float(CFG["max_ego_to_target_line_d_m"]):
+        ego_s_on_line, _ = _project_on_target_view(ego_xy, line)
+        if _target_view_distance(ego_xy, line) > float(CFG["max_ego_to_target_line_d_m"]):
             continue
 
-        score = abs(float(main_d_on_line)) + 0.05 * abs(float(main_s_on_line) - float(ego_s_on_line))
+        score = main_distance + 0.05 * abs(float(main_s_on_line) - float(ego_s_on_line))
         if score < best_score:
             best_score = score
             best_line = line
@@ -1296,11 +1464,14 @@ def _evaluate_launch_plan(
     context: SceneContext,
     target_line: ReferenceLineView,
     remaining_t: float,
+    *,
+    requested_thw_s: float | None = None,
 ) -> dict[str, Any]:
     """评估当前时刻能否进入 exact/degraded cut-in。"""
     # 逻辑：
     # 1. 先构造统一求解上下文，再计算当前可行 THW 区间。
     # 2. exact 落在区间内就尝试精确解；落在区间外则按下界/上界构造退化解。
+    requested_thw = float(CFG["target_thw_s"] if requested_thw_s is None else requested_thw_s)
     solve_ctx_result = _build_solve_context(context, target_line, remaining_t)
     if not solve_ctx_result["ok"]:
         failure = _build_solver_failure(
@@ -1324,21 +1495,21 @@ def _evaluate_launch_plan(
     interval = _compute_thw_interval(solve_ctx)
     exact_result = _solve_requested_thw(
         solve_ctx,
-        requested_thw=float(CFG["target_thw_s"]),
+        requested_thw=requested_thw,
         reason="cutin_active_exact",
     )
 
     degraded_result = _build_solver_failure("no_solution", "degraded_not_needed")
     degrade_reason = ""
     if interval["ok"]:
-        if float(CFG["target_thw_s"]) < float(interval["thw_min_feasible"]):
+        if requested_thw < float(interval["thw_min_feasible"]):
             degrade_reason = "main_speed_too_low_for_exact_thw"
             degraded_result = _solve_requested_thw(
                 solve_ctx,
                 requested_thw=float(interval["thw_min_feasible"]),
                 reason="cutin_active_degraded",
             )
-        elif float(CFG["target_thw_s"]) > float(interval["thw_max_feasible"]):
+        elif requested_thw > float(interval["thw_max_feasible"]):
             degrade_reason = "ego_cap_limited_for_exact_thw"
             degraded_result = _solve_requested_thw(
                 solve_ctx,
@@ -1397,6 +1568,8 @@ def _evaluate_launch_plan(
 def _build_prepare_strategy(
     context: SceneContext,
     target_line: ReferenceLineView,
+    *,
+    requested_thw_s: float | None = None,
 ) -> dict[str, Any]:
     """根据当前 launch plan 构造 PREPARE 的纵向组织策略。"""
     # 逻辑：
@@ -1414,16 +1587,25 @@ def _build_prepare_strategy(
             "debug": {},
         }
 
-    _, ego_s_on_target, _ = project_point_to_path(
+    ego_s_on_target, _ = _project_on_target_view(
         np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float),
-        target_line.line,
+        target_line,
     )
-    _, main_s_on_target, _ = project_point_to_path(
+    main_s_on_target, _ = _project_on_target_view(
         np.array([main.x, main.y], dtype=float),
-        target_line.line,
+        target_line,
     )
     delta_s_target = float(ego_s_on_target) - float(main_s_on_target)
-    delta_s_goal = float(CFG["prepare_merge_lead_m"])
+    # 准备阶段应为原始THW建立足够领先量，不能只追求固定1米，
+    # 再依靠超时退化或道路末端截断偶然触发换道。
+    requested_thw = float(CFG["target_thw_s"] if requested_thw_s is None else requested_thw_s)
+    main_v = max(0.0, float(main.v))
+    ego_v = max(0.0, float(context.ego_vehicle.v))
+    change_t = float(CFG["lane_change_time_s"])
+    relative_gain = max(0.0, (0.5 * (ego_v + limits.max_v) - main_v) * change_t)
+    buffer_m = float(CFG["prepare_merge_lead_m"])
+    minimum_lead = 0.5 * (limits.ego_length + limits.main_length) + float(CFG["min_physical_gap_m"]) + buffer_m
+    delta_s_goal = max(minimum_lead, requested_thw * main_v - relative_gain + buffer_m)
     delta_s_error = float(delta_s_goal) - float(delta_s_target)
     raw_speed_delta = float(delta_s_error) / max(0.1, float(CFG["prepare_convergence_time_s"]))
     speed_delta = _clamp(
@@ -1445,6 +1627,8 @@ def _build_prepare_strategy(
             "prepare_raw_speed_delta": float(raw_speed_delta),
             "prepare_speed_delta": float(speed_delta),
             "prepare_target_v": float(target_v),
+            "prepare_original_thw_s": requested_thw,
+            "prepare_relative_gain_estimate_m": relative_gain,
         },
     }
 
@@ -1457,104 +1641,49 @@ def _select_active_solution(
     target_line: ReferenceLineView,
     remaining_t: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """在 ACTIVE 中选择本帧应执行的 exact/degraded 解。"""
-    # 逻辑：
-    # 1. exact 模式下优先尝试精确解，失败时允许切到 degraded。
-    # 2. degraded 模式下优先维持已锁定的退化 THW，必要时再夹紧到当前可行边界。
-    launch_plan = _evaluate_launch_plan(context, target_line, remaining_t)
-    solve_ctx = launch_plan["solve_ctx"]
-    if solve_ctx is None:
-        return None, {
-            "scene_status": "globally_infeasible",
-            "reason": str(launch_plan["summary_reason"]),
-            "debug": launch_plan["debug"],
-        }
-
-    if str(memory.get("execution_kind", "")) == "exact":
-        if launch_plan["exact_result"]["ok"]:
-            output = _annotate_output(
-                copy.deepcopy(launch_plan["exact_result"]["solution"]),
-                scene_status="exact_executable",
-                scene_detail="active_exact",
-                scene_debug=launch_plan["debug"],
-            )
-            return output, {"scene_status": "exact_executable", "reason": "active_exact", "debug": launch_plan["debug"]}
-
-        if launch_plan["degraded_result"]["ok"]:
-            memory["execution_kind"] = "degraded"
-            memory["execution_requested_thw_s"] = float(launch_plan["degraded_result"]["requested_thw"])
-            memory["execution_degrade_reason"] = str(launch_plan["degrade_reason"])
-            _print_degrade_event(
-                prefix="active",
-                degrade_reason=str(launch_plan["degrade_reason"]),
-                target_thw=float(CFG["target_thw_s"]),
-                degraded_thw=float(launch_plan["degraded_result"]["requested_thw"]),
-                debug=launch_plan["debug"],
-            )
-            output = _annotate_output(
-                copy.deepcopy(launch_plan["degraded_result"]["solution"]),
-                scene_status="degraded_executable",
-                scene_detail=str(launch_plan["degrade_reason"]),
-                scene_debug=launch_plan["debug"],
-            )
-            return output, {"scene_status": "degraded_executable", "reason": str(launch_plan["degrade_reason"]), "debug": launch_plan["debug"]}
-
-        return None, {
-            "scene_status": str(launch_plan["exact_result"]["scene_status"]),
-            "reason": str(launch_plan["exact_result"]["reason"]),
-            "debug": launch_plan["debug"],
-        }
-
-    requested_thw = float(memory.get("execution_requested_thw_s", CFG["target_thw_s"]))
-    interval = launch_plan["interval"]
-    if interval is not None and interval["ok"]:
-        if str(memory.get("execution_degrade_reason", "")) == "main_speed_too_low_for_exact_thw":
-            requested_thw = max(requested_thw, float(interval["thw_min_feasible"]))
-        else:
-            requested_thw = min(requested_thw, float(interval["thw_max_feasible"]))
-        memory["execution_requested_thw_s"] = float(requested_thw)
-
-    degraded_result = _solve_requested_thw(
-        solve_ctx,
-        requested_thw=float(requested_thw),
-        reason="cutin_active_degraded",
+    """每帧优先原始目标；只在候选求解成功后同步提交执行请求与缓存。"""
+    original_target = _scenario_target_thw(memory)
+    launch_plan = _evaluate_launch_plan(
+        context, target_line, remaining_t, requested_thw_s=original_target,
     )
-    if degraded_result["ok"]:
-        debug = copy.deepcopy(launch_plan["debug"])
-        debug["active_requested_thw"] = float(requested_thw)
-        output = _annotate_output(
-            copy.deepcopy(degraded_result["solution"]),
-            scene_status="degraded_executable",
-            scene_detail=str(memory.get("execution_degrade_reason", "degraded_active")),
-            scene_debug=debug,
-        )
-        return output, {
-            "scene_status": "degraded_executable",
-            "reason": str(memory.get("execution_degrade_reason", "degraded_active")),
-            "debug": debug,
-        }
+    if launch_plan["solve_ctx"] is None:
+        return None, {"scene_status": "globally_infeasible",
+                      "reason": str(launch_plan["summary_reason"]), "debug": launch_plan["debug"]}
 
-    if launch_plan["degraded_result"]["ok"]:
-        memory["execution_requested_thw_s"] = float(launch_plan["degraded_result"]["requested_thw"])
-        debug = copy.deepcopy(launch_plan["debug"])
-        debug["active_requested_thw"] = float(memory["execution_requested_thw_s"])
-        output = _annotate_output(
-            copy.deepcopy(launch_plan["degraded_result"]["solution"]),
-            scene_status="degraded_executable",
-            scene_detail=str(memory.get("execution_degrade_reason", "degraded_active")),
-            scene_debug=debug,
-        )
-        return output, {
-            "scene_status": "degraded_executable",
-            "reason": str(memory.get("execution_degrade_reason", "degraded_active")),
-            "debug": debug,
-        }
+    if launch_plan["exact_result"]["ok"]:
+        selected = launch_plan["exact_result"]
+        kind, degrade_reason = "exact", ""
+    elif launch_plan["degraded_result"]["ok"]:
+        # _evaluate_launch_plan已经按原始目标选择本帧最近可行边界，
+        # 不再对历史退化值取单向max/min，允许预测恢复后目标回落。
+        selected = launch_plan["degraded_result"]
+        kind, degrade_reason = "degraded", str(launch_plan["degrade_reason"])
+    else:
+        failure = launch_plan["exact_result"]
+        return None, {"scene_status": str(failure["scene_status"]),
+                      "reason": str(failure["reason"]), "debug": launch_plan["debug"]}
 
-    return None, {
-        "scene_status": str(degraded_result["scene_status"]),
-        "reason": str(degraded_result["reason"]),
-        "debug": launch_plan["debug"],
-    }
+    accepted_target = float(selected["requested_thw"])
+    previous_kind = str(memory.get("execution_kind", ""))
+    previous_target = float(memory.get("execution_requested_thw_s", 0.0))
+    debug = copy.deepcopy(launch_plan["debug"])
+    debug.update(scenario_target_thw_s=original_target, active_requested_thw=accepted_target,
+                 accepted_execution_kind=kind, scene_candidate_accepted=True)
+    output = _annotate_output(
+        copy.deepcopy(selected["solution"]), f"{kind}_executable",
+        "active_exact" if kind == "exact" else degrade_reason, debug,
+    )
+    memory.update(
+        execution_kind=kind, execution_requested_thw_s=accepted_target,
+        execution_degrade_reason=degrade_reason, last_dynamic_solution=copy.deepcopy(output),
+    )
+    if kind == "exact" and previous_kind == "degraded":
+        print(f"[cutin] recover_original_target time={context.time_s:.2f}s target_thw={original_target:.3f}", flush=True)
+    elif kind == "degraded" and (previous_kind != kind or abs(previous_target-accepted_target) > 1e-9):
+        _print_degrade_event(prefix="active", degrade_reason=degrade_reason,
+                             target_thw=original_target, degraded_thw=accepted_target, debug=debug)
+    return output, {"scene_status": f"{kind}_executable",
+                    "reason": "exact_feasible" if kind == "exact" else degrade_reason, "debug": debug}
 
 
 def _handle_active_infeasible(
@@ -1583,27 +1712,28 @@ def _handle_active_infeasible(
     remaining_t = _remaining_lane_change_time(memory, now)
     progress_ratio = _lane_change_progress_ratio(context, memory, target_line)
     infeasible_count = int(memory["active_infeasible_count"])
-    if infeasible_count < int(CFG["active_persistent_infeasible_max_frames"]):
-        hold_reason = "cutin_transient_hold" if infeasible_count <= int(CFG["active_transient_hold_max_frames"]) else "cutin_persistent_hold"
-        return _build_projected_solution_output(
-            target_line=target_line,
-            solution=hold_solution,
-            remaining_t=remaining_t,
-            reason=hold_reason,
-            scene_status=str(failure_info["scene_status"]),
-            scene_detail=str(failure_info["reason"]),
-            scene_debug=failure_info["debug"],
-        )
-
-    if progress_ratio >= float(CFG["persistent_infeasible_progress_ratio_thresh"]):
-        return _build_projected_solution_output(
-            target_line=target_line,
-            solution=hold_solution,
-            remaining_t=remaining_t,
-            reason="cutin_persistent_infeasible",
-            scene_status=str(failure_info["scene_status"]),
-            scene_detail=str(failure_info["reason"]),
-            scene_debug=failure_info["debug"],
+    transient = infeasible_count < int(CFG["active_persistent_infeasible_max_frames"])
+    if transient or progress_ratio >= float(CFG["persistent_infeasible_progress_ratio_thresh"]):
+        hold_reason = "cutin_persistent_infeasible"
+        if transient:
+            hold_reason = "cutin_transient_hold" if infeasible_count <= int(CFG["active_transient_hold_max_frames"]) else "cutin_persistent_hold"
+        target_lane_ids = set(_normalize_lane_sequence(memory.get("locked_target_lane_sequence", [])))
+        target_lane_ids.add(str(memory.get("locked_target_lane_id", "")))
+        target_lane_ids.discard("")
+        identity_valid = str(target_line.lane_id) in target_lane_ids
+        output = _build_projected_solution_output(
+            target_line=target_line, solution=hold_solution, remaining_t=remaining_t,
+            reason=hold_reason, scene_status=str(failure_info["scene_status"]),
+            scene_detail=str(failure_info["reason"]), scene_debug=failure_info["debug"],
+        ) if identity_valid else None
+        if output is not None:
+            return output
+        debug = copy.deepcopy(failure_info["debug"])
+        debug.update(active_reuse_identity_valid=identity_valid, active_reuse_remaining_t_s=remaining_t)
+        _enter_cooldown(memory, now)
+        return _build_keep_lane_output(
+            context, reason="active_reuse_unavailable", scene_status="no_solution",
+            scene_detail="historical_target_not_reusable", scene_debug=debug,
         )
 
     _enter_cooldown(memory, now)
@@ -1807,6 +1937,12 @@ def _solve_requested_thw(
     # 1. exact 和 degraded 最终都统一落到这里求目标点和目标速度。
     # 2. 返回统一结构，便于状态机直接拿来判断 exact/degraded 是否可执行。
     projection = _project_requested_thw(solve_ctx, float(requested_thw))
+    # 仅吸收浮点舍入，不放宽物理速度/加速度范围。
+    numeric_eps = 1e-9
+    if -numeric_eps <= float(projection["target_v"]) <= float(solve_ctx["max_v"]) + numeric_eps:
+        projection["target_v"] = _clamp(float(projection["target_v"]), 0.0, float(solve_ctx["max_v"]))
+    if float(solve_ctx["min_acc"]) - numeric_eps <= float(projection["a_req"]) <= float(solve_ctx["max_acc"]) + numeric_eps:
+        projection["a_req"] = _clamp(float(projection["a_req"]), float(solve_ctx["min_acc"]), float(solve_ctx["max_acc"]))
     if float(projection["target_gap"]) < float(solve_ctx["min_physical_gap"]):
         return _build_solver_failure(
             "metric_invalid_low_main_speed",
@@ -1937,6 +2073,47 @@ def _project_requested_thw(solve_ctx: dict[str, Any], requested_thw: float) -> d
     }
 
 
+def _target_view_distance(point: np.ndarray, target_line: ReferenceLineView) -> float:
+    """到已知有限道路折线的真实距离；法向偏移不能用于证明车道归属。"""
+    relation_line = getattr(target_line, "relation_line", None)
+    if relation_line is None or len(relation_line) < 2:
+        relation_line = target_line.line
+    line = np.asarray(relation_line, dtype=float)
+    point = np.asarray(point, dtype=float)[:2]
+    if (line.ndim != 2 or line.shape[1] < 2 or len(line) < 2
+            or not np.isfinite(line[:, :2]).all() or not np.isfinite(point).all()):
+        raise ValueError("Invalid target corridor geometry")
+    starts = line[:-1, :2]
+    segments = np.diff(line[:, :2], axis=0)
+    length_squared = np.sum(segments * segments, axis=1)
+    valid = length_squared > 1e-12
+    if not np.any(valid):
+        raise ValueError("Target corridor has no nonzero segment")
+    starts, segments, length_squared = starts[valid], segments[valid], length_squared[valid]
+    fraction = np.clip(np.einsum("ij,ij->i", point - starts, segments) / length_squared, 0.0, 1.0)
+    return float(np.min(np.linalg.norm(point - starts - fraction[:, None] * segments, axis=1)))
+
+
+def _target_view_heading(point: np.ndarray, target_line: ReferenceLineView) -> float:
+    """目标走廊在查询点处的行驶方向，支持前向裁剪线后方的曲线。"""
+    relation_line = getattr(target_line, "relation_line", None)
+    if relation_line is None or len(relation_line) < 2:
+        relation_line = target_line.line
+    point_s, _ = project_signed_on_reference(point, relation_line)
+    _, heading = get_path_point_at_s(relation_line, point_s)
+    return float(heading)
+
+
+def _project_on_target_view(point: np.ndarray, target_line: ReferenceLineView) -> tuple[float, float]:
+    """目标车道完整关系轴上的投影，返回原局部规划线坐标，后方保留负值。"""
+    relation_line = getattr(target_line, "relation_line", None)
+    if relation_line is None or len(relation_line) < 2:
+        relation_line = target_line.line
+    point_s, point_d = project_signed_on_reference(point, relation_line)
+    origin_s, _ = project_signed_on_reference(target_line.line[0, :2], relation_line)
+    return float(point_s - origin_s), float(point_d)
+
+
 def _predict_main_vehicle_at_t(
     context: SceneContext,
     target_line: ReferenceLineView,
@@ -1959,7 +2136,9 @@ def _predict_main_vehicle_at_t(
     s_pred_on_main = _clamp(s_pred_on_main, float(main_line.current_s), float(main_line.cumulative_s[-1]) - 0.5)
     xy_pred, heading_pred = get_path_point_at_s(main_line.line, s_pred_on_main, main_line.cumulative_s)
     v_pred = max(0.0, float(main.v) + a_use * float(total_t))
-    _, s_pred_on_target, d_pred_on_target = project_point_to_path(xy_pred, target_line.line)
+    # 预测点可能在自车前向规划线起点后方，不能夹到 s=0。
+    # 在完整目标车道轴上保留有符号位置，再换回原局部线的 s 原点。
+    s_pred_on_target, d_pred_on_target = _project_on_target_view(xy_pred, target_line)
     return {
         "x": float(xy_pred[0]),
         "y": float(xy_pred[1]),
@@ -1980,16 +2159,21 @@ def _completion_debug(memory: dict[str, Any]) -> dict[str, Any]:
 
     achieved = memory.get("completion_achieved_thw_s")
     error = memory.get("completion_thw_error_s")
+    tolerance = memory.get("completion_thw_tolerance_s")
+    tolerance = float(CFG["thw_tol_s"] if tolerance is None else tolerance)
     return {
+        "cutin_metrics_version": 2,
         "completion_latched": True,
         "completion_time_s": float(memory.get("completion_time_s", -1.0)),
         "completion_lane_id": str(memory.get("completion_lane_id", "")),
         "completion_execution_kind": str(memory.get("completion_execution_kind", "")),
         "completion_requested_thw_s": float(memory.get("completion_requested_thw_s", 0.0)),
+        "completion_execution_target_thw_s": memory.get("completion_execution_target_thw_s"),
+        "completion_thw_tolerance_s": tolerance,
         "completion_achieved_thw_s": None if achieved is None else float(achieved),
         "completion_thw_error_s": None if error is None else float(error),
         "completion_thw_within_tolerance": bool(
-            error is not None and abs(float(error)) <= float(CFG["thw_tol_s"])
+            error is not None and np.isfinite(error) and abs(float(error)) <= tolerance
         ),
         "completion_metric_reason": str(memory.get("completion_metric_reason", "")),
     }
@@ -2005,6 +2189,8 @@ def _annotate_output(
     # 逻辑：
     # 1. 轨迹目标和场景状态分开记录，便于上层区分 exact/degraded/infeasible。
     output["scene_status"] = str(scene_status)
+    output["enforce_external_dynamic_limits"] = True
+    output["time_param_solver_tolerance"] = 1e-4
     if scene_detail is not None:
         output["scene_detail"] = str(scene_detail)
     if scene_debug is not None:
@@ -2087,10 +2273,14 @@ def _read_vehicle_limits(context: SceneContext) -> VehicleLimits:
     runtime_frame = context.runtime_frame
     config = {} if runtime_frame is None else runtime_frame.config
     ego_length = float(config.get("size", {}).get("L", 4.5))
+    main_actor = None if runtime_frame is None else getattr(runtime_frame, "main_actor", None)
+    main_length = float(getattr(main_actor, "length", ego_length))
+    if not np.isfinite(main_length) or main_length <= 0.0:
+        main_length = ego_length
     constrain = config.get("constrain", {})
     return VehicleLimits(
         ego_length=float(ego_length),
-        main_length=float(ego_length),
+        main_length=main_length,
         max_v=float(constrain.get("max_v", 6.94)),
         min_acc=float(constrain.get("min_acc", -2.0)),
         max_acc=float(constrain.get("max_acc", 2.0)),

@@ -54,6 +54,8 @@ def build_relation_reference(
     遇到有歧义的分叉、重复 ID、缺失几何或无效连接时停止。
     显式路径只有在对应真实纵向拓扑连接时才能用于选择分支，
     不能仅凭全局路径中出现相邻车道就选择该车道。
+    后向候选合并显式 predecessor 与已知 successor 的反向边，兼容缺失的反向索引；
+    所有候选仍须通过几何连接校验和原有路径消歧，不修改原始地图。
     """
     centre_lines = getattr(parser, 'lane_centerlines', {})
     lane_info = getattr(parser, 'lanes', {})
@@ -69,10 +71,17 @@ def build_relation_reference(
     paths = (tuple(planned_path), tuple(getattr(ego_view, 'lane_sequence', ()) or ()))
     visited = {current}
     before, after = [], []
+    inferred_predecessors: dict[str, list[str]] = {}
+    for lane_id, info in lane_info.items():
+        for successor in info.get('successor', []) or []:
+            inferred_predecessors.setdefault(str(successor), []).append(str(lane_id))
 
     def next_lane(lane_id: str, direction: str) -> str | None:
         options = []
-        for candidate in lane_info.get(lane_id, {}).get(direction, []) or []:
+        candidates = list(lane_info.get(lane_id, {}).get(direction, []) or [])
+        if direction == 'predecessor':
+            candidates.extend(inferred_predecessors.get(lane_id, []))
+        for candidate in candidates:
             candidate = str(candidate)
             if candidate in visited or candidate in options:
                 continue
