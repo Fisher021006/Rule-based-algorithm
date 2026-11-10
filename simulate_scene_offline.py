@@ -63,6 +63,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ego-max-speed-kph", type=float, default=25.0, help="自车/GVT 离线仿真最大速度 km/h")
     parser.add_argument("--main-start-speed", type=float, default=2.0, help="主车初始速度 m/s")
     parser.add_argument("--main-desired-speed", type=float, default=4.0, help="主车 IDM 期望速度 m/s；constant 模式忽略该参数")
+    parser.add_argument(
+        "--main-max-acc",
+        type=float,
+        default=None,
+        help="主车 IDM 最大加速度 m/s²；缺省沿用离线仿真内置值，用于复现实车记录中的加速度",
+    )
     parser.add_argument("--disable-main-obstacle", action="store_true", help="不向局部规划器注入主车障碍物，用于无障碍基线测试")
     parser.add_argument(
         "--main-motion",

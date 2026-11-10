@@ -70,6 +70,7 @@ def _build_route_actor(
     lane_change_side: str = "left",
     lane_change_start_s: float = 10.0,
     lane_change_duration_s: float = 4.0,
+    max_acc: float | None = None,
 ) -> tuple[IDMRouteVehicle, np.ndarray, np.ndarray | None]:
     """按离线仿真参数创建一辆路线/静止障碍车。"""
 
@@ -105,6 +106,8 @@ def _build_route_actor(
             lane_change_duration_s=lane_change_duration_s,
         )
     actor.ptc_id = str(ptc_id)
+    if max_acc is not None:
+        actor.max_acc = float(max_acc)
     return actor, actor_start_xy, actor_goal_xy
 
 
@@ -174,6 +177,7 @@ def run_simulation(args: argparse.Namespace) -> dict[str, Any]:
         lane_change_side=str(getattr(args, "main_lane_change_side", "left")),
         lane_change_start_s=float(getattr(args, "main_lane_change_start_s", 10.0)),
         lane_change_duration_s=float(getattr(args, "main_lane_change_duration_s", 4.0)),
+        max_acc=getattr(args, "main_max_acc", None),
     )
     main_lane_extender = _build_route_extender(
         xodr_parser=xodr_parser,

@@ -17,7 +17,14 @@ from typing import Any
 import numpy as np
 
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
-from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
+from traj_planner import path as traj_path_module
+from traj_planner.path import bezier_curve_kappa
+from traj_planner.tools import (
+    calculate_path_cumulative_distance,
+    get_path_point_at_s,
+    normalize_angle,
+    project_point_to_path,
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -331,26 +338,114 @@ def _build_conflict_target_output(*, context: SceneContext, metrics: dict[str, A
     if limited and "sync_target_feasible" in scene_debug:
         scene_debug.update(sync_target_feasible=False, sync_target_infeasible_reason="local_time_parameterization_limited")
     available = max(0.0, float(line.cumulative_s[-1]) - 0.5 - current_s)
-    if distance > available + 1e-6:
+    # 目标点落在参考线上；车身存在横向偏移（换道未完成）时，规划器实际生成的
+    # 路径比参考线弧长更长，直接按弧长下发会让纵向进度超过剖面可达距离。
+    # 这里用规划器同一段 Bezier 几何把期望路径长度折算成弧长，不放宽动态限值。
+    path_distance = float(distance)
+    arc_distance, achieved_distance = _path_distance_to_arc(
+        context, line, float(current_s), float(lateral), path_distance, available)
+    if achieved_distance < path_distance - 1e-6:
         # 局部走廊不足时明确标记，不把裁短后的目标继续称作原时序可行。
         scene_debug.update(sync_target_feasible=False, sync_target_infeasible_reason="local_corridor_too_short")
-        distance = available
-        terminal_v = min(terminal_v, max(0.0, 2.0 * distance / horizon - float(context.ego_vehicle.v)))
+        terminal_v = min(terminal_v, max(0.0, 2.0 * achieved_distance / horizon - float(context.ego_vehicle.v)))
     scene_debug.update(selection)
     scene_debug.update(requested_sync_acc_mps2=acceleration, target_acc_mps2=0.0,
                        local_mean_acc_mps2=(terminal_v-float(context.ego_vehicle.v))/horizon,
-                       local_output_target_distance_m=distance,
-                       local_output_target_s_m=current_s + distance, local_output_plan_t_s=horizon,
+                       local_output_target_distance_m=achieved_distance,
+                       local_output_target_arc_m=float(arc_distance),
+                       local_output_target_path_distance_m=path_distance,
+                       local_output_target_s_m=current_s + float(arc_distance), local_output_plan_t_s=horizon,
                        ego_s_on_selected_local_line_m=float(current_s), ego_d_on_selected_local_line_m=float(lateral),
                        output_target_line_source="route_aligned_bounded_profile")
     output = _build_line_target_output(context=context, target_line=line,
-                                    target_s=current_s + distance, target_v=terminal_v,
+                                    target_s=current_s + float(arc_distance), target_v=terminal_v,
                                     target_a=0.0, plan_t=horizon, reason=reason,
                                     scene_status=scene_status, scene_debug=scene_debug,
                                     min_plan_t=float(context.dt), min_target_progress=0.0)
     # 仅本场景请求最终动态限值复核，其他既有外部目标场景保持原入口行为。
     output["enforce_external_dynamic_limits"] = True
     return output
+
+
+def _path_distance_to_arc(
+    context: SceneContext,
+    line: ReferenceLineView,
+    current_s: float,
+    lateral: float,
+    path_distance: float,
+    available_s: float,
+) -> tuple[float, float]:
+    """把期望路径长度折算成参考线弧长，返回 ``(弧长, 实际路径长度)``。
+
+    规划器在车身偏离参考线时会用一段 Bezier 从当前位置平滑并回目标点，
+    实际路径长度大于弧长。这里复用同一段几何反解弧长，保证下发的纵向
+    进度与速度剖面可达的距离一致。路径长度对弧长单调递增，用割线迭代
+    在括号内收敛，通常 2~3 次即可；横向偏移小于 5 cm 时两者差可忽略，
+    直接返回，避免每帧额外构造 Bezier。
+    """
+
+    available_s = max(0.0, float(available_s))
+    path_distance = max(0.0, float(path_distance))
+    if abs(float(lateral)) <= 0.05:
+        arc_s = min(path_distance, available_s)
+        return arc_s, arc_s
+
+    ego_xy = np.array([context.ego_vehicle.x, context.ego_vehicle.y], dtype=float)
+    start_heading = float(context.ego_vehicle.heading)
+
+    def path_length(arc_s: float) -> float:
+        target_xy, _ = get_path_point_at_s(line.line, current_s + arc_s, line.cumulative_s)
+        # 这里只是复用同一段几何量长度，不能占用规划器的曲率告警额度，
+        # 否则真正需要关注的规划告警会被提前用光。
+        warning_state = traj_path_module._curvature_warning_count
+        traj_path_module._curvature_warning_count = traj_path_module.CURVATURE_WARNING_PRINT_LIMIT + 2
+        try:
+            path = np.asarray(
+                bezier_curve_kappa(line.line, ego_xy, np.asarray(target_xy, dtype=float), start_heading,
+                                   end_theta=None),
+                dtype=float,
+            )
+        finally:
+            traj_path_module._curvature_warning_count = warning_state
+        if path.ndim != 2 or len(path) < 2 or not np.isfinite(path).all():
+            return float("inf")
+        return float(calculate_path_cumulative_distance(path)[-1])
+
+    start_length = path_length(0.0)
+    if not np.isfinite(start_length):
+        return available_s, path_distance
+    if start_length >= path_distance - 1e-6:
+        return 0.0, start_length
+
+    hi_arc = min(path_distance, available_s)
+    hi_length = path_length(hi_arc)
+    if not np.isfinite(hi_length):
+        return available_s, path_distance
+    if hi_length <= path_distance:
+        return hi_arc, hi_length
+
+    # 括号 [lo, hi] 始终满足 length(lo) <= path_distance < length(hi)。
+    # 割线步落在括号内部并留最小收缩量，避免端点停滞；返回下界保证不超发。
+    lo_arc, lo_length = 0.0, start_length
+    for _ in range(4):
+        if hi_length - lo_length <= 1e-3:
+            break
+        shrink = max(1e-4, 1e-3 * (hi_arc - lo_arc))
+        if hi_arc - lo_arc <= 2.0 * shrink:
+            break
+        span = hi_length - lo_length
+        if span <= 1e-9:
+            break
+        guess = lo_arc + (path_distance - lo_length) * (hi_arc - lo_arc) / span
+        guess = min(max(guess, lo_arc + shrink), hi_arc - shrink)
+        guess_length = path_length(guess)
+        if not np.isfinite(guess_length):
+            break
+        if guess_length <= path_distance:
+            lo_arc, lo_length = guess, guess_length
+        else:
+            hi_arc, hi_length = guess, guess_length
+    return lo_arc, lo_length
 
 
 def _build_line_target_output(
