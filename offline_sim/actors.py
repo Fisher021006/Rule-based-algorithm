@@ -9,7 +9,7 @@ import numpy as np
 
 from global_planner.curve_planner.planner import CurvePlanner, TrajectoryGenerator
 from global_planner.curve_planner.tools import project_and_cut_path
-from planning_runtime.scene.map_views import slice_centerline_from_projection
+from planning_runtime.scene.map_views import extend_lane_forward, slice_centerline_from_projection
 from simulator.vehicle import GVT
 from traj_planner.tools import calculate_path_cumulative_distance, get_path_point_at_s, project_point_to_path
 from xodr_parser.xodr_parser import XODRParser
@@ -165,15 +165,20 @@ class IDMRouteVehicle:
         if not target_lane_id or target_lane_id not in planner.parser.lanes:
             raise ValueError(f"起始车道 {source_lane_id} 不存在 {self.lane_change_side} 侧相邻车道")
 
-        source_line = np.asarray(planner.get_lane_centerline(source_lane_id), dtype=float)
-        target_line = np.asarray(planner.get_lane_centerline(target_lane_id), dtype=float)
-        if source_line.ndim != 2 or len(source_line) < 2:
-            raise ValueError(f"起始车道 {source_lane_id} 中心线无效")
-        if target_line.ndim != 2 or len(target_line) < 2:
-            raise ValueError(f"目标车道 {target_lane_id} 中心线无效")
+        # 单条车道中心线在车道末端就断了：主车若在短车道段内换道，纵向进度会先被
+        # 夹在路径末端，而换道时钟仍在推进，车辆被横向拖走并卡死。这里沿 successor
+        # 串接中心线，保证路径覆盖「起步距离 + 换道距离 + 余量」。
+        approx_speed = max(float(self.desired_speed), float(start_speed), 1.0)
+        required_chain_s = (
+            float(self.lane_change_start_s)
+            + approx_speed * float(self.lane_change_duration_s)
+            + 30.0
+        )
+        source_line = _build_centerline_chain(planner, source_lane_id, required_chain_s)
+        target_line = _build_centerline_chain(planner, target_lane_id, required_chain_s)
 
-        self.script_source_line = np.asarray(source_line[:, :2], dtype=float)
-        self.script_target_line = np.asarray(target_line[:, :2], dtype=float)
+        self.script_source_line = np.asarray(source_line, dtype=float)
+        self.script_target_line = np.asarray(target_line, dtype=float)
         self.script_source_cum = calculate_path_cumulative_distance(self.script_source_line)
         self.script_target_cum = calculate_path_cumulative_distance(self.script_target_line)
         _, source_s, _ = project_point_to_path(np.asarray(start_xy, dtype=float), self.script_source_line)
@@ -307,15 +312,19 @@ class IDMRouteVehicle:
             self.a = self._compute_idm_acc(leader)
             travel_s = max(0.0, self.v * dt + 0.5 * self.a * dt * dt)
             next_v = max(0.0, min(self.v + self.a * dt, self.desired_speed))
+        previous_progress_s = float(self.progress_s)
         self.progress_s = min(self.progress_s + travel_s, float(self.path_cumulative_s[-1]))
 
         if self.motion_mode == "scripted_lane_change":
             if self.progress_s >= float(self.lane_change_start_s):
                 self.lane_change_started = True
-                self.lane_change_elapsed_s = min(
-                    float(self.lane_change_duration_s),
-                    self.lane_change_elapsed_s + float(dt),
-                )
+                # 纵向进度到路径末端会被夹住，此时继续推进换道时钟会把车原地横向
+                # 拖走，所以只在进度实际前进时计时。
+                if self.progress_s > previous_progress_s:
+                    self.lane_change_elapsed_s = min(
+                        float(self.lane_change_duration_s),
+                        self.lane_change_elapsed_s + float(dt),
+                    )
             blend = _smoothstep(self.lane_change_elapsed_s / max(float(self.lane_change_duration_s), 1e-3))
             self.lane_change_completed = bool(blend >= 0.999)
             # 输入起点可在车道中心线附近但不完全重合。首帧若用该偏差计算朝向，
@@ -355,6 +364,48 @@ def serialize_obstacle_input(obstacle: Any) -> dict[str, Any]:
         "width": float(getattr(obstacle, "width", getattr(obstacle, "W", 1.8))),
         "timestamp_ms": int(getattr(obstacle, "timestamp_ms", 0) or 0),
     }
+
+
+_CHAIN_JOIN_GAP_TOL_M = 2.0
+
+
+def _build_centerline_chain(
+    planner: CurvePlanner,
+    lane_id: str,
+    required_s: float,
+    max_lane_segments: int = 12,
+) -> np.ndarray:
+    """沿 successor 串接车道中心线，直到累计长度满足 required_s。"""
+
+    lane_sequence = extend_lane_forward(planner.parser, lane_id, max_lane_segments)
+    points: list[np.ndarray] = []
+    total_s = 0.0
+    for current_lane_id in lane_sequence:
+        line = np.asarray(planner.get_lane_centerline(current_lane_id), dtype=float)
+        if line.ndim != 2 or len(line) < 2:
+            break
+        line = np.asarray(line[:, :2], dtype=float)
+        if points:
+            gap = float(np.linalg.norm(line[0] - points[-1][-1]))
+            if gap > _CHAIN_JOIN_GAP_TOL_M:
+                break
+            if gap < 1e-3:
+                line = line[1:]
+                if len(line) < 2:
+                    break
+            total_s += gap
+        points.append(line)
+        total_s += float(calculate_path_cumulative_distance(line)[-1])
+        if total_s >= float(required_s):
+            break
+    if not points:
+        raise ValueError(f"车道 {lane_id} 中心线无效")
+    if total_s < float(required_s):
+        print(
+            f"[warn] 车道 {lane_id} 中心线链长 {total_s:.1f} m，"
+            f"不足所需 {float(required_s):.1f} m，换道可能在路径末端截断"
+        )
+    return np.vstack(points)
 
 
 def _smoothstep(value: float) -> float:

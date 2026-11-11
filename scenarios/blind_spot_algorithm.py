@@ -18,7 +18,11 @@ from typing import Any
 
 import numpy as np
 
-from planning_runtime.scene.target_feasibility import DEFAULT_MAX_PLAN_T_S, resolve_target
+from planning_runtime.scene.target_feasibility import (
+    DEFAULT_MAX_PLAN_T_S,
+    resolve_corridor_target,
+    resolve_target,
+)
 from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
 
@@ -1097,32 +1101,69 @@ def _build_line_target_output(
     resolved_t = float(resolution.plan_t)
     travel_s = float(resolution.travel_s)
 
+    origin_s = float(target_line.current_s)
     max_target_s = float(target_line.cumulative_s[-1]) - 0.5
-    available_s = max(0.0, max_target_s - float(target_line.current_s))
-    if travel_s > available_s + 1e-6:
-        limited = resolve_target(
+    available_s = max(0.0, max_target_s - origin_s)
+    corridor_fallback = False
+
+    def resolve_corridor(distance_s: float, end_v: float):
+        """按夹取后的真实距离复核；请求末速不可行时退化为保持当前速度。"""
+
+        return resolve_corridor_target(
             v_start=float(context.ego_vehicle.v),
-            v_end=resolved_v,
-            plan_t=resolved_t,
+            v_end=float(end_v),
+            plan_t=float(resolved_t),
             a_min=float(limits.min_acc),
             a_max=float(limits.max_acc),
             v_max=float(limits.max_v),
             dt=float(context.dt),
-            fixed_travel_s=available_s,
+            fixed_travel_s=float(distance_s),
             max_plan_t=float(SCENE_CONFIG["target_max_plan_t_s"]),
             min_plan_t=float(context.dt),
         )
+
+    if travel_s > available_s + 1e-6:
+        limited = resolve_corridor(available_s, resolved_v)
         if limited.feasible:
             resolution = limited
             resolved_v = float(limited.v_end)
             resolved_t = float(limited.plan_t)
             travel_s = float(limited.travel_s)
+        else:
+            corridor_fallback = True
 
     target_s = _clamp(
-        float(target_line.current_s) + float(travel_s),
-        float(target_line.current_s) + min(float(min_progress), float(travel_s)),
+        origin_s + float(travel_s),
+        origin_s + min(float(min_progress), float(travel_s)),
         max_target_s,
     )
+    actual_travel_s = float(target_s) - origin_s
+    if abs(actual_travel_s - float(travel_s)) > 1e-6:
+        # 夹取改变了实际距离时，必须按真实距离重新解析；否则场景校验过的
+        # ``(L, T, vT)`` 会和规划器实际走的几何长度不一致。
+        limited = resolve_corridor(actual_travel_s, resolved_v)
+        if limited.feasible:
+            resolution = limited
+            resolved_v = float(limited.v_end)
+            resolved_t = float(limited.plan_t)
+            travel_s = float(limited.travel_s)
+        else:
+            corridor_fallback = True
+
+    if abs(float(travel_s) - actual_travel_s) > 1e-6:
+        # 走廊内不存在任何可行 (T, vT) 时，保持当前速度按时域反算距离，
+        # 保证下发的目标点与速度剖面使用同一个 L，避免规划器收到矛盾目标。
+        v_now = max(0.0, float(context.ego_vehicle.v))
+        resolved_t = _clamp(
+            actual_travel_s / max(v_now, 1e-3),
+            float(context.dt),
+            float(SCENE_CONFIG["target_max_plan_t_s"]),
+        )
+        travel_s = min(actual_travel_s, v_now * resolved_t)
+        target_s = origin_s + float(travel_s)
+        resolved_v = v_now
+        corridor_fallback = True
+
     target_xy, target_heading = get_path_point_at_s(target_line.line, target_s, target_line.cumulative_s)
     resolved_a = _clamp(
         (resolved_v - float(context.ego_vehicle.v)) / max(resolved_t, 1e-3),
@@ -1139,6 +1180,8 @@ def _build_line_target_output(
             "line_target_resolved_a_mps2": float(resolved_a),
             "line_target_travel_s_m": float(travel_s),
             "line_target_s_m": float(target_s),
+            "line_target_corridor_available_m": float(available_s),
+            "line_target_corridor_fallback": bool(corridor_fallback),
         }
     )
     output = {

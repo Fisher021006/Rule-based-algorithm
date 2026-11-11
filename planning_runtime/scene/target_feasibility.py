@@ -460,23 +460,27 @@ def _resolve_fixed(
         for candidate in t_values:
             lower, upper = _reachable_end_speed(v_start, candidate, dt, a_min, a_max, v_min, v_max)
             if allow_clip:
-                v_values = [float(v_end)]
-                if lower - _SPEED_EPS_MPS <= v_end <= upper + _SPEED_EPS_MPS:
-                    # 请求速度在可达区间内但距离不可达时，换一个终点速度。
-                    v_values.extend(
-                        _feasible_end_speed_candidates(
-                            v_start=v_start,
-                            travel_s=target,
-                            plan_t=candidate,
-                            lower=lower,
-                            upper=upper,
-                            requested=v_end,
-                            a_min=a_min,
-                            a_max=a_max,
-                        )
-                    )
-                else:
-                    v_values.append(_clip(v_end, lower, upper))
+                # 请求速度可能落在可达区间外。此时不能只试边界点：距离被截短
+                # 后，真正可行的终点速度往往在区间内部（例如减速目标遇到短
+                # 走廊时，只能少减一点速度），必须把整个可达区间作为候选。
+                requested_v = _clip(v_end, lower, upper)
+                v_values: list[float] = []
+                for value in (
+                    float(v_end),
+                    requested_v,
+                    *_feasible_end_speed_candidates(
+                        v_start=v_start,
+                        travel_s=target,
+                        plan_t=candidate,
+                        lower=lower,
+                        upper=upper,
+                        requested=requested_v,
+                        a_min=a_min,
+                        a_max=a_max,
+                    ),
+                ):
+                    if all(abs(value - seen) > 1e-6 for seen in v_values):
+                        v_values.append(float(value))
             elif lower - _SPEED_EPS_MPS <= v_end <= upper + _SPEED_EPS_MPS:
                 v_values = [float(v_end)]
             else:
@@ -607,3 +611,45 @@ def resolve_target(
         max_plan_t=max_plan_t,
         min_plan_t=min_plan_t,
     )
+
+
+def resolve_corridor_target(
+    *,
+    v_start: float,
+    v_end: float,
+    plan_t: float,
+    a_min: float,
+    a_max: float,
+    v_max: float,
+    dt: float,
+    fixed_travel_s: float,
+    max_plan_t: float,
+    min_plan_t: float = MIN_EXTERNAL_PLAN_T_S,
+) -> TargetResolution:
+    """在固定走廊距离下解析目标，末速不可行时退化为保持当前速度。
+
+    场景把目标点夹取到参考线末端后，必须按夹取后的真实距离复核。原末速
+    在短走廊里可能无解（减速目标需要更长的刹车距离），但"走廊内保持当前
+    速度"通常仍然可行，因此这里先按请求末速解析，失败再按 ``v_start`` 重试。
+
+    返回值的 ``travel_s`` 恒等于 ``fixed_travel_s``。``feasible`` 为假表示
+    该距离在允许时域内不存在任何可行 ``(T, vT)``，调用方必须自行兜底，
+    不能把它当成可下发目标。
+    """
+
+    kwargs = dict(
+        v_start=float(v_start),
+        plan_t=float(plan_t),
+        a_min=float(a_min),
+        a_max=float(a_max),
+        v_max=float(v_max),
+        dt=float(dt),
+        fixed_travel_s=float(fixed_travel_s),
+        max_plan_t=float(max_plan_t),
+        min_plan_t=float(min_plan_t),
+    )
+    requested = resolve_target(v_end=float(v_end), **kwargs)
+    if requested.feasible:
+        return requested
+    hold = resolve_target(v_end=float(v_start), **kwargs)
+    return hold if hold.feasible else requested
