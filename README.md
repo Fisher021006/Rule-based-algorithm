@@ -127,3 +127,41 @@ python simulate_rollout.py --start-xy -418 59 --goal-xy -429 129 --output-prefix
 - `common_msgs/controlcmd.msg` 中 `acceleration` 字段在该协议下承载的是速度指令，单位 `km/h`
 - 当前 OBU 输入会优先读取 `pos_lon/pos_lat`，回退 `lon/lat`，并带上 `speed / heading / accel / size / timestamp` 转成内部障碍物
 - 默认地图为 `xodr_parser/data/同济测试场.xodr`，并已附带 `xodr_parser/cache/同济测试场.pkl`
+
+## 6. 平台任务接入（新）
+
+`direct_control_node.py` 保持原样，平台接入由 `vehicle_platform_bridge.py` 提供，
+用 `--role` 区分五个角色：`mux / task-manager / adapter / algorithm / probe`。
+
+一键启动四个角色（mux、task-manager、adapter、algorithm）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/redis_stu/devel/setup.bash
+source .venv/bin/activate
+
+# 默认 cut_in，mux 限速 0，车不会动，用于联调
+./start_platform_bridge.sh
+
+# 真正控车
+./start_platform_bridge.sh --max-speed-kph 25
+
+# 换场景
+./start_platform_bridge.sh -a scenarios.blind_spot_algorithm.blind_spot_algorithm
+
+# 查看/停止
+./start_platform_bridge.sh status
+./start_platform_bridge.sh stop
+```
+
+脚本会自动选择终端模式：图形界面用 gnome-terminal 的四个标签页，
+SSH 下用 tmux 会话 `bridge`，都没有就后台运行并输出日志到 `logs/`。
+`--dry-run` 只打印命令不启动。
+
+注意：
+
+- `mux` 是 `/controlcmd` 的唯一发布者，**不要**同时运行 `launch_direct_control.sh`，
+  否则两个节点会抢控制权。
+- 任务停止或算法异常时 `mux` 自动回到 HOLD（`acceleration=0, brkreq=0`）。
+- 首次上车先用 `--role probe` 打印 `/start_task`、`/taskstatus`、
+  `/test_trajectory_req` 的真实内容，再启动四个角色。
