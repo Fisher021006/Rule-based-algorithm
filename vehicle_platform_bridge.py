@@ -1454,6 +1454,7 @@ class TaskDrivenDirectControlNode:
                 self._emergency = False
                 self._last_hold_log = 0.0
                 self._last_route_log = 0.0
+                self._last_scene_state_log = 0.0
                 super().__init__(node_args)
 
                 from std_msgs.msg import String
@@ -1668,6 +1669,29 @@ class TaskDrivenDirectControlNode:
                     log(f"[algorithm] HOLD ({reason})")
                     self._last_hold_log = current
 
+            def _log_scene_state(self, obstacles) -> None:
+                """场景要求停车时打印原因和当前障碍物 id，便于现场定位。"""
+                history = getattr(self.gvt.scene_target_provider, "history", None)
+                if not history:
+                    return
+                last = history[-1]
+                mode = str(last.get("control_mode", ""))
+                status = str(last.get("scene_status", ""))
+                if mode != "emergency_stop" and "invalid" not in status:
+                    return
+                current = time.time()
+                if current - self._last_scene_state_log < 1.0:
+                    return
+                self._last_scene_state_log = current
+                obstacle_ids = sorted(
+                    str(getattr(obstacle, "ptc_id", "")) for obstacle in obstacles
+                )
+                log(
+                    f"[algorithm] scene stop mode={mode} status={status} "
+                    f"detail={last.get('scene_detail', '')} "
+                    f"obstacle_ids=[{','.join(obstacle_ids)}]"
+                )
+
             def _ensure_route_initialized(self) -> bool:
                 state, _, route, token = self._bridge_snapshot()
                 if state != STATE_ACTIVE or route is None:
@@ -1696,10 +1720,14 @@ class TaskDrivenDirectControlNode:
                         log("[algorithm] 路线缺少有效起点")
                         return False
 
-                # 交叉口/伴行等场景需要主车的路线意图；这里用平台起点而不是自车当前位姿。
-                self.gvt.scene_target_provider.set_main_route_points(
-                    route_start_xy if route_start_xy is not None else start_xy,
-                    goal_xy,
+                # 平台任务路线是自车的路线，不能拿来当主车路线意图。
+                # 主车路线只认 --scene-main-start-xy/--scene-main-goal-xy；
+                # 未配置时保持为空，场景会明确报 route_intent_missing。
+                main_start_xy = self.gvt.scene_target_provider.main_route_start_xy
+                main_goal_xy = self.gvt.scene_target_provider.main_route_goal_xy
+                log(
+                    f"[algorithm] main route intent start={main_start_xy.tolist() if main_start_xy is not None else None} "
+                    f"goal={main_goal_xy.tolist() if main_goal_xy is not None else None}"
                 )
 
                 try:
@@ -1773,6 +1801,8 @@ class TaskDrivenDirectControlNode:
                         self._set_hold("planner_exception")
                         time.sleep(interval)
                         continue
+
+                    self._log_scene_state(obstacles)
 
                     if trajectory is None:
                         if self.gvt.traj_planner.attribute.get("plan_mode") == "arrived":

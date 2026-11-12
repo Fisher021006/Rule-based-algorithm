@@ -10,6 +10,11 @@
 #   ./start_platform_bridge.sh --dry-run              # 只打印命令，不启动
 #   ./start_platform_bridge.sh --no-use-taskstatus-transitions  # 只认 /start_task
 #   ./start_platform_bridge.sh --running-task-status-values 1,2   # 哪些 taskStatus 算执行中
+#   ./start_platform_bridge.sh --scene-main-ptc-id 3690   # 锁定场景主车
+#   ./start_platform_bridge.sh --scene-main-start-xy -315 176 --scene-main-goal-xy -272 124
+#                                                           # 显式指定场景主车路线（平台不发主车路径）
+#   ./start_platform_bridge.sh --trajectory-log-path logs/intersection.trajectory.jsonl
+#                                                           # 逐帧规划结果落盘（JSONL）
 #   ./start_platform_bridge.sh status                 # 查看运行中的角色
 #   ./start_platform_bridge.sh stop                   # 停止所有角色
 #
@@ -33,7 +38,10 @@ MODE="auto"
 PLANNER_MODE="scene_target"
 SYMBOL="scenarios.cut_in_algorithm.cut_in_algorithm"
 MAX_SPEED_KPH="0"
-SCENE_MAIN_PTC_ID="200005"
+SCENE_MAIN_PTC_ID="3690"
+SCENE_MAIN_START_XY=()
+SCENE_MAIN_GOAL_XY=()
+TRAJECTORY_LOG_PATH=""
 PLAN_HZ="10"
 CONTROL_HZ="20"
 BRIDGE_HZ="20"
@@ -81,6 +89,12 @@ while [[ $# -gt 0 ]]; do
             MAX_SPEED_KPH="${2:?缺少参数值}"; shift 2 ;;
         --scene-main-ptc-id)
             SCENE_MAIN_PTC_ID="${2:?缺少参数值}"; shift 2 ;;
+        --scene-main-start-xy)
+            SCENE_MAIN_START_XY=("${2:?缺少X}" "${3:?缺少Y}"); shift 3 ;;
+        --scene-main-goal-xy)
+            SCENE_MAIN_GOAL_XY=("${2:?缺少X}" "${3:?缺少Y}"); shift 3 ;;
+        --trajectory-log-path)
+            TRAJECTORY_LOG_PATH="${2:?缺少参数值}"; shift 2 ;;
         --plan-hz)
             PLAN_HZ="${2:?缺少参数值}"; shift 2 ;;
         --control-hz)
@@ -184,6 +198,12 @@ case "$PLANNER_MODE" in
         exit 1 ;;
 esac
 
+if [[ ${#SCENE_MAIN_START_XY[@]} -gt 0 && ${#SCENE_MAIN_GOAL_XY[@]} -eq 0 ]] \
+    || [[ ${#SCENE_MAIN_START_XY[@]} -eq 0 && ${#SCENE_MAIN_GOAL_XY[@]} -gt 0 ]]; then
+    echo "错误：主车起点和终点必须同时提供" >&2
+    exit 1
+fi
+
 if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
     PYTHON="$SCRIPT_DIR/.venv/bin/python"
     VENV_ACTIVATE="$SCRIPT_DIR/.venv/bin/activate"
@@ -242,6 +262,13 @@ fi
 if [[ "$SCENE_MAIN_PTC_ID" != "-" ]]; then
     ALGO_ARGS+=(--scene-main-ptc-id "$SCENE_MAIN_PTC_ID")
 fi
+if [[ ${#SCENE_MAIN_START_XY[@]} -gt 0 ]]; then
+    ALGO_ARGS+=(--scene-main-start-xy "${SCENE_MAIN_START_XY[@]}")
+    ALGO_ARGS+=(--scene-main-goal-xy "${SCENE_MAIN_GOAL_XY[@]}")
+fi
+if [[ -n "$TRAJECTORY_LOG_PATH" ]]; then
+    ALGO_ARGS+=(--scene-trajectory-log-path "$TRAJECTORY_LOG_PATH")
+fi
 if [[ $USE_CURRENT_START -eq 1 ]]; then
     ALGO_ARGS+=(--use-current-start)
 fi
@@ -258,6 +285,14 @@ if [[ "$PLANNER_MODE" == "scene_target" ]]; then
 echo " 场景算法 : $SYMBOL"
 fi
 echo " 主车 ptcId: $SCENE_MAIN_PTC_ID"
+if [[ ${#SCENE_MAIN_START_XY[@]} -gt 0 ]]; then
+echo " 主车路线 : ${SCENE_MAIN_START_XY[*]} -> ${SCENE_MAIN_GOAL_XY[*]}"
+else
+echo " 主车路线 : 未配置（场景会报 route_intent_missing）"
+fi
+if [[ -n "$TRAJECTORY_LOG_PATH" ]]; then
+echo " 轨迹日志 : $TRAJECTORY_LOG_PATH"
+fi
 echo " mux 限速 : ${MAX_SPEED_KPH} km/h"
 if [[ $USE_TASKSTATUS_TRANSITIONS -eq 1 ]]; then
 echo " 任务触发 : /start_task + /taskstatus"

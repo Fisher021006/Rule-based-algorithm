@@ -291,7 +291,8 @@ def _build_invalid_scene_output(
         scene_debug=debug,
     )
     output["scene_error"] = True
-    output["control_mode"] = "scene_invalid"
+    output["control_mode"] = "emergency_stop"
+    output["emergency_decel_mps2"] = abs(float(limits.min_acc))
     return output
 
 

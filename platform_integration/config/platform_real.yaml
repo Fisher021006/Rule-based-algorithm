@@ -46,21 +46,21 @@ ros:
 # A-B 自由行驶先用 local_sampling；后续接场景算法时再切到 scene_target 并配置 symbol。
 direct_control:
   planner_mode: scene_target
-  # scene_algorithm_symbol: scenarios.intersection_conflict_algorithm.intersection_conflict_algorithm
+  scene_algorithm_symbol: scenarios.intersection_conflict_algorithm.intersection_conflict_algorithm
   # scene_algorithm_symbol: scenarios.blind_spot_algorithm.blind_spot_algorithm
-  scene_algorithm_symbol: scenarios.cut_in_algorithm.cut_in_algorithm
+  # scene_algorithm_symbol: scenarios.cut_in_algorithm.cut_in_algorithm
   # scene_algorithm_symbol: "scenarios.braking_algorithm.braking_algorithm"
   # 平台被测主车 VUT 的 OBU ptcId。
-  scene_main_ptc_id: "200005"
+  scene_main_ptc_id: "3690"
   scene_exposed_ptc_id: ""
   # intersection_conflict 需要平台下发车/VUT 的起终点作为路线意图输入。
   # 手动测试时可填 lat/lon 或 xy 二选一；平台协议补齐后也复用这组字段。
   # scene_main_start_latlon:
   # scene_main_goal_latlon:
 
-  # 交叉口场景需要手动配置主车的起终点 xy，避免平台下发的起终点在交叉口内导致规划失败。
-  # scene_main_start_xy: [-270.0, 174.0]
-  # scene_main_goal_xy: [-325.0, 122.0]
+  # 实车交叉口用例（2026-11-10）：主车 3690，从 [-315, 176] 直行到 [-272, 124]。
+  scene_main_start_xy: [-315.0, 176.0]
+  scene_main_goal_xy: [-272.0, 124.0]
 
   plan_hz: 10
   control_hz: 20
