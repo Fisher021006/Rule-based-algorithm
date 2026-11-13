@@ -44,6 +44,9 @@ CONTINUATION_TEMPLATE_NAME = "continuation"
 CONTINUATION_MATCH_DIST_M = 1.5
 CONTINUATION_MATCH_HEADING_RAD = np.deg2rad(40.0)
 CONTINUATION_DT = 0.1
+# 低速时轨迹前几个点几乎重合，取最近点时必须挑并列里最靠后的那个，
+# 否则续行候选会一直锚在 0 号点、把车锁在原地。
+CONTINUATION_MATCH_TIE_M = 1e-3
 
 
 def _normalize_angle(angle: float) -> float:
@@ -206,18 +209,43 @@ class LocalPlanner:
         timings["sampling_ms"] = (time.perf_counter() - sampling_start) * 1000.0
 
         generator_start = time.perf_counter()
-        candidates = [
-            apply_time_param_to_candidate(
-                context,
-                build_candidate_smooth_path(context, terminal),
-                method="quintic",
+        candidates = []
+        geometries = []
+        for terminal in terminals:
+            geometry = build_candidate_smooth_path(context, terminal)
+            geometries.append(geometry)
+            candidates.append(
+                apply_time_param_to_candidate(context, geometry, method="quintic")
             )
-            for terminal in terminals
-        ]
-        continuation_candidate = self._build_continuation_candidate(context)
+        # quintic 把 a(0)=start_a 当硬约束，传感器加速度一旦越界，整族候选会在生成
+        # 阶段一起死掉（trajectory=None）。这时评估器没有轨迹可打分，候选池直接为空，
+        # 连 osqp 精修都轮不到。按终端顺序逐条改用软约束的 osqp 重解，第一条可行的
+        # 就采用，不放开任何硬门（回退结果仍要过同一份限值校验）。
+        osqp_fallback_attempts = 0
+        if candidates and all(candidate.trajectory is None for candidate in candidates):
+            for index, geometry in enumerate(geometries):
+                osqp_fallback_attempts = index + 1
+                quintic_reason = candidates[index].failure_reason
+                fallback = apply_time_param_to_candidate(context, geometry, method="osqp")
+                if fallback.trajectory is None:
+                    continue
+                if not self._external_dynamics_valid(context, fallback.trajectory):
+                    continue
+                fallback.metrics["quintic_failure_reason"] = quintic_reason
+                candidates[index] = fallback
+                break
+        self.attribute["sampling_osqp_fallback_attempts"] = osqp_fallback_attempts
+        continuation_candidate = self._build_continuation_candidate(context, allow_line_fallback=True)
+        rescue_candidate = None
         if continuation_candidate is not None:
-            candidates.append(continuation_candidate)
-            terminals.append(continuation_candidate.terminal)
+            if continuation_candidate.metrics.get("continuation_line_fallback"):
+                # 跨车道时退到主参考线建出来的续行候选只作兜底，不进候选池参与评分。
+                # 它的 terminal 沿用上一帧轨迹的陈旧终点，一旦赢了就会自我强化
+                # （下一帧的“上一帧轨迹”就是它自己），把车带过目标点。
+                rescue_candidate = continuation_candidate
+            else:
+                candidates.append(continuation_candidate)
+                terminals.append(continuation_candidate.terminal)
         timings["generator_ms"] = (time.perf_counter() - generator_start) * 1000.0
 
         evaluator_start = time.perf_counter()
@@ -229,6 +257,16 @@ class LocalPlanner:
                 candidate.feasible = False
                 candidate.failure_reason = candidate.failure_reason or "trajectory_dynamic_limit_violation"
         best_candidate, _ = evaluate_candidates(context, decision, checked_candidates)
+        if best_candidate is None and rescue_candidate is not None:
+            # 新鲜候选全灭，且续行候选本帧因跨车道被挡在池子外，这时才把它拿出来。
+            # 仍然走同一份动力学校验和评分硬门，不放宽任何限值。
+            if self._external_dynamics_valid(context, rescue_candidate.trajectory):
+                rescued_best, _ = evaluate_candidates(context, decision, [rescue_candidate])
+                if rescued_best is not None:
+                    rescued_best.metrics["selected_as_fallback"] = True
+                    best_candidate = rescued_best
+                    candidates.append(rescued_best)
+                    terminals.append(rescued_best.terminal)
         timings["evaluator_ms"] = (time.perf_counter() - evaluator_start) * 1000.0
 
         refine_start = time.perf_counter()
@@ -507,6 +545,10 @@ class LocalPlanner:
         if best_candidate.terminal.template_name == CONTINUATION_TEMPLATE_NAME:
             best_candidate.metrics["refine_status"] = "skipped_continuation"
             return best_candidate, candidates
+        if best_candidate.metrics.get("time_param_method") == "osqp":
+            # 回退链已经产出 osqp 解，再解一遍同一个 smooth_path 只会重复耗时。
+            best_candidate.metrics["refine_status"] = "skipped_already_osqp"
+            return best_candidate, candidates
 
         best_candidate.metrics["refine_status"] = "attempted"
         refined_candidate = apply_time_param_to_candidate(context, best_candidate, method="osqp")
@@ -528,8 +570,15 @@ class LocalPlanner:
             candidates[winner_idx] = refined_best
         return refined_best, candidates
 
-    def _build_continuation_candidate(self, context) -> CandidateTrajectory | None:
-        """把上一帧最优轨迹的剩余后缀包装成一个额外候选。"""
+    def _build_continuation_candidate(
+        self, context, allow_line_fallback: bool = False
+    ) -> CandidateTrajectory | None:
+        """把上一帧最优轨迹的剩余后缀包装成一个额外候选。
+
+        ``allow_line_fallback`` 打开时，上一帧的 line_id 在当前参考线里查不到就
+        退到当前主参考线（``line_contexts[0]``），并在 metrics 里标记
+        ``continuation_line_fallback``。这种候选只能作兜底，不能参与评分竞争。
+        """
 
         previous = self.last_best_candidate
         if previous is None or previous.trajectory is None:
@@ -542,7 +591,14 @@ class LocalPlanner:
         ego_state = context.ego_state
         ego_xy = np.array([ego_state.x, ego_state.y], dtype=float)
         point_distances = np.linalg.norm(prev_traj[:, :2] - ego_xy, axis=1)
-        nearest_idx = int(np.argmin(point_distances))
+        # 低速时轨迹前几个点位置重合（时间参数化按 0.1 s 采样，v≈0 时位移≈0），
+        # argmin 会固定取到 0 号点，续行候选就永远停在轨迹开头、速度剖面每帧
+        # 被重置，车原地不动。取并列最小里最靠后的那个，保证每次都能跳过重复点。
+        nearest_idx = int(
+            np.flatnonzero(
+                point_distances <= point_distances.min() + CONTINUATION_MATCH_TIE_M
+            )[-1]
+        )
         if nearest_idx >= len(prev_traj) - 1:
             return None
         if float(point_distances[nearest_idx]) > CONTINUATION_MATCH_DIST_M:
@@ -553,18 +609,28 @@ class LocalPlanner:
             return None
 
         line_context = self._find_line_context_by_lane_id(context, previous.terminal.line_id)
-        if line_context is None:
-            return None
+        line_fallback = line_context is None
+        if line_fallback:
+            if not allow_line_fallback or not context.line_contexts:
+                return None
+            # 上一帧的 line_id 是参考线首车道，自车开过该车道终点后参考线会重锚，
+            # 查表必然落空。续行后缀本身仍在当前主参考线前方，退到 line_contexts[0]
+            # 只用来算 target_s 和 line_index，候选仍要过同一套动力学校验和评分硬门。
+            line_context = context.line_contexts[0]
 
         suffix = np.asarray(prev_traj[nearest_idx:], dtype=float).copy()
+        # 首点只重锚定控制器实际读取的位姿列（x/y/heading），以及校验器要求等于
+        # 当前车速的 v；加速度和曲率沿用上一帧规划值，避免把传感器读数写进一条
+        # 已经通过校验的轨迹后缀——那样会让整条候选被动力学校验判死。
+        anchor = prev_traj[nearest_idx]
         suffix[0, :] = np.array(
             [
                 float(ego_state.x),
                 float(ego_state.y),
                 float(ego_state.heading),
                 float(ego_state.v),
-                float(ego_state.a),
-                float(ego_state.kappa),
+                float(anchor[4]),
+                float(anchor[5]),
             ],
             dtype=float,
         )
@@ -587,7 +653,10 @@ class LocalPlanner:
             trajectory=suffix,
             smooth_path=np.asarray(suffix[:, :3], dtype=float),
             feasible=True,
-            metrics={"continuation_source_template": previous.terminal.template_name},
+            metrics={
+                "continuation_source_template": previous.terminal.template_name,
+                "continuation_line_fallback": line_fallback,
+            },
         )
 
     @staticmethod

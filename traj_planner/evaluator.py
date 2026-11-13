@@ -358,6 +358,18 @@ def _goal_progress_cost(context: PlanningContext, traj: np.ndarray) -> float:
     return float(np.linalg.norm(final_xy - context.goal_xy))
 
 
+def _approach_goal_stop_allowance(context: PlanningContext) -> float:
+    """终点之后仍算“停住”的余量。
+
+    停车点不要求在终点之前。采样器本身就把 ``APPROACH_GOAL`` 的终端夹在
+    ``goal_s + approach_goal_s_window`` 以内，所以这里复用同一个配置键：
+    只要能在终点后这段窗口内停住，就仍然是可接受的一次停车。
+    """
+
+    local_fsm_cfg = context.config.get("local_fsm", {})
+    return max(float(local_fsm_cfg.get("approach_goal_s_window", 0.5)), 0.0)
+
+
 def _lane_change_delay_cost(context: PlanningContext, decision: BehaviorDecision, candidate: CandidateTrajectory) -> float:
     """在强制换道场景下，对继续拖延换道的候选加罚。"""
 
@@ -485,7 +497,6 @@ def evaluate_candidates(
 
     软代价：
     - 舒适性（jerk / 加速度 / 曲率）
-    - 接近终点程度
     - 强制换道拖延代价
     - 自由换道前向收益偏好
     - 与上一帧所选线的一致性
@@ -522,6 +533,22 @@ def evaluate_candidates(
             candidate.feasible = False
             candidate.failure_reason = "over_kappa"
             continue
+
+        if decision.mode == BehaviorMode.APPROACH_GOAL:
+            # 到终点刹不住的候选不可行。续行/保持这类只看短时域的候选末端仍在 5 m/s
+            # 以上，评分只罚末端速度、不罚"下一帧就停不下来"，于是它会一直赢，把车
+            # 高速送过终点，随后任何候选都刹不住，整帧无解。
+            stop_acc = max(abs(float(context.config["constrain"]["min_acc"])), 1e-3)
+            end_v = float(traj[-1, 3])
+            end_to_goal = float(np.linalg.norm(traj[-1, :2] - context.goal_xy))
+            # 停车点不强制落在终点之前：终点后 stop_allowance 以内停住也算到达
+            # （采样器本来就允许终端落在 goal_s + window），所以可用制动距离取
+            # “到终点距离 + 余量”。
+            stop_allowance = _approach_goal_stop_allowance(context)
+            if end_v * end_v / (2.0 * stop_acc) > end_to_goal + stop_allowance + 1e-6:
+                candidate.feasible = False
+                candidate.failure_reason = "cannot_stop_near_goal"
+                continue
 
         deadline_ok = _within_deadline(context, decision, candidate)
         candidate.metrics["deadline_ok"] = bool(deadline_ok)
@@ -565,6 +592,10 @@ def evaluate_candidates(
             candidate.feasible = False
             candidate.failure_reason = "clearance_too_small"
             continue
+        # 仅作诊断记录，不计入 score：它按"候选末端到终点的欧氏距离"度量，
+        # 会系统性偏向长时域（T 大、走得远）的候选，并不是纯粹的进度信号。
+        # 终点相关的决策由上面的 cannot_stop_near_goal 硬门和 score 里的
+        # 末端速度罚负责，不要把这一项接进评分。
         candidate.metrics["goal_cost"] = _goal_progress_cost(context, traj)
 
         ttc_cost = _ttc_cost(context, safety_metrics["min_ttc"])

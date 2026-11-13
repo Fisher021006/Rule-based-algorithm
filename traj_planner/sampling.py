@@ -319,10 +319,15 @@ def sample_terminal_states(
                         if decision.mode == BehaviorMode.APPROACH_GOAL:
                             goal_s = _goal_s_on_line(context, line_context)
                             goal_window = _approach_goal_s_window(context)
-                            target_s = min(
-                                target_s,
-                                goal_s + goal_window - _approach_goal_stop_reserve(float(target_v)),
-                            )
+                            goal_cap = goal_s + goal_window - _approach_goal_stop_reserve(float(target_v))
+                            if target_s > goal_cap:
+                                # 终点夹紧生效：路径被截短后末端速度必须同步归零。否则五次
+                                # 多项式只能靠"负速度回退 + 静默钳位"凑出一条弧长不够却仍带
+                                # 末端速度的假可行轨迹，车会卡在离终点几米处不动。
+                                target_v = 0.0
+                                target_s = goal_s + goal_window - _approach_goal_stop_reserve(0.0)
+                            else:
+                                target_s = goal_cap
 
                         # 为下一帧保留少量距离，避免贴着末端采样导致几何退化。
                         line_end_margin = 1.0 if decision.mode != BehaviorMode.APPROACH_GOAL else 0.1
@@ -369,7 +374,9 @@ def sample_terminal_states(
                 goal_dist = float(context.route_intent.distance_to_goal)
                 v_lower, v_upper = _dynamic_speed_bounds(context, min(template.plan_T_values), decision)
                 if goal_dist <= APPROACH_GOAL_FORCE_STOP_DIST or v_upper <= APPROACH_GOAL_FORCE_STOP_SPEED:
-                    target_s = min(goal_s + goal_window, max(goal_s - goal_window, line_context.current_s + 1e-3))
+                    # 停车点落在终点投影处；原先退到 goal_s - goal_window 会白白缩短
+                    # 最后一段路径，把小横向偏差放大成超限曲率。
+                    target_s = min(goal_s + goal_window, max(goal_s, line_context.current_s + 1e-3))
                     key = (
                         line_index,
                         round(float(target_s), 2),
@@ -388,7 +395,7 @@ def sample_terminal_states(
                                 target_v=0.0,
                                 plan_T=float(min(template.plan_T_values)),
                                 hold_t=0.0,
-                                template_name=template.name,
+                                template_name=f"{template.name}_stop",
                             )
                         )
 
