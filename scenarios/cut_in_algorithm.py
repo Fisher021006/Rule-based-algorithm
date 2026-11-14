@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import copy
+import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +22,18 @@ from planning_runtime.scene.types import ReferenceLineView, SceneContext
 from planning_runtime.scene.relative_geometry import project_signed_on_reference
 from traj_planner.tools import get_path_point_at_s, normalize_angle, project_point_to_path
 from traj_planner.trajectory import DYNAMIC_NUMERIC_TOLERANCE
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量；读取失败时回退默认值。"""
+
+    raw_value = os.getenv(name, "")
+    if raw_value == "":
+        return float(default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 @dataclass(frozen=True)
@@ -35,8 +49,10 @@ class VehicleLimits:
 
 CFG: dict[str, Any] = {
     "cutin_side": "auto",
-    "target_thw_s": 4.0,
-    "thw_tol_s": 0.5,
+    # 目标 THW 与容差支持环境变量覆盖，便于离线批量扫 THW 强度；
+    # 不设环境变量时与原来的常量行为完全一致。
+    "target_thw_s": _env_float("ROS_SCENE_CUTIN_TARGET_THW_S", 4.0),
+    "thw_tol_s": _env_float("ROS_SCENE_CUTIN_THW_TOL_S", 0.5),
     "cruise_target_v": 5.0,
     "lane_change_time_s": 4.0,
     "prepare_plan_t_s": 1.5,
@@ -48,6 +64,9 @@ CFG: dict[str, Any] = {
     "prepare_max_speed_lag_mps": 2.0,
     "prepare_commit_debounce_frames": 1,
     "prepare_build_timeout_s": 6.0,
+    # PREPARE 必须有界：可行解长时间建不出来时不能无限组织纵向运动。
+    "prepare_max_dwell_s": 8.0,
+    "prepare_timeout_max_count": 2,
     "prepare_acc_margin_mps2": 0.1,
     "search_rel_s_min": -35.0,
     "search_rel_s_max": 25.0,
@@ -68,10 +87,16 @@ CFG: dict[str, Any] = {
     "persistent_infeasible_progress_ratio_thresh": 0.5,
     "enter_target_d_thresh_m": 0.3,
     "execute_complete_frames": 2,
+    # 冻结目标到达容差：越过冻结点属于"已到达"，只有目标明显落在自车后方才是几何失败。
+    "frozen_arrival_tolerance_m": 0.5,
     "stabilize_duration_s": 1.5,
     "abort_cooldown_s": 2.0,
     "prediction_min_acc": -1.5,
     "prediction_max_acc": 1.5,
+    # 主车瞬时加速度只对很短一段可信：IDM 减速度在自车刚进入横向阈值那一帧
+    # 最狠，随后 gap 打开、Δv 缩小，实测 0.1~0.25 s 内就衰减掉。
+    # 用一阶衰减 a(t)=a_use*exp(-t/tau) 外推，避免首帧减速度被当成恒定值。
+    "prediction_acc_decay_tau_s": _env_float("ROS_SCENE_CUTIN_PRED_ACC_TAU_S", 0.2),
 }
 
 
@@ -82,6 +107,8 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "cooldown_until_time_s": -1.0,
     "prepare_start_time_s": -1.0,
     "prepare_success_hits": 0,
+    "prepare_timeout_count": 0,
+    "prepare_build_elapsed_s": 0.0,
     "prepare_line_index": None,
     "prepare_target_lane_id": "",
     "prepare_target_lane_sequence": [],
@@ -210,6 +237,20 @@ def _handle_approach(
     now: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """处理 APPROACH：寻找目标车道并进入 PREPARE。"""
+    # PREPARE 反复超时说明当前几何/速度组合根本进不了发射窗口，
+    # 继续重试只会重复组织纵向运动，因此锁存为中止并保持当前车道巡航。
+    if int(memory.get("prepare_timeout_count", 0)) >= int(CFG["prepare_timeout_max_count"]):
+        return _build_keep_lane_output(
+            context,
+            reason="prepare_timeout_abort",
+            scene_status="cutin_aborted",
+            scene_detail="prepare_dwell_timeout_repeated",
+            scene_debug={
+                "prepare_timeout_count": int(memory.get("prepare_timeout_count", 0)),
+                "prepare_timeout_max_count": int(CFG["prepare_timeout_max_count"]),
+            },
+        ), memory
+
     target_line = _choose_target_line(context)
     if target_line is None:
         return _build_keep_lane_output(
@@ -248,6 +289,16 @@ def _handle_prepare(
 
     launch_plan = _evaluate_launch_plan(context, target_line, float(CFG["lane_change_time_s"]), requested_thw_s=_scenario_target_thw(memory))
     prepare_strategy = _build_prepare_strategy(context, target_line, requested_thw_s=_scenario_target_thw(memory))
+
+    # 只在"连可行解都建不出来"时累计停留时间。已经 ready、只是还在等自车速度收敛
+    # 属于正常 PREPARE，不能计入，否则会把慢收敛的合法场景误判成卡死。
+    if str(launch_plan["prepare_state"]) == "prepare_build_exact":
+        memory["prepare_build_elapsed_s"] = (
+            float(memory.get("prepare_build_elapsed_s", 0.0))
+            + float(getattr(context, "dt", 0.1))
+        )
+    else:
+        memory["prepare_build_elapsed_s"] = 0.0
 
     if _prepare_should_abort_as_globally_infeasible(memory, launch_plan, now):
         _enter_cooldown(memory, now)
@@ -329,6 +380,24 @@ def _handle_prepare(
     prepare_debug["degraded_activate_ok"] = bool(degraded_ready)
     prepare_debug["exact_activate_reason"] = str(exact_debug["reason"])
     prepare_debug["degraded_activate_reason"] = str(degraded_debug["reason"])
+
+    # 可行解长时间建不出来时 PREPARE 没有其它出口：超时后退回 APPROACH，
+    # 由 _handle_approach 决定是否继续重试。
+    build_elapsed = float(memory.get("prepare_build_elapsed_s", 0.0))
+    prepare_debug["prepare_build_elapsed_s"] = build_elapsed
+    prepare_debug["prepare_max_dwell_s"] = float(CFG["prepare_max_dwell_s"])
+    if build_elapsed >= float(CFG["prepare_max_dwell_s"]):
+        memory["prepare_timeout_count"] = int(memory.get("prepare_timeout_count", 0)) + 1
+        prepare_debug["prepare_timeout_count"] = int(memory["prepare_timeout_count"])
+        _enter_cooldown(memory, now)
+        return _build_keep_lane_output(
+            context,
+            reason="prepare_dwell_timeout",
+            scene_status="prepare_timeout",
+            scene_detail=str(launch_plan["prepare_reason"]),
+            scene_debug=prepare_debug,
+        ), memory
+
     return _build_prepare_output(
         context,
         memory,
@@ -447,6 +516,7 @@ def _enter_prepare_mode(memory: dict[str, Any], target_line: ReferenceLineView, 
     memory["mode"] = "PREPARE"
     memory["prepare_start_time_s"] = float(now)
     memory["prepare_success_hits"] = 0
+    memory["prepare_build_elapsed_s"] = 0.0
     memory["prepare_line_index"] = int(target_line.line_index)
     memory["prepare_target_lane_id"] = str(target_line.lane_id)
     memory["prepare_target_lane_sequence"] = _normalize_lane_sequence(target_line.lane_sequence)
@@ -596,6 +666,7 @@ def _reset_prepare_memory(memory: dict[str, Any]) -> None:
     # 1. PREPARE 只缓存锁定目标车道和准备开始时间。
     memory["prepare_start_time_s"] = -1.0
     memory["prepare_success_hits"] = 0
+    memory["prepare_build_elapsed_s"] = 0.0
     memory["prepare_line_index"] = None
     memory["prepare_target_lane_id"] = ""
     memory["prepare_target_lane_sequence"] = []
@@ -752,6 +823,10 @@ def _build_lane_speed_target(
     """将车道内期望速度转换为一致的距离/末状态；不预跑规划器。"""
     limits = _read_vehicle_limits(context)
     current_v = float(context.ego_vehicle.v)
+    # 车辆停住后测速可能落到 0 以下一点点（数值噪声）。按 0 处理，
+    # 否则可行域判定会把"静止"当成不可行，进而下发急停请求。
+    if -DYNAMIC_NUMERIC_TOLERANCE <= current_v < 0.0:
+        current_v = 0.0
     # 与现有时间参数化的0.1s网格一致。末区间保留零加速度，
     # 再预留一个采样周期的速度可达余量，避免直接选择极限端点。
     dt = 0.1
@@ -916,7 +991,10 @@ def _build_frozen_output(
     if min(target_index, ego_index) < 0 or not np.all(np.isfinite([target_s, target_d, ego_s, ego_d])):
         return exit_frozen("frozen_target_geometry_invalid")
     remaining_s = float(target_s - ego_s)
-    if remaining_s <= 1e-6:
+    # 冻结解的速度律本来就按"在截止时刻正好走到目标点"来解，越过冻结点属于按计划到达。
+    # 只有目标明显落在自车后方才说明冻结几何失效；否则继续执行，等完成判定在截止时刻锁存。
+    arrival_tol = float(CFG["frozen_arrival_tolerance_m"])
+    if remaining_s < -arrival_tol:
         return exit_frozen("frozen_target_not_ahead")
     projected_xy, _ = get_path_point_at_s(line, target_s)
     projection_error = float(np.linalg.norm(projected_xy - target_xy))
@@ -941,6 +1019,8 @@ def _build_frozen_output(
         frozen_target_world_xy=target_xy.tolist(), frozen_target_local_s=float(target_s),
         frozen_remaining_distance_m=remaining_s, frozen_deadline_s=deadline,
         frozen_remaining_t_s=float(remaining_t), frozen_projection_error_m=projection_error,
+        frozen_arrival_tolerance_m=arrival_tol,
+        frozen_arrived=bool(remaining_s <= arrival_tol),
     )
     return _annotate_output(
         output, str(solution.get("scene_status", "frozen_execute")),
@@ -1133,6 +1213,10 @@ def _prepare_window_ok(
     launch_delta_s_min = float(CFG["launch_delta_s_min_m"])
     ready_lead = max(launch_delta_s_min,
                      float(prepare_strategy["delta_s_goal"]) - float(CFG["prepare_lead_tolerance_m"]))
+    # 领先过多时合并目标点会离自车很近，冻结解的目标速度趋近 0。这一情况由
+    # _build_frozen_output 的到达容差处理：越过冻结点算到达，不再判几何失败。
+    # 这里不加领先上界，否则领先 9~11 m 的正常用例会被迫在 PREPARE 里减速，
+    # 反而把精确 THW 拖成退化 THW。
     launch_geom_ok = delta_s_target >= ready_lead
     launch_state_ready = str(prepare_state) in {"prepare_exact_ready", "prepare_degraded_ready"}
     window_ok = bool(
@@ -2132,10 +2216,19 @@ def _predict_main_vehicle_at_t(
         float(CFG["prediction_min_acc"]),
         float(CFG["prediction_max_acc"]),
     )
-    s_pred_on_main = float(main_line.current_s) + float(main.v) * float(total_t) + 0.5 * a_use * float(total_t) ** 2
+    # 一阶衰减：v(T) = v0 + a_use*tau*(1-e^(-T/tau))
+    #          s(T) = s0 + v0*T + a_use*tau*(T - tau*(1-e^(-T/tau)))
+    total_t = float(total_t)
+    tau = max(float(CFG["prediction_acc_decay_tau_s"]), 1e-3)
+    decay = 1.0 - math.exp(-total_t / tau)
+    s_pred_on_main = (
+        float(main_line.current_s)
+        + float(main.v) * total_t
+        + a_use * tau * (total_t - tau * decay)
+    )
     s_pred_on_main = _clamp(s_pred_on_main, float(main_line.current_s), float(main_line.cumulative_s[-1]) - 0.5)
     xy_pred, heading_pred = get_path_point_at_s(main_line.line, s_pred_on_main, main_line.cumulative_s)
-    v_pred = max(0.0, float(main.v) + a_use * float(total_t))
+    v_pred = max(0.0, float(main.v) + a_use * tau * decay)
     # 预测点可能在自车前向规划线起点后方，不能夹到 s=0。
     # 在完整目标车道轴上保留有符号位置，再换回原局部线的 s 原点。
     s_pred_on_target, d_pred_on_target = _project_on_target_view(xy_pred, target_line)
