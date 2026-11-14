@@ -1,6 +1,7 @@
 import numpy as np
 import time
 from traj_planner.tools import normalize_angle
+from traj_planner.path import polyline_curvature
 import osqp
 from scipy.sparse import csc_matrix, diags
 # 启动时加载 HiGHS 所属模块，避免首次兜底把导入耗时计入规划周期。
@@ -9,6 +10,8 @@ from scipy import optimize as scipy_optimize
 
 DYNAMIC_NUMERIC_TOLERANCE = 0.01
 PROFILE_EQUALITY_TOLERANCE = 1e-3
+# 路径上相邻点相距小于此值时视为重合，估曲率时丢弃
+MIN_PATH_POINT_GAP = 1e-2
 DEFAULT_HIGHS_TIME_LIMIT_S = 0.05
 
 
@@ -151,35 +154,54 @@ def interp_pose_on_path(path, cum_s, query_s):
     return x, y, theta
 
 
-def calculate_trajectory_kappa(trajectory):
-    """
-    根据轨迹点计算曲率 kappa（三点法）
-    trajectory: list of [x, y, heading, v, a] 或类似格式，至少包含 x, y
-    返回：添加了 kappa 的轨迹列表（每个元素为 [x, y, heading, v, a, kappa]）
-    """
-    traj = np.array(trajectory)
-    if len(traj) < 3:
-        # 点数不足时曲率置零
-        kappa = np.zeros(len(traj))
-    else:
-        x = traj[:, 0]
-        y = traj[:, 1]
-        dx = np.gradient(x)
-        dy = np.gradient(y)
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-        # 曲率公式: (x' y'' - y' x'') / (x'^2 + y'^2)^(3/2)
-        denominator = (dx ** 2 + dy ** 2) ** 1.5
-        kappa = np.zeros_like(denominator)
-        mask = denominator > 1e-6
-        kappa[mask] = (dx[mask] * ddy[mask] - dy[mask] * ddx[mask]) / denominator[mask]
+def sample_path_curvature(path, cum_s, s_values):
+    """按弧长从路径几何取曲率，返回与 ``s_values`` 等长的曲率数组。
 
-    # 将曲率添加到轨迹中
-    result = []
-    for i, pt in enumerate(trajectory):
-        # 假设 pt 为 [x, y, heading, v, a] 形式
-        result.append(list(pt) + [float(kappa[i])])
-    return result
+    曲率是**路径**的属性，不是采样点的属性。旧实现 ``calculate_trajectory_kappa``
+    对按时间重采样后的轨迹点做三点差分，结果会随采样密度（也就是车速）变化：
+
+    - 保持车道的路径是参考线切片，弦长约 1 m；轨迹按 ``v*dt`` 采样，慢车每 0.1 m
+      一个点。同一根弦上的三点共线得 0，跨过弦的拐点时分母只有 0.1 m，曲率爆掉。
+      实测 B5 慢候选算出 0.237，而路径顶点上的真值是 0.048。
+    - 停车候选的采样间距趋近 0，分母塌缩，算出 1.28~1.44。
+
+    毛刺幅值约等于 ``弦长 / 采样间距 / R``，与车速成反比，所以越慢越“弯”。这个
+    结果同时污染舒适项的横向代价和 ``max_kappa`` 硬门，必须按几何算。
+
+    注意这里用 ``polyline_curvature`` 而不是 ``compute_path_curvature``：候选路径
+    首点是自车位置、尾点常被截断，点距从 0.01 m 到 1.1 m 不等，按索引差分的版本
+    在那种点距上会算出几十的曲率。
+
+    输入：
+        ``path``：``(M, 3)`` 几何路径（时参的输入，不是时参的输出）
+        ``cum_s``：``(M,)`` 该路径的累积弧长
+        ``s_values``：``(N,)`` 每个轨迹采样点对应的弧长
+
+    输出：
+        ``np.ndarray``，shape ``(N,)``
+    """
+    path = np.asarray(path, dtype=float)
+    cum_s = np.asarray(cum_s, dtype=float)
+    s_values = np.asarray(s_values, dtype=float)
+    # 少于 3 个点的路径按直线处理：两点之间没有可估计的曲率。
+    if len(path) < 3 or float(cum_s[-1]) <= 1e-9:
+        return np.zeros(len(s_values))
+    # 相距不足 1 cm 的相邻点视为重合：它们的连线方向由浮点误差决定，不能用来估曲率。
+    # 参考线切片拼自车位置时经常出现这种点（实测有 0.001 m 的间隔，算出的曲率是 3.7）。
+    gaps = np.diff(cum_s)
+    if np.any(gaps < MIN_PATH_POINT_GAP):
+        keep = np.r_[True, gaps >= MIN_PATH_POINT_GAP]
+        path, cum_s = path[keep], cum_s[keep]
+        if len(path) < 3:
+            return np.zeros(len(s_values))
+    return np.interp(s_values, cum_s, polyline_curvature(path[:, :2]))
+
+
+def attach_path_curvature(trajectory, path, cum_s, s_values):
+    """给 ``[x, y, heading, v, a]`` 轨迹补上按路径几何取到的 ``kappa`` 列。"""
+    traj = np.asarray(trajectory, dtype=float)
+    kappa = sample_path_curvature(path, cum_s, s_values)
+    return np.column_stack([traj, kappa])
 
 
 def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0.1):
@@ -223,8 +245,8 @@ def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0
             v = 0.0
             a = 0.0
             trajectory.append([x, y, heading, v, a])
-        # 计算曲率
-        trajectory = calculate_trajectory_kappa(trajectory)
+        # 路径长度为零，没有可估计的曲率
+        trajectory = attach_path_curvature(trajectory, path, cum_s, np.zeros(len(trajectory)))
         return trajectory
 
     # 解五次多项式（弧长 s 作为时间的函数）
@@ -254,8 +276,8 @@ def quintic_time_param_traj(smooth_path, start_v, start_a, end_v, end_a, T, dt=0
         a = float(a)
         trajectory.append([x, y, heading, v, a])
 
-    # 计算曲率并返回最终轨迹
-    trajectory = calculate_trajectory_kappa(trajectory)
+    # 曲率按路径几何取：采样点间距是 v*dt，随车速变化，不能拿来反推几何。
+    trajectory = attach_path_curvature(trajectory, path, cum_s, s_profile)
     return trajectory
 
 
@@ -616,6 +638,5 @@ def optimize_time_param_traj(smooth_path, T, v_start, a_start, v_end, a_end, dt=
         a = a_opt[i] if i < len(a_opt) else a_opt[-1]
         trajectory.append([x, y, heading, v, a])
 
-    # 计算曲率
-    trajectory = calculate_trajectory_kappa(trajectory)
-    return np.array(trajectory)
+    # 曲率按路径几何取，不从事后重采样的点反推
+    return attach_path_curvature(trajectory, path, cum_s, s_opt)

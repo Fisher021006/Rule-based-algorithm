@@ -238,10 +238,14 @@ class LocalPlanner:
         continuation_candidate = self._build_continuation_candidate(context, allow_line_fallback=True)
         rescue_candidate = None
         if continuation_candidate is not None:
-            if continuation_candidate.metrics.get("continuation_line_fallback"):
+            continuation_line_allowed = int(continuation_candidate.terminal.line_index) in decision.allowed_line_indices
+            if continuation_candidate.metrics.get("continuation_line_fallback") or not continuation_line_allowed:
                 # 跨车道时退到主参考线建出来的续行候选只作兜底，不进候选池参与评分。
                 # 它的 terminal 沿用上一帧轨迹的陈旧终点，一旦赢了就会自我强化
                 # （下一帧的“上一帧轨迹”就是它自己），把车带过目标点。
+                # 同理，决策只允许走目标线时（EXECUTE_MLC / APPROACH_GOAL），挂在
+                # 别的线上的续行候选也不该进池：它不用付横向代价，会一直压过真正
+                # 要换道的那族候选，车就一直留在原车道。
                 rescue_candidate = continuation_candidate
             else:
                 candidates.append(continuation_candidate)

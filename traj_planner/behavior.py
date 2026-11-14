@@ -25,6 +25,12 @@ from traj_planner.tools import project_point_to_path
 from traj_planner.types import BehaviorDecision, BehaviorMemory, BehaviorMode, CandidateTrajectory, PlanningContext
 
 
+# 强制换道在“目标车道可并入”时提前升级到执行态，不再只等 deadline 收紧。
+# 静止时目标车道两侧没有障碍物，_line_merge_feasible 会直接放行，
+# 所以必须配一个最低车速门，否则起步第一帧就会开始横移。
+MLC_MERGE_MIN_SPEED_MPS = 2.0
+
+
 def _approach_goal_trigger_distance(current_v: float) -> float:
     """返回进入终点接近态的经验距离阈值。"""
 
@@ -711,6 +717,33 @@ def decide_behavior(context: PlanningContext) -> BehaviorDecision:
                 must_change=True,
                 deadline_margin_m=route_intent.deadline_margin_m,
                 reason=mlc_reason,
+            )
+
+        # 目标车道现在就能并、车速也已经起来，就不必一路 prepare 到 deadline。
+        # 没有这个入口时 PREPARE_MLC 只能靠 route_window_urgent 升级，而长直道上
+        # deadline 永远够不着 urgency，结果是准备一整段路却一次都不执行。
+        # 但目标车道前方只要有车就不提前升级：_line_merge_feasible 只保证“并得进去”，
+        # 不保证“并进去之后不用立刻刹停”。前方是静止障碍时，这个入口会让自车在
+        # 障碍前十几米并回目标车道、然后被堵死（E1 绕行 case 的回归就出在这里）。
+        # 有前车时退回 deadline 驱动的那条路，由 prepare→execute 自己找时机。
+        target_line_clear = (
+            0 <= route_intent.target_line_index < len(context.line_contexts)
+            and context.line_contexts[route_intent.target_line_index].front_obstacle is None
+        )
+        if (
+            current_v >= MLC_MERGE_MIN_SPEED_MPS
+            and target_line_clear
+            and _line_merge_feasible(context, route_intent.target_line_index)
+        ):
+            return _make_decision(
+                context,
+                mode=BehaviorMode.EXECUTE_MLC,
+                allowed_line_indices=[route_intent.target_line_index],
+                target_line_index=route_intent.target_line_index,
+                target_lane_id=route_intent.target_lane_id,
+                must_change=True,
+                deadline_margin_m=route_intent.deadline_margin_m,
+                reason="mandatory_lane_change_merge_ready",
             )
 
         committed_decision = _continue_committed_lane_change(context)

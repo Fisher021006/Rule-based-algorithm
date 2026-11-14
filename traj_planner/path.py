@@ -87,6 +87,42 @@ def compute_path_curvature(path_xy):
     return kappa
 
 
+def polyline_curvature(path_xy, min_chord=1e-6):
+    """折线顶点曲率，三点外接圆，用真实弦长。
+
+    与 ``compute_path_curvature`` 的区别是**不假设点距均匀**。后者用
+    ``np.gradient`` 按索引差分，只有等间距采样时才是曲率；而候选路径的首点是
+    自车位置、尾点常被截断，点距从 0.01 m 到 1.1 m 不等，同一份几何算出来能到
+    75 这种量级。外接圆公式 ``κ = 2A / (abc)`` 里 a、b、c 就是实际弦长，与采样
+    密度无关。
+
+    输入：
+        ``path_xy``：``(N, 2)``
+        ``min_chord``：任一弦短于此值视为重合点，该顶点曲率记 0
+
+    输出：
+        ``np.ndarray``，shape ``(N,)``，两端点取相邻顶点的值
+    """
+    path_xy = np.asarray(path_xy, dtype=float)
+    n = len(path_xy)
+    kappa = np.zeros(n)
+    if n < 3:
+        return kappa
+    p0, p1, p2 = path_xy[:-2], path_xy[1:-1], path_xy[2:]
+    v01 = p1 - p0
+    v12 = p2 - p1
+    a = np.hypot(v01[:, 0], v01[:, 1])
+    b = np.hypot(v12[:, 0], v12[:, 1])
+    c = np.hypot(p2[:, 0] - p0[:, 0], p2[:, 1] - p0[:, 1])
+    cross = v01[:, 0] * v12[:, 1] - v01[:, 1] * v12[:, 0]
+    denom = a * b * c
+    valid = (a > min_chord) & (b > min_chord) & (c > min_chord) & (denom > 1e-12)
+    kappa[1:-1] = np.where(valid, 2.0 * cross / np.where(valid, denom, 1.0), 0.0)
+    kappa[0] = kappa[1]
+    kappa[-1] = kappa[-2]
+    return kappa
+
+
 def compute_heading_from_path(path_xy, start_theta, end_theta):
     """
     根据路径点计算航向角（弧度），并强制首尾角度为给定值。

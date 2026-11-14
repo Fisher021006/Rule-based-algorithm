@@ -13,8 +13,8 @@ import numpy as np
 from traj_planner.context import build_planning_context
 from traj_planner.generator import build_candidate_smooth_path
 from traj_planner.trajectory import (
-    PROFILE_EQUALITY_TOLERANCE, calculate_path_cumulative_distance,
-    calculate_trajectory_kappa, interp_pose_on_path,
+    PROFILE_EQUALITY_TOLERANCE, attach_path_curvature,
+    calculate_path_cumulative_distance, interp_pose_on_path,
 )
 from traj_planner.types import PlanningInput, TerminalCandidate
 
@@ -123,6 +123,7 @@ def build_emergency_stop_trajectory(
         diagnostics["terminal_distance_residual_m"] = max(0.0, stop_distance - float(path_distance[-1]))
 
     trajectory = []
+    travel_s_values = []
     for idx in range(steps + 1):
         t = min(float(idx) * dt, total_t)
         if brake_a < -1e-6 and t < stop_t:
@@ -144,6 +145,12 @@ def build_emergency_stop_trajectory(
         else:
             x, y, heading = interp_pose_on_path(stop_path, path_distance, travel_s)
         trajectory.append([x, y, heading, float(v), float(a)])
+        travel_s_values.append(float(travel_s))
 
     diagnostics["failure_reason"] = ""
-    return np.asarray(calculate_trajectory_kappa(trajectory), dtype=float)
+    if stop_path is None:
+        # 没有几何路径（stop_distance 为 0），不存在可估计的曲率
+        traj = np.asarray(trajectory, dtype=float)
+        return np.column_stack([traj, np.zeros(len(traj))])
+    # 曲率按停车路径几何取，不从事后重采样的轨迹点反推
+    return attach_path_curvature(trajectory, stop_path, path_distance, travel_s_values)

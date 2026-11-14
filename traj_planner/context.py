@@ -357,10 +357,15 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
     route_lookahead_required = False
     route_lookahead_reason = ""
     if 0 <= target_line_index < len(line_contexts):
+        # 目标车道不是当前车道，它的 lane_sequence 不可能包含 planned_path[start_idx]
+        # （那一格是当前车道），从 start_idx 开始查必然落空、返回 start_idx-1，
+        # 于是下面 current > target 恒成立、换道意图被 current_line_preserves_future_route
+        # 一律回退。目标线接手的位置在 start_idx+1，与 lookahead 的取法保持一致。
         target_route_progress_index = _line_route_progress_index(
             line_contexts[target_line_index],
             planning_input.planned_path,
             planned_start_idx,
+            max_initial_skip=1,
         )
     else:
         target_route_progress_index = current_route_progress_index
@@ -404,6 +409,19 @@ def _extract_route_intent(planning_input: PlanningInput, line_contexts: list[Lin
             deadline_margin_m,
             float(line_contexts[target_line_index].first_lane_remaining_length),
         )
+        # 车道尽头只是“这条线到哪结束”，不是“路线要求你什么时候到位”。
+        # 终点落在目标车道上时，必须在那之前完成换道，所以终点在当前线上的投影
+        # 才是更紧的 deadline。长直道上这一项会把 deadline 从车道剩余长度拉回到
+        # 实际可用的里程，短路段上不影响（min 仍取车道剩余）。
+        # 放在这个分支里是因为 deadline 只在 must_change 时被读；不换道时
+        # 每帧多做一次整条参考线的投影没有收益，只会抬高 context_ms。
+        _, goal_s, _ = project_point_to_path(
+            np.asarray(planning_input.goal_xy, dtype=float),
+            current_line.line,
+        )
+        goal_along_current_line = float(goal_s) - float(current_line.current_s)
+        if goal_along_current_line > 0.0:
+            deadline_margin_m = min(deadline_margin_m, goal_along_current_line)
     distance_to_goal = float(
         np.linalg.norm(np.asarray(planning_input.goal_xy, dtype=float) - np.array([planning_input.ego_state.x, planning_input.ego_state.y], dtype=float))
     )

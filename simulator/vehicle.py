@@ -126,7 +126,11 @@ class GVT:
                 "clearance": 10.0,
                 "mobil": 20.0,
                 "efficiency": 15.0,
-                "comfort": 15.0,
+                # 舒适项权重从 15 降到 8：弯道上快候选的 comfort 会被 clamp01 打到 1.0
+                # （三项都饱和），慢候选接近 0，两者差 14~15 分；效率项满量程只有 15 分，
+                # 等权重时快候选必然输，形成 1 m/s 自锁。8 与 15 的比例让效率项能赢，
+                # 同时舒适项仍是单项最大权重之一。
+                "comfort": 8.0,
                 "consistency": 5.0,
                 "comfort_lat_ratio": 0.40,
                 "comfort_acc_ratio": 0.35,
