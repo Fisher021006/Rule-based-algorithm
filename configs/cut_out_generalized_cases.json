@@ -1,0 +1,820 @@
+{
+  "map_cache": "xodr_parser/cache/同济测试场.pkl",
+  "planner_mode": "scene_target",
+  "scenario_algorithm": "scenarios.cut_out_algorithm.cut_out_algorithm",
+  "simulation": {
+    "dt": 0.1,
+    "max_steps": 130
+  },
+  "vut_motion": {
+    "motion": "idm",
+    "max_acc": 2.5
+  },
+  "thw_tol_s": 0.25,
+  "ttc_tol_s": 0.35,
+  "hard_min_thw_s": 0.8,
+  "hard_min_ttc_s": 1.0,
+  "cases": [
+    {
+      "id": "P1_R_static_vm15_ve0",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        251.599935,
+        245.389936
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_R_slow_vm15_ve3",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        257.486683,
+        244.994719
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_R_static_vm10_ve0",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 10.0,
+      "vut_desired_speed_mps": 15.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.3,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.3,
+      "lane_change_time_s": 3.5,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        293.40586,
+        242.583751
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        263.572984,
+        244.586139
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_R_slow_vm10_ve3",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 10.0,
+      "vut_desired_speed_mps": 15.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.6,
+      "target_metric_s": 2.6,
+      "lane_change_time_s": 3.5,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        293.40586,
+        242.583751
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        269.010747,
+        244.221123
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P2_R_static_vm15_ve0",
+      "location": "P2_curve20",
+      "side": "right",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        86.972411,
+        252.153807
+      ],
+      "ego_goal_xy": [
+        171.676788,
+        242.798555
+      ],
+      "main_start_xy": [
+        72.397875,
+        251.361324
+      ],
+      "main_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "exposed_start_xy": [
+        124.542748,
+        247.973161
+      ],
+      "exposed_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P2_R_slow_vm15_ve3",
+      "location": "P2_curve20",
+      "side": "right",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        86.972411,
+        252.153807
+      ],
+      "ego_goal_xy": [
+        171.676788,
+        242.798555
+      ],
+      "main_start_xy": [
+        72.397875,
+        251.361324
+      ],
+      "main_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "exposed_start_xy": [
+        118.747572,
+        249.080322
+      ],
+      "exposed_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P2_R_static_vm10_ve0",
+      "location": "P2_curve20",
+      "side": "right",
+      "vut_speed_mps": 10.0,
+      "vut_desired_speed_mps": 15.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.3,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.3,
+      "lane_change_time_s": 3.5,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        82.973994,
+        252.042729
+      ],
+      "ego_goal_xy": [
+        171.676788,
+        242.798555
+      ],
+      "main_start_xy": [
+        72.397875,
+        251.361324
+      ],
+      "main_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "exposed_start_xy": [
+        112.744116,
+        250.161146
+      ],
+      "exposed_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P2_R_slow_vm10_ve3",
+      "location": "P2_curve20",
+      "side": "right",
+      "vut_speed_mps": 10.0,
+      "vut_desired_speed_mps": 15.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.6,
+      "target_metric_s": 2.6,
+      "lane_change_time_s": 3.5,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        82.973994,
+        252.042729
+      ],
+      "ego_goal_xy": [
+        171.676788,
+        242.798555
+      ],
+      "main_start_xy": [
+        72.397875,
+        251.361324
+      ],
+      "main_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "exposed_start_xy": [
+        107.367641,
+        251.0528
+      ],
+      "exposed_goal_xy": [
+        172.181851,
+        238.797917
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P3_L_static_vm15_fix",
+      "location": "P3_testfield_curve",
+      "side": "left",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        -425.574523,
+        74.449618
+      ],
+      "ego_goal_xy": [
+        -391.438232,
+        181.172373
+      ],
+      "main_start_xy": [
+        -419.583108,
+        61.156832
+      ],
+      "main_goal_xy": [
+        -388.721112,
+        179.002882
+      ],
+      "exposed_start_xy": [
+        -428.803569,
+        111.8624
+      ],
+      "exposed_goal_xy": [
+        -388.721112,
+        179.002882
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P3_L_static_vm10_fix",
+      "location": "P3_testfield_curve",
+      "side": "left",
+      "vut_speed_mps": 10.0,
+      "vut_desired_speed_mps": 15.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.3,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.3,
+      "lane_change_time_s": 3.5,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        -424.185248,
+        70.699321
+      ],
+      "ego_goal_xy": [
+        -391.438232,
+        181.172373
+      ],
+      "main_start_xy": [
+        -419.583108,
+        61.156832
+      ],
+      "main_goal_xy": [
+        -388.721112,
+        179.002882
+      ],
+      "exposed_start_xy": [
+        -429.717449,
+        99.906848
+      ],
+      "exposed_goal_xy": [
+        -388.721112,
+        179.002882
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_static_vm20",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 20.0,
+      "vut_desired_speed_mps": 25.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 90.0,
+      "ego_start_xy": [
+        285.922696,
+        243.08601
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        234.13925,
+        246.562325
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_slow_vm20",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 20.0,
+      "vut_desired_speed_mps": 25.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 90.0,
+      "ego_start_xy": [
+        285.922696,
+        243.08601
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        240.025995,
+        246.167049
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_R_static_vm20",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 20.0,
+      "vut_desired_speed_mps": 25.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 90.0,
+      "ego_start_xy": [
+        285.922696,
+        243.08601
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        234.13925,
+        246.562325
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_R_slow_vm20",
+      "location": "P1_straight",
+      "side": "right",
+      "vut_speed_mps": 20.0,
+      "vut_desired_speed_mps": 25.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 90.0,
+      "ego_start_xy": [
+        285.922696,
+        243.08601
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        240.025995,
+        246.167049
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_static_vm8",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 8.0,
+      "vut_desired_speed_mps": 13.0,
+      "exposed_speed_mps": 0.0,
+      "metric_name": "THW",
+      "target_thw_s": 2.3,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.3,
+      "lane_change_time_s": 3.7,
+      "lane_change_time_min_s": 3.7,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        293.904737,
+        242.550266
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        270.856593,
+        244.097225
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_slow_vm8_ve3",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 8.0,
+      "vut_desired_speed_mps": 13.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.6,
+      "target_metric_s": 2.6,
+      "lane_change_time_s": 3.7,
+      "lane_change_time_min_s": 3.7,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        293.904737,
+        242.550266
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        277.192338,
+        243.671968
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_slow_vm15_ve6",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 6.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 2.0,
+      "target_metric_s": 2.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        267.963105,
+        244.291445
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_slow_vm15_ve10",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 10.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 3.5,
+      "target_metric_s": 3.5,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        274.448511,
+        243.856132
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    },
+    {
+      "id": "P1_L_slow_vm15_ttc15",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 1.5,
+      "target_metric_s": 1.5,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        261.4777,
+        244.726794
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS",
+      "note": "暴露车比原设计沿路径前移 2 m，避开安全释放硬门"
+    },
+    {
+      "id": "P1_L_slow_vm15_ttc30",
+      "location": "P1_straight",
+      "side": "left",
+      "vut_speed_mps": 15.0,
+      "vut_desired_speed_mps": 20.0,
+      "exposed_speed_mps": 3.0,
+      "metric_name": "TTC",
+      "target_thw_s": 2.0,
+      "target_ttc_s": 3.0,
+      "target_metric_s": 3.0,
+      "lane_change_time_s": 3.0,
+      "lane_change_time_min_s": 3.0,
+      "ego_max_speed_kph": 60.0,
+      "ego_start_xy": [
+        289.414839,
+        242.851626
+      ],
+      "ego_goal_xy": [
+        197.937076,
+        245.896961
+      ],
+      "main_start_xy": [
+        303.982057,
+        241.873794
+      ],
+      "main_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "exposed_start_xy": [
+        245.513638,
+        245.79858
+      ],
+      "exposed_goal_xy": [
+        198.228966,
+        248.991309
+      ],
+      "expected": "PASS"
+    }
+  ]
+}

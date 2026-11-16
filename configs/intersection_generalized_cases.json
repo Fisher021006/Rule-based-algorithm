@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "description": "同济测试场 junction 572 交叉口泛化 case：8 种交互模式 × 入区时差。冲突半径固定 2.5 m，成功容差固定 0.5 s。",
+  "map_cache": "xodr_parser/cache/同济测试场.pkl",
+  "scenario_algorithm": "scenarios.intersection_conflict_algorithm.intersection_conflict_algorithm",
+  "planner_mode": "scene_target",
+  "conflict_zone_radius_m": 2.5,
+  "success_time_tol_s": 0.5,
+  "deltas": [
+    -1.5,
+    0.0,
+    1.5
+  ],
+  "ego": {
+    "start_speed": 0.0,
+    "max_speed_kph": 25.0
+  },
+  "vut": {
+    "motion": "idm",
+    "start_speed": 0.0,
+    "desired_speed": 4.17,
+    "max_acc": 1.5
+  },
+  "simulation": {
+    "dt": 0.1,
+    "max_steps": 300
+  },
+  "modes": [
+    {
+      "id": "M1",
+      "name": "AB_gvt_left_vut_straight",
+      "interaction": "自车左转 × 主车直行（现有实车 case1）",
+      "conflict_type": "vut_straight_cross",
+      "gvt": {
+        "start_xy": [-319.80158748218906, 121.7608749447074],
+        "goal_xy": [-303.8802312156567, 171.63479567650722]
+      },
+      "vut": {
+        "start_xy": [-266.948041635147, 177.82869989331905],
+        "goal_xy": [-325.0, 122.0]
+      },
+      "expected_conflict_xy": [-294.08, 152.43],
+      "expected_conflict_angle_deg": 38.4
+    },
+    {
+      "id": "M2",
+      "name": "AB_gvt_straight_vut_left",
+      "interaction": "自车直行 × 主车左转",
+      "conflict_type": "vut_left_oncoming",
+      "gvt": {
+        "start_xy": [-319.80158748218906, 121.7608749447074],
+        "goal_xy": [-250.37, 183.85]
+      },
+      "vut": {
+        "start_xy": [-254.69, 187.25],
+        "goal_xy": [-272.25, 119.73]
+      },
+      "expected_conflict_xy": [-289.22, 147.42],
+      "expected_conflict_angle_deg": 43.5
+    },
+    {
+      "id": "M3",
+      "name": "AC_both_straight",
+      "interaction": "双方直行（A×C）",
+      "conflict_type": "vut_straight_cross",
+      "gvt": {
+        "start_xy": [-319.80158748218906, 121.7608749447074],
+        "goal_xy": [-250.37, 183.85]
+      },
+      "vut": {
+        "start_xy": [-318.15, 178.96],
+        "goal_xy": [-272.25, 119.73]
+      },
+      "expected_conflict_xy": [-292.04, 145.11],
+      "expected_conflict_angle_deg": 86.3
+    },
+    {
+      "id": "M4",
+      "name": "AC_both_left",
+      "interaction": "双方左转（A×C）",
+      "conflict_type": "vut_left_oncoming",
+      "gvt": {
+        "start_xy": [-319.80158748218906, 121.7608749447074],
+        "goal_xy": [-303.8802312156567, 171.63479567650722]
+      },
+      "vut": {
+        "start_xy": [-315.77, 180.58],
+        "goal_xy": [-250.37, 183.85]
+      },
+      "expected_conflict_xy": [-293.98, 155.75],
+      "expected_conflict_angle_deg": 46.7
+    },
+    {
+      "id": "M5",
+      "name": "CD_gvt_left_vut_straight",
+      "interaction": "自车左转 × 主车直行（C×D）",
+      "conflict_type": "vut_straight_cross",
+      "gvt": {
+        "start_xy": [-315.77, 180.58],
+        "goal_xy": [-250.37, 183.85]
+      },
+      "vut": {
+        "start_xy": [-262.60, 123.33],
+        "goal_xy": [-303.46, 171.12]
+      },
+      "expected_conflict_xy": [-287.99, 153.25],
+      "expected_conflict_angle_deg": 39.3
+    },
+    {
+      "id": "M6",
+      "name": "CD_gvt_straight_vut_left",
+      "interaction": "自车直行 × 主车左转（C×D）",
+      "conflict_type": "vut_left_oncoming",
+      "gvt": {
+        "start_xy": [-318.15, 178.96],
+        "goal_xy": [-272.25, 119.73]
+      },
+      "vut": {
+        "start_xy": [-264.95, 121.44],
+        "goal_xy": [-310.39, 137.18]
+      },
+      "expected_conflict_xy": [-294.21, 148.15],
+      "expected_conflict_angle_deg": 57.2
+    },
+    {
+      "id": "M7",
+      "name": "BD_both_straight",
+      "interaction": "双方直行（B×D）",
+      "conflict_type": "vut_straight_cross",
+      "gvt": {
+        "start_xy": [-266.948041635147, 177.82869989331905],
+        "goal_xy": [-310.39, 137.18]
+      },
+      "vut": {
+        "start_xy": [-262.60, 123.33],
+        "goal_xy": [-303.46, 171.12]
+      },
+      "expected_conflict_xy": [-290.41, 155.93],
+      "expected_conflict_angle_deg": 88.4
+    },
+    {
+      "id": "M8",
+      "name": "BD_both_left",
+      "interaction": "双方左转（B×D）",
+      "conflict_type": "vut_left_oncoming",
+      "gvt": {
+        "start_xy": [-254.69, 187.25],
+        "goal_xy": [-272.25, 119.73]
+      },
+      "vut": {
+        "start_xy": [-264.95, 121.44],
+        "goal_xy": [-310.39, 137.18]
+      },
+      "expected_conflict_xy": [-289.22, 147.35],
+      "expected_conflict_angle_deg": 77.3
+    }
+  ]
+}

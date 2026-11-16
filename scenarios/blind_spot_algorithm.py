@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -40,16 +41,40 @@ class VehicleLimits:
     max_acc: float
 
 
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量；读取失败时回退默认值。"""
+
+    raw_value = os.getenv(name, "")
+    if raw_value == "":
+        return float(default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_side(name: str, default: str) -> str:
+    """读取场景侧环境变量；只接受 left/right，其余回退默认值。"""
+
+    raw_value = os.getenv(name, "").strip().lower()
+    if raw_value not in {"left", "right"}:
+        return str(default)
+    return raw_value
+
+
 SCENE_CONFIG: dict[str, Any] = {
     # 以下仅保留测试需求可见的场景契约；内部策略值定义为私有模块常量。
     # VUT 预期换道方向。算法不控制 VUT，只根据该方向构造同侧 GVT 盲区目标。
-    "scene_side": "left",
+    # 支持环境变量覆盖，便于离线批量扫左右侧；不设时保持原常量行为。
+    "scene_side": _env_side("ROS_SCENE_BLIND_SCENE_SIDE", "left"),
     "blind_rel_s_min_m": -8.6,
     "blind_rel_s_max_m": -5.1,
     "blind_rel_s_target_m": -6.1,
     # 外部显式配置的完成时 THW。内部会把 THW 换算成同车道完成时目标净距。
-    "completion_target_thw_s": 3.0,
-    "completion_thw_tol_s": 0.2,
+    # 目标 THW 与容差支持环境变量覆盖，便于离线批量扫 THW 强度；
+    # 不设环境变量时与原来的常量行为完全一致。
+    "completion_target_thw_s": _env_float("ROS_SCENE_BLIND_TARGET_THW_S", 3.0),
+    "completion_thw_tol_s": _env_float("ROS_SCENE_BLIND_THW_TOL_S", 0.2),
     "completion_min_net_gap_m": 1.0,
     # 目标不可达时允许延长规划时域的上限；正常目标不会用到。
     "target_max_plan_t_s": DEFAULT_MAX_PLAN_T_S,
@@ -62,6 +87,11 @@ _LANE_CHANGE_PREDICTION_T_MIN_S = 0.1
 _LANE_CHANGE_PREDICTION_T_MAX_S = 6.0
 _THW_V_FLOOR_MPS = 0.5
 _ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M = 0.05
+# 规划器按 jerk 最小化生成速度曲线，末端加速度固定为 0，滚动重规划时
+# 每帧只执行最平缓的第一段，减速永远滞后。剩余时间进入该窗口后冻结
+# 终端轨迹，交给规划器的 preserve_trajectory 机制执行后缀。
+_COMPLETION_FREEZE_MAX_T_S = 1.2
+_COMPLETION_BRAKING_LEAD_S = 0.05
 _COMPLETE_DECEL_MPS2 = 2.5
 _ACTIVE_TIMEOUT_MIN_S = 6.0
 
@@ -83,6 +113,7 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "locked_target_lane_sequence": [],
     "baseline_main_abs_d_on_target": -1.0,
     "prev_main_abs_d_on_target": -1.0,
+    "prev_lateral_v": float("nan"),
     "lane_change_start_hits": 0,
     "last_hold_detection_debug_time_s": -1.0,
     "blind_zone_hits": 0,
@@ -91,6 +122,7 @@ SCENE_MEMORY_TEMPLATE: dict[str, Any] = {
     "completion_success_hits": 0,
     "completion_success": None,
     "active_completion_target": None,
+    "active_frozen_solution": None,
     "last_metrics": None,
 }
 
@@ -665,6 +697,7 @@ def _reset_execution_memory(memory: dict[str, Any]) -> None:
     memory["completion_success_hits"] = 0
     memory["completion_success"] = None
     memory["active_completion_target"] = None
+    memory["active_frozen_solution"] = None
     memory["last_metrics"] = None
 
 
@@ -819,9 +852,23 @@ def _build_active_output(
     scene_status: str,
 ) -> dict[str, Any]:
     """构造 ACTIVE 阶段输出：反解 VUT 换道完成时的目标 THW 终端状态。"""
+    frozen = memory.get("active_frozen_solution")
+    if isinstance(frozen, dict):
+        frozen_output = _build_active_frozen_output(
+            context=context,
+            target_line=target_line,
+            metrics=metrics,
+            frozen=frozen,
+            reason=reason,
+            scene_status=scene_status,
+        )
+        if frozen_output is not None:
+            return frozen_output
+        memory["active_frozen_solution"] = None
+
     precise_target = _get_active_completion_target(context, target_line, metrics, memory)
     if bool(precise_target.get("valid", False)):
-        return _build_precise_completion_output(
+        output = _build_precise_completion_output(
             context=context,
             target_line=target_line,
             metrics=metrics,
@@ -829,29 +876,217 @@ def _build_active_output(
             reason=reason,
             scene_status=scene_status,
         )
+        plan_t = float(precise_target.get("plan_t_s", float("inf")))
+        if (np.isfinite(plan_t)
+                and plan_t <= float(_COMPLETION_FREEZE_MAX_T_S)
+                and bool(precise_target.get("completion_target_feasible", False))):
+            _freeze_active_solution(
+                context=context,
+                target_line=target_line,
+                output=output,
+                memory=memory,
+            )
+            _annotate_frozen_output(output, memory["active_frozen_solution"], context)
+        return output
 
-    fallback_target = _compute_active_target_rel_s(metrics)
-    fallback_debug = copy.deepcopy(fallback_target)
-    fallback_debug.update(
-        {
-            "completion_precise_valid": False,
-            "completion_precise_invalid_reason": str(precise_target.get("reason", "unknown")),
-        }
-    )
-    return _build_rel_s_control_output(
+    return _build_active_fallback_output(
         context=context,
         target_line=target_line,
         metrics=metrics,
-        target_rel_s=float(fallback_target["target_rel_s_m"]),
-        gain=float(0.28),
-        max_adv=float(2.0),
-        max_lag=float(3.0),
-        plan_t=float(1.0),
         reason=reason,
         scene_status=scene_status,
-        extra_speed_delta=float(fallback_target["prediction_speed_delta_mps"]),
-        extra_debug=fallback_debug,
+        invalid_reason=str(precise_target.get("reason", "unknown")),
     )
+
+
+def _freeze_active_solution(
+    *,
+    context: SceneContext,
+    target_line: ReferenceLineView | None,
+    output: dict[str, Any],
+    memory: dict[str, Any],
+) -> None:
+    """把换道完成终端固化为世界坐标终点，后续帧只执行剩余轨迹。"""
+
+    line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
+    route_lane_ids = _normalize_lane_sequence(memory.get("locked_target_lane_sequence", []))
+    if not route_lane_ids:
+        route_lane_ids = _normalize_lane_sequence(line.lane_sequence)
+    memory["active_frozen_solution"] = {
+        "x": float(output["x"]),
+        "y": float(output["y"]),
+        "v": float(output["v"]),
+        "a": float(output["a"]),
+        "theta": float(output["theta"]),
+        "deadline_s": float(context.time_s) + float(output["t"]),
+        "lane_id": str(line.lane_id),
+        "route_lane_ids": list(route_lane_ids),
+    }
+
+
+def _annotate_frozen_output(
+    output: dict[str, Any],
+    frozen: dict[str, Any],
+    context: SceneContext,
+) -> None:
+    """给冻结终端补上规划器执行后缀所需的元数据。"""
+
+    output["preserve_trajectory"] = True
+    output["trajectory_execution_time_s"] = float(context.time_s)
+    output["trajectory_deadline_s"] = float(frozen["deadline_s"])
+    output["trajectory_route_lane_ids"] = list(frozen.get("route_lane_ids", []))
+    output["min_external_plan_t_s"] = float(context.dt)
+    # 冻结终点已在世界坐标中固定，禁止下游按默认 1m 最小前进量改写。
+    output["min_external_target_progress_m"] = 0.0
+
+
+def _build_active_frozen_output(
+    *,
+    context: SceneContext,
+    target_line: ReferenceLineView | None,
+    metrics: dict[str, Any],
+    frozen: dict[str, Any],
+    reason: str,
+    scene_status: str,
+) -> dict[str, Any] | None:
+    """冻结执行：保持世界终点不变，只把剩余时域交给规划器。"""
+
+    deadline = float(frozen["deadline_s"])
+    remaining_t = deadline - float(context.time_s)
+    if remaining_t < float(context.dt) - 1e-9:
+        return None
+    line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
+    if str(line.lane_id) != str(frozen.get("lane_id", "")):
+        return None
+
+    output = {
+        "x": float(frozen["x"]),
+        "y": float(frozen["y"]),
+        "v": float(frozen["v"]),
+        "a": float(frozen["a"]),
+        "theta": float(frozen["theta"]),
+        "t": float(remaining_t),
+        "target_line_index": int(line.line_index),
+        "hold_t": 0.0,
+        "reason": str(reason),
+    }
+    _annotate_frozen_output(output, frozen, context)
+    debug = copy.deepcopy(metrics)
+    debug.update(
+        {
+            "active_frozen_execute": True,
+            "active_frozen_deadline_s": float(deadline),
+            "active_frozen_remaining_t_s": float(remaining_t),
+            "active_frozen_target_v_mps": float(frozen["v"]),
+        }
+    )
+    return _annotate_output(output, scene_status, reason, debug)
+
+
+def _build_active_fallback_output(
+    *,
+    context: SceneContext,
+    target_line: ReferenceLineView | None,
+    metrics: dict[str, Any],
+    reason: str,
+    scene_status: str,
+    invalid_reason: str,
+) -> dict[str, Any]:
+    """精确终端不可行时的兜底：按当前车头间距直接反算目标 THW 速度。
+
+    兜底不再使用随当前车速漂移的 ``rel_s`` 目标。THW 的定义是
+    ``headway_gap / v``，因此保持 ``v = headway_gap / target_thw`` 就能在
+    换道完成时维持目标 THW；间距变化时目标速度同向变化，不会出现目标
+    往后退的追不上问题。
+
+    规划器的 QP 末端加速度固定为 0，距离按左端点矩形积分，短时域内无法
+    完成较大减速。这里按同一离散模型搜索最短可执行时域，并按规划器的
+    积分方式补上 ``0.5*dt*(v0-vT)`` 的距离差，避免下发不可执行的
+    ``(L,T,vT)`` 或退化成拉长时域的软目标。
+    """
+
+    limits = _read_vehicle_limits(context)
+    line = target_line if target_line is not None else context.ego_vehicle.current_ref_line
+    dt = float(context.dt)
+    target_thw = max(float(SCENE_CONFIG["completion_target_thw_s"]), 1e-3)
+    gap = max(0.0, float(metrics.get("completion_headway_gap_m", 0.0)))
+    target_v = _clamp(gap / target_thw, 0.0, limits.max_v)
+    v0 = max(0.0, float(context.ego_vehicle.v))
+    requested_t = _clamp(
+        float(metrics.get("predicted_t_complete_s", 1.0)),
+        dt,
+        1.0,
+    )
+    requested_t = max(dt, round(requested_t / dt) * dt)
+
+    plan_t = float("nan")
+    planner_travel = float("nan")
+    candidate = float(requested_t)
+    while candidate <= 1.0 + 1e-9:
+        candidate_travel = (
+            0.5 * (v0 + target_v) * candidate + 0.5 * dt * (v0 - target_v)
+        )
+        check = resolve_target(
+            v_start=v0,
+            v_end=target_v,
+            plan_t=candidate,
+            a_min=float(limits.min_acc),
+            a_max=float(limits.max_acc),
+            v_max=float(limits.max_v),
+            dt=dt,
+            fixed_travel_s=float(candidate_travel),
+            max_plan_t=candidate,
+            min_plan_t=candidate,
+        )
+        if check.feasible and abs(float(check.v_end) - target_v) <= 1e-6:
+            plan_t = candidate
+            planner_travel = float(candidate_travel)
+            break
+        candidate = round((candidate + dt) / dt) * dt
+    if not np.isfinite(plan_t):
+        # 1 s 内都不存在可执行的减速终端时保持当前速度，至少保证目标自洽。
+        target_v = v0
+        plan_t = 1.0
+        planner_travel = 0.5 * (v0 + target_v) * plan_t + 0.5 * dt * (v0 - target_v)
+
+    target_s = _clamp(
+        float(line.current_s) + float(planner_travel),
+        float(line.current_s) + float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
+        float(line.cumulative_s[-1]) - 0.5,
+    )
+    planner_travel = float(target_s) - float(line.current_s)
+    target_xy, target_heading = get_path_point_at_s(line.line, target_s, line.cumulative_s)
+    target_a = _clamp(
+        (target_v - v0) / max(plan_t, 1e-3),
+        limits.min_acc,
+        limits.max_acc,
+    )
+    debug = copy.deepcopy(metrics)
+    debug.update(
+        {
+            "completion_precise_valid": False,
+            "completion_precise_invalid_reason": str(invalid_reason),
+            "active_fallback_mode": "direct_thw_speed",
+            "active_fallback_gap_m": float(gap),
+            "active_fallback_target_v_mps": float(target_v),
+            "active_fallback_plan_t_s": float(plan_t),
+            "active_fallback_planner_travel_m": float(planner_travel),
+        }
+    )
+    output = {
+        "x": float(target_xy[0]),
+        "y": float(target_xy[1]),
+        "v": float(target_v),
+        "a": float(target_a),
+        "theta": float(target_heading),
+        "t": float(plan_t),
+        "target_line_index": int(line.line_index),
+        "hold_t": 0.0,
+        "reason": str(reason),
+        "min_external_plan_t_s": float(dt),
+        "min_external_target_progress_m": float(_ACTIVE_MIN_EXTERNAL_TARGET_PROGRESS_M),
+    }
+    return _annotate_output(output, scene_status, reason, debug)
 
 
 def _build_precise_completion_output(
@@ -1527,7 +1762,8 @@ def _get_active_completion_target(
         float(line.cumulative_s[-1]) - 0.5,
     )
     terminal["target_s_m"] = float(target_s)
-    terminal["plan_t_s"] = float(remaining_t)
+    # ``target_s`` 已按吸附后的时域解出，这里保留同一个时域，避免下发值自相矛盾。
+    terminal["plan_t_s"] = float(terminal.get("plan_t_s", remaining_t))
     # 连续反解的距离在离散 QP 的 a_end=0 约束下不一定可行，交给公共 helper
     # 按同一时域复核；末速度被改动说明精确终端保不住，退回 rel_s 闭环目标。
     limits = _read_vehicle_limits(context)
@@ -1590,6 +1826,10 @@ def _solve_completion_thw_terminal(
     )
     if plan_t <= 1e-3:
         return {"valid": False, "reason": "non_positive_completion_time"}
+    # 规划器会把时域吸附到 dt 网格（``_snap_plan_time``），场景必须用同一个
+    # 时域解终端；否则 ``target_s`` 按 0.937 s 算、实际只执行 0.9 s，QP 只能
+    # 靠"先加速补面积再急刹"来凑距离。
+    plan_t = max(float(context.dt), round(plan_t / float(context.dt)) * float(context.dt))
 
     limits = _read_vehicle_limits(context)
     gvt_s = float(metrics.get("ego_s_on_target_line_m", target_line.current_s))
@@ -1630,10 +1870,16 @@ def _solve_completion_thw_terminal(
     # 这里保留反解的终端速度；实际可达性单独记录，统一由下游规划器施加约束。
     target_v = _clamp(raw_target_v, 0.0, limits.max_v)
     target_acc = (target_v - float(gvt_v)) / plan_t
-    target_s = float(gvt_s) + 0.5 * (float(gvt_v) + target_v) * plan_t
+    # 连续时间下的终端位移（梯形平均速度），THW / 净距判据都用它。
+    travel_s = 0.5 * (float(gvt_v) + target_v) * plan_t
+    # 规划器的路程等式用左端点矩形和（``s_i = s_{i-1} + v_{i-1}*dt``），减速
+    # 剖面上比梯形积分多 ``dt*(v0-vT)/2``。下发的目标点必须按同一离散化给出，
+    # 否则 QP 会把这段距离差补成"先加速再急刹"。
+    planner_travel_s = travel_s + 0.5 * float(context.dt) * (float(gvt_v) - target_v)
+    target_s = float(gvt_s) + planner_travel_s
     target_headway_gap = (
         float(vut_s_complete) + 0.5 * main_length
-        - (target_s + 0.5 * ego_length)
+        - (float(gvt_s) + travel_s + 0.5 * ego_length)
     )
     target_net_gap = target_headway_gap - main_length
     achieved_thw = (
@@ -1680,44 +1926,6 @@ def _solve_completion_thw_terminal(
         "completion_target_thw_s": float(target_thw),
         "completion_target_feasible": bool(feasible),
         "completion_target_infeasible_reason": "" if feasible else "speed_or_acc_constraint_limited",
-    }
-
-
-def _compute_active_target_rel_s(metrics: dict[str, Any]) -> dict[str, Any]:
-    """VUT 换道过程中，将盲区目标 ``rel_s`` 平滑过渡到完成时 THW 对应 ``rel_s``。"""
-    ego_length = float(metrics.get("ego_length_m", 4.5))
-    main_length = float(metrics.get("main_length_m", 4.5))
-    limits_half_sum = 0.5 * (ego_length + main_length)
-    follower_v = max(float(metrics.get("ego_v_mps", 0.0)), float(_THW_V_FLOOR_MPS))
-    target_headway_gap = float(SCENE_CONFIG["completion_target_thw_s"]) * follower_v
-    target_net_gap = max(
-        target_headway_gap - main_length,
-        float(SCENE_CONFIG["completion_min_net_gap_m"]),
-    )
-    completion_rel_s_target = -(target_net_gap + limits_half_sum)
-    blind_target = float(SCENE_CONFIG["blind_rel_s_target_m"])
-    progress = float(metrics.get("lane_change_progress_ratio", 0.0))
-    blend_start = _clamp(float(0.50), 0.0, 0.95)
-    blend = _clamp((progress - blend_start) / max(1.0 - blend_start, 1e-3), 0.0, 1.0)
-    target_rel_s = (1.0 - blend) * blind_target + blend * completion_rel_s_target
-
-    t_complete = float(metrics.get("predicted_t_complete_s", float("inf")))
-    rel_s_complete = float(metrics.get("predicted_rel_s_complete_m", float("nan")))
-    if np.isfinite(t_complete) and np.isfinite(rel_s_complete) and t_complete > 1e-3:
-        prediction_error = completion_rel_s_target - rel_s_complete
-        prediction_speed_delta = float(0.45) * prediction_error / t_complete
-    else:
-        prediction_error = 0.0
-        prediction_speed_delta = 0.0
-
-    return {
-        "active_blend_to_completion": float(blend),
-        "target_headway_gap_from_thw_m": float(target_headway_gap),
-        "target_net_gap_from_thw_m": float(target_net_gap),
-        "completion_rel_s_target_m": float(completion_rel_s_target),
-        "target_rel_s_m": float(target_rel_s),
-        "prediction_rel_s_error_m": float(prediction_error),
-        "prediction_speed_delta_mps": float(prediction_speed_delta),
     }
 
 
@@ -1815,6 +2023,10 @@ def _compute_blind_spot_metrics(
         current_abs_d=current_abs_d,
         prev_abs_d=float(memory.get("prev_main_abs_d_on_target", current_abs_d)),
         dt=float(context.dt),
+        prev_lateral_v=float(memory.get("prev_lateral_v", float("nan"))),
+    )
+    memory["prev_lateral_v"] = float(
+        predicted["predicted_lateral_v_toward_target_mps"]
     )
     hard_collision = _evaluate_hard_collision(context, limits)
     gvt_on_side_lane = bool(ego_on_target_line and side_lateral_ok)
@@ -1877,14 +2089,42 @@ def _predict_lane_change_completion(
     current_abs_d: float,
     prev_abs_d: float,
     dt: float,
+    prev_lateral_v: float = float("nan"),
 ) -> dict[str, Any]:
-    """按纵向速度恒定假设，预测 VUT 到达目标侧车道中心附近时的两车纵向关系。"""
+    """预测 VUT 到达目标侧车道中心附近时的两车纵向关系。
+
+    换道尾段横向速度会衰减；只用当前横向速度会把完成时刻算早。这里用
+    前后两帧横向速度估计横向加速度，按 ``remaining_d = v*t + 0.5*a*t²``
+    反解时间。加速度非负或判别式无效时退回恒速预测。
+    """
     lateral_v = (float(prev_abs_d) - float(current_abs_d)) / max(float(dt), 1e-3)
     lateral_v_eff = max(float(lateral_v), float(0.15))
     remaining_d = max(0.0, float(current_abs_d) - float(_LANE_CHANGE_COMPLETE_D_M))
-    raw_t_complete = remaining_d / max(lateral_v_eff, 1e-3)
-    # 横向剩余距离/横向速度给出主预测，固定 0.05s 补偿离散观测滞后。
-    adjusted_t_complete = max(float(dt), raw_t_complete - float(0.05))
+    constant_v_t_complete = remaining_d / max(lateral_v_eff, 1e-3)
+    raw_t_complete = float(constant_v_t_complete)
+    lateral_a = float("nan")
+    if (
+        np.isfinite(float(prev_lateral_v))
+        and float(prev_lateral_v) > 0.0
+        and float(lateral_v) > 0.0
+    ):
+        lateral_a = _clamp(
+            (float(lateral_v) - float(prev_lateral_v)) / max(float(dt), 1e-3),
+            -2.0,
+            2.0,
+        )
+        if lateral_a < -1e-3:
+            disc = float(lateral_v) * float(lateral_v) + 2.0 * lateral_a * remaining_d
+            if disc > 0.0:
+                raw_t_complete = (
+                    -float(lateral_v) + float(np.sqrt(disc))
+                ) / lateral_a
+    # 横向剩余距离/横向速度给出主预测；再提前一段制动提前量，抵消
+    # jerk 最小化速度曲线的减速滞后和离散观测滞后。
+    adjusted_t_complete = max(
+        float(dt),
+        raw_t_complete - float(_COMPLETION_BRAKING_LEAD_S),
+    )
     t_complete = _clamp(
         adjusted_t_complete,
         float(_LANE_CHANGE_PREDICTION_T_MIN_S),
@@ -1894,6 +2134,8 @@ def _predict_lane_change_completion(
     main_s_complete = float(main_s) + float(main_v) * t_complete
     return {
         "predicted_lateral_v_toward_target_mps": float(lateral_v),
+        "predicted_lateral_a_toward_target_mps2": float(lateral_a),
+        "predicted_t_complete_constant_v_s": float(constant_v_t_complete),
         "predicted_t_complete_raw_s": float(raw_t_complete),
         "predicted_t_complete_adjusted_s": float(adjusted_t_complete),
         "predicted_t_complete_s": float(t_complete),

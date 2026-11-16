@@ -597,8 +597,6 @@ def _build_cutout_scene(
 
     if _heading_diff_deg(float(main.heading), float(ego.heading)) > float(CFG["max_heading_diff_deg"]):
         return _scene_failure("main_heading_mismatch", {"heading_diff_deg": _heading_diff_deg(main.heading, ego.heading)})
-    if _heading_diff_deg(float(exposed.heading), float(ego.heading)) > float(CFG["max_heading_diff_deg"]):
-        return _scene_failure("exposed_heading_mismatch", {"heading_diff_deg": _heading_diff_deg(exposed.heading, ego.heading)})
 
     target_line = target_line_override
     if target_line is None:
@@ -612,6 +610,15 @@ def _build_cutout_scene(
     geometry = _compute_source_geometry(context, exposed, limits, source_line)
     if not bool(geometry["same_source_lane"]):
         return _scene_failure("not_same_source_lane", geometry)
+    # 同向判断应使用暴露车所在位置的源车道切线，而不是自车当前朝向。
+    # 弯道上两车相距几十米时，绝对朝向本来就有差异，直接比较会误判。
+    exposed_tangent_heading = _source_line_heading_at_s(source_line, float(geometry["exposed_s_on_source"]))
+    exposed_heading_diff = _heading_diff_deg(float(exposed.heading), exposed_tangent_heading)
+    if (not np.isfinite(exposed_tangent_heading)) or exposed_heading_diff > float(CFG["max_heading_diff_deg"]):
+        debug = copy.deepcopy(geometry)
+        debug["heading_diff_deg"] = exposed_heading_diff
+        debug["heading_reference"] = "source_line_tangent"
+        return _scene_failure("exposed_heading_mismatch", debug)
     if not bool(geometry["ordering_ok"]):
         return _scene_failure("invalid_cutout_order", geometry)
     if float(geometry["gvt_to_exposed_gap_m"]) < float(CFG["source_abort_gap_m"]):
@@ -659,6 +666,29 @@ def _build_source_relation_line(context: SceneContext) -> ReferenceLineView:
     """
 
     ego = context.ego_vehicle
+    # 优先使用 provider 已构建的完整关系轴。它同时向前驱和后继延伸，
+    # 能覆盖起点落在上一段车道上的 VUT；只用当前车道中心线会把这类
+    # VUT 压到线端，产生虚假的横向偏移。
+    relation_line = getattr(ego.current_ref_line, "relation_line", None)
+    if relation_line is not None:
+        relation_xy = np.asarray(relation_line, dtype=float)
+        if relation_xy.ndim == 2 and len(relation_xy) >= 2:
+            relation_xy = relation_xy[:, :2]
+            cumulative_s = calculate_path_cumulative_distance(relation_xy)
+            _, current_s, current_d = project_point_to_path(
+                np.array([ego.x, ego.y], dtype=float), relation_xy
+            )
+            return ReferenceLineView(
+                line_index=int(ego.current_ref_line.line_index),
+                lane_id=str(ego.current_ref_line.lane_id),
+                lane_sequence=_normalize_lane_sequence(ego.current_ref_line.lane_sequence),
+                lateral_step=0,
+                line=relation_xy,
+                cumulative_s=cumulative_s,
+                current_s=float(current_s),
+                current_d=float(current_d),
+            )
+
     lane_centerline = getattr(ego, "lane_centerline", None)
     if lane_centerline is None:
         return ego.current_ref_line
@@ -2195,6 +2225,20 @@ def _heading_diff_deg(h1: float, h2: float) -> float:
     """计算两个航向角之间的最小夹角，单位为度。"""
 
     return float(np.degrees(abs(normalize_angle(float(h1) - float(h2)))))
+
+
+def _source_line_heading_at_s(source_line: ReferenceLineView, s_value: float) -> float:
+    """取源车道关系线在给定 s 处的切线朝向。"""
+
+    line = np.asarray(source_line.line, dtype=float)
+    if line.ndim != 2 or len(line) < 2:
+        return float("nan")
+    _, heading = get_path_point_at_s(
+        line[:, :2],
+        float(s_value),
+        np.asarray(source_line.cumulative_s, dtype=float),
+    )
+    return float(heading)
 
 
 def _normalize_lane_sequence(lane_sequence: list[str] | tuple[str, ...] | None) -> list[str]:

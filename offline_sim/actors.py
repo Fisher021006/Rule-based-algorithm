@@ -192,6 +192,24 @@ class IDMRouteVehicle:
         _, heading = self._scripted_pose_at_progress(0.0, 0.0, previous_xy=None)
         self.heading = float(heading)
 
+    def _project_source_to_target(self, source_xy: np.ndarray) -> np.ndarray:
+        """把源车道上的点投影到目标车道中心线，返回投影点。
+
+        弯道上两条车道中心线的弧长参数不对齐，若直接按同一个 lane_s 取目标点，
+        混合时会混入纵向位移（左右切方向相反）。投影最近点可保证源、目标两点
+        位于同一纵向站位，换道混合只产生横向位移。
+        """
+        if self.script_target_line is None or self.script_target_cum is None:
+            raise ValueError("scripted_lane_change 尚未初始化目标车道中心线")
+        _, target_s, _ = project_point_to_path(
+            np.asarray(source_xy, dtype=float), self.script_target_line
+        )
+        target_s = float(np.clip(target_s, 0.0, float(self.script_target_cum[-1])))
+        target_xy, _ = get_path_point_at_s(
+            self.script_target_line, target_s, self.script_target_cum
+        )
+        return np.asarray(target_xy, dtype=float)
+
     def _build_scripted_lane_change_path(self) -> np.ndarray:
         """生成用于主车参考线投影和可视化的连续脚本换道路径。"""
         if (
@@ -219,8 +237,7 @@ class IDMRouteVehicle:
             else:
                 ratio = _smoothstep((lane_s - change_start_s) / max(change_end_s - change_start_s, 1e-3))
             source_xy, _ = get_path_point_at_s(self.script_source_line, lane_s, self.script_source_cum)
-            target_s = min(lane_s, float(self.script_target_cum[-1]))
-            target_xy, _ = get_path_point_at_s(self.script_target_line, target_s, self.script_target_cum)
+            target_xy = self._project_source_to_target(source_xy)
             xy = (1.0 - ratio) * source_xy + ratio * target_xy
             points.append(xy)
         points_arr = np.asarray(points, dtype=float)
@@ -243,8 +260,7 @@ class IDMRouteVehicle:
             raise ValueError("scripted_lane_change 尚未初始化中心线")
         lane_s = min(float(self.script_start_lane_s) + float(progress_s), float(self.script_source_cum[-1]))
         source_xy, _ = get_path_point_at_s(self.script_source_line, lane_s, self.script_source_cum)
-        target_s = min(lane_s, float(self.script_target_cum[-1]))
-        target_xy, _ = get_path_point_at_s(self.script_target_line, target_s, self.script_target_cum)
+        target_xy = self._project_source_to_target(source_xy)
         xy = (1.0 - float(blend)) * source_xy + float(blend) * target_xy
         if previous_xy is not None:
             delta = xy - previous_xy
@@ -252,8 +268,7 @@ class IDMRouteVehicle:
                 return xy, float(math.atan2(delta[1], delta[0]))
         lookahead_s = min(lane_s + 0.5, float(self.script_source_cum[-1]))
         source_next, _ = get_path_point_at_s(self.script_source_line, lookahead_s, self.script_source_cum)
-        target_next_s = min(lookahead_s, float(self.script_target_cum[-1]))
-        target_next, _ = get_path_point_at_s(self.script_target_line, target_next_s, self.script_target_cum)
+        target_next = self._project_source_to_target(source_next)
         next_xy = (1.0 - float(blend)) * source_next + float(blend) * target_next
         delta = next_xy - xy
         return xy, float(math.atan2(delta[1], delta[0]))

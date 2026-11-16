@@ -144,6 +144,12 @@ CFG: dict[str, Any] = {
     "release_max_speed_adv_mps": 3.0,
     "release_max_speed_lag_mps": 3.0,
     "plan_t_s": 0.5,
+    # 局部规划器在单个 plan_t 时域内可实现的单步速度修正上限。
+    # 0.5 s 时域下超过约 1.1 m/s 的台阶会被时间参数化判为加速度超限，
+    # 这里用 1.0 m/s 保守限幅，大偏差时改为多步收敛。
+    "planner_feasible_speed_delta_mps": _env_float(
+        "ROS_SCENE_COMPANION_FEASIBLE_SPEED_DELTA_MPS", 1.0
+    ),
     "min_target_progress_m": 1.0,
     "standstill_speed_eps_mps": 0.05,
     # 几何判断和状态去抖。连续命中/丢失若干帧后才切换状态，
@@ -837,6 +843,9 @@ def _build_create_gap_output(
         reason="companion_create_gap",
         scene_status="create_gap",
         reference_v=float(interaction.get("release_reference_v_mps", metrics.get("main_v_mps", 0.0))),
+        rel_v_reference_v=float(
+            interaction.get("primary_v_mps", metrics.get("main_v_mps", 0.0))
+        ),
         extra_debug={"primary_interaction": copy.deepcopy(interaction)},
     )
 
@@ -868,6 +877,9 @@ def _build_released_gap_output(
         reason="companion_hold_released_gap",
         scene_status="hold_released_gap",
         reference_v=float(interaction.get("release_reference_v_mps", metrics.get("main_v_mps", 0.0))),
+        rel_v_reference_v=float(
+            interaction.get("primary_v_mps", metrics.get("main_v_mps", 0.0))
+        ),
         extra_debug={"primary_interaction": copy.deepcopy(interaction)},
     )
 
@@ -906,6 +918,7 @@ def _build_rel_s_control_output(
     reason: str,
     scene_status: str,
     reference_v: float | None = None,
+    rel_v_reference_v: float | None = None,
     extra_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """按 ``rel_s`` 误差和相对速度构造纵向终端速度。
@@ -920,6 +933,10 @@ def _build_rel_s_control_output(
     limits = _read_vehicle_limits(context)
     rel_s = float(metrics.get("rel_s_m", CFG["rel_s_target_m"]))
     rel_v = float(metrics.get("rel_v_mps", 0.0))
+    # 释放/让位时目标 rel_s 以主场景车为基准，阻尼必须用同一参考车速度；
+    # 否则切入车与 VUT 的速度差会被当成“自己超速”而把车往回拽。
+    if rel_v_reference_v is not None:
+        rel_v = float(context.ego_vehicle.v) - float(rel_v_reference_v)
     rel_error = float(target_rel_s) - rel_s
     # 位置误差推动 GVT 接近目标 rel_s，相对速度阻尼用于减小越过目标后的振荡。
     speed_delta = _clamp(
@@ -935,6 +952,16 @@ def _build_rel_s_control_output(
     reachable_min_v = max(0.0, float(context.ego_vehicle.v) + limits.min_acc * plan_t)
     reachable_max_v = min(limits.max_v, float(context.ego_vehicle.v) + limits.max_acc * plan_t)
     target_v = _clamp(raw_target_v, reachable_min_v, reachable_max_v)
+    # 规划器的时间参数化按整条轨迹检查加速度峰值，而不是只看平均加速度；
+    # 梯形目标点在大偏差时会要求超过车辆加速度上限的瞬时修正。这里按
+    # 单个时域可实现的修正量再裁剪一次，让大偏差退化为多步收敛。
+    feasible_delta = max(0.0, float(CFG["planner_feasible_speed_delta_mps"]))
+    ego_v = float(context.ego_vehicle.v)
+    target_v = _clamp(
+        target_v,
+        max(0.0, ego_v - feasible_delta),
+        min(limits.max_v, ego_v + feasible_delta),
+    )
     # 平均加速度仅记录和随输出透传；实际轨迹仍由终端位置、速度和时域生成。
     target_a = (target_v - float(context.ego_vehicle.v)) / max(plan_t, 1e-3)
 
@@ -944,6 +971,9 @@ def _build_rel_s_control_output(
             "control_target_rel_s_m": float(target_rel_s),
             "control_rel_s_error_m": float(rel_error),
             "control_rel_v_mps": float(rel_v),
+            "control_rel_v_reference_v_mps": (
+                None if rel_v_reference_v is None else float(rel_v_reference_v)
+            ),
             "control_reference_v_mps": float(base_v),
             "control_speed_delta_mps": float(speed_delta),
             "control_raw_target_v_mps": float(raw_target_v),
@@ -1344,6 +1374,9 @@ def _compute_primary_interaction(
         + float(CFG["primary_min_net_gap_m"])
     )
     primary_rel_s_to_main = float(primary_s) - float(main_s)
+    # 释放目标在硬间距上再加缓冲：车辆跟踪终端速度有约一个 plan_t 的滞后，
+    # 目标若刚好等于最小中心距，瞬态必然压线。该缓冲同时用于触发判定。
+    release_margin = max(0.0, float(CFG["primary_gap_buffer_m"]))
     # 已在主场景 GVT 前方则继续前移，已在其后方则继续后撤；
     # 不跨越主场景车辆寻找另一侧空间，避免两车轨迹在释放过程中交叉。
     ego_ahead = float(ego_s) >= float(primary_s)
@@ -1351,7 +1384,7 @@ def _compute_primary_interaction(
         release_direction = "forward"
         release_target_rel_s = max(
             float(CFG["rel_s_target_m"]),
-            primary_rel_s_to_main + required_center_gap,
+            primary_rel_s_to_main + required_center_gap + release_margin,
         )
         current_center_gap = float(ego_s) - float(primary_s)
         reference_v = max(float(main.v), float(primary.v))
@@ -1359,7 +1392,7 @@ def _compute_primary_interaction(
         release_direction = "backward"
         release_target_rel_s = min(
             float(CFG["rel_s_target_m"]),
-            primary_rel_s_to_main - required_center_gap,
+            primary_rel_s_to_main - required_center_gap - release_margin,
         )
         current_center_gap = float(primary_s) - float(ego_s)
         reference_v = min(float(main.v), float(primary.v))

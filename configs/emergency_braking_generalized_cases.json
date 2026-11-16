@@ -1,0 +1,425 @@
+{
+  "version": 1,
+  "description": "紧急制动泛化 case：目标触发 THW × 主车初始速度 × 初始净间距。GVT 为场景车（braking_gvt），VUT 为主车（IDM 跟车），主矩阵不含伴随车。",
+  "map_cache": "xodr_parser/cache/同济测试场.pkl",
+  "scenario_algorithm": "scenarios.braking_algorithm.braking_algorithm",
+  "planner_mode": "scene_target",
+  "thw_tol_s": 0.1,
+  "net_gap_tol_m": 0.5,
+  "speed_tol_mps": 0.3,
+  "ego": {
+    "start_speed": 0.0,
+    "max_speed_kph": 25.0
+  },
+  "vut_motion": {
+    "motion": "idm",
+    "max_acc": 2.5
+  },
+  "simulation": {
+    "dt": 0.1,
+    "max_steps": 400
+  },
+  "route": {
+    "vut_start_xy": [
+      393.836978,
+      235.736749
+    ],
+    "vut_goal_xy": [
+      157.350323,
+      251.810564
+    ],
+    "gvt_goal_xy": [
+      157.350323,
+      251.810564
+    ],
+    "forward_unit_xy": [
+      -0.997698064953,
+      0.06781276568
+    ],
+    "ego_length_m": 4.64
+  },
+  "cases": [
+    {
+      "id": "T25_V40_G12",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 4.16,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V40_G20",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 6.16,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V40_G25",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 7.41,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V50_G12",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 3.328,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V50_G20",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.928,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V50_G25",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 5.928,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V60_G12",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 2.7733,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V60_G20",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.1067,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T25_V60_G25",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 4.94,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V40_G12",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 4.16,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V40_G20",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 6.16,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V40_G25",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 7.41,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V50_G12",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 3.328,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V50_G20",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.928,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V50_G25",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 5.928,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V60_G12",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 2.7733,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V60_G20",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.1067,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T40_V60_G25",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 4.94,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V40_G12",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 4.16,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V40_G20",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 6.16,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V40_G25",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 7.41,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V50_G12",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 3.328,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V50_G20",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.928,
+      "expected_trigger": "immediate_exact",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V50_G25",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 5.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 5.928,
+      "expected_trigger": "approach",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V60_G12",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 12.0,
+      "gvt_start_xy": [
+        377.235282,
+        236.865153
+      ],
+      "expected_initial_thw_s": 2.7733,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V60_G20",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 20.0,
+      "gvt_start_xy": [
+        369.253698,
+        237.407656
+      ],
+      "expected_initial_thw_s": 4.1067,
+      "expected_trigger": "immediate_late",
+      "expected_infeasible": false
+    },
+    {
+      "id": "T50_V60_G25",
+      "target_thw_s": 5.0,
+      "vut_speed_mps": 6.0,
+      "initial_net_gap_m": 25.0,
+      "gvt_start_xy": [
+        364.265207,
+        237.746719
+      ],
+      "expected_initial_thw_s": 4.94,
+      "expected_trigger": "immediate_exact",
+      "expected_infeasible": false
+    },
+    {
+      "id": "B0_BASELINE",
+      "target_thw_s": 4.0,
+      "vut_speed_mps": 5.0,
+      "vut_start_speed_mps": 0.0,
+      "vut_desired_speed_mps": 5.0,
+      "initial_net_gap_m": 25.5,
+      "gvt_start_xy": [
+        363.908139,
+        237.801819
+      ],
+      "expected_initial_thw_s": null,
+      "expected_trigger": "approach_from_rest",
+      "expected_infeasible": false,
+      "note": "现有实车 case 回归锚点：主车 0 起步、IDM 期望 5 m/s、中心距 30 m"
+    },
+    {
+      "id": "X_INFEASIBLE",
+      "target_thw_s": 2.5,
+      "vut_speed_mps": 4.0,
+      "initial_net_gap_m": 35.0,
+      "gvt_start_xy": [
+        354.288227,
+        238.424847
+      ],
+      "expected_initial_thw_s": 9.91,
+      "expected_trigger": "none",
+      "expected_infeasible": true,
+      "max_steps": 200,
+      "note": "负例：低速 + 大间距，PREPARE 硬超时前无法收敛"
+    }
+  ]
+}

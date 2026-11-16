@@ -1,0 +1,340 @@
+{
+  "version": 1,
+  "description": "盲区场景泛化 case：相对车道（左切/右切）× 换道起点（P1-P5）× 完成 THW（2.5/3.0/3.5/4.0）。地图同济测试场 road 72/71/70，GVT 与 VUT 恒为相邻机动车道，右侧 .3 为非机动车道不参与。本版为全 40 格网格。",
+  "map_cache": "xodr_parser/cache/同济测试场.pkl",
+  "scenario_algorithm": "scenarios.blind_spot_algorithm.blind_spot_algorithm",
+  "planner_mode": "scene_target",
+  "thw_tol_s": 0.2,
+  "vut_motion": {
+    "motion": "scripted_lane_change",
+    "start_speed": 2.5,
+    "desired_speed": 2.5,
+    "lane_change_duration_s": 4.0
+  },
+  "ego": {
+    "start_speed": 0.0,
+    "max_speed_kph": 25.0
+  },
+  "simulation": {
+    "dt": 0.1,
+    "max_steps": 320
+  },
+  "sides": {
+    "L": {
+      "name": "left_cut",
+      "interaction": "GVT 在左车道 72.0.1，VUT 在右侧相邻车道 72.0.2 向左切入",
+      "scene_side": "left",
+      "vut_lane_change_side": "left",
+      "ego": {
+        "start_xy": [
+          -418.59169704042665,
+          152.65035671654192
+        ],
+        "goal_xy": [
+          -419.80275551109906,
+          49.20029894173733
+        ]
+      },
+      "vut": {
+        "start_xy": [
+          -425.542,
+          149.0
+        ],
+        "goal_xy": [
+          -431.60245767,
+          61.84509924
+        ]
+      }
+    },
+    "R": {
+      "name": "right_cut",
+      "interaction": "GVT 在右车道 72.0.2，VUT 在左侧相邻车道 72.0.1 向右切入",
+      "scene_side": "right",
+      "vut_lane_change_side": "right",
+      "ego": {
+        "start_xy": [
+          -421.335748504793,
+          154.935226009026
+        ],
+        "goal_xy": [
+          -423.183838068226,
+          47.658363052997
+        ]
+      },
+      "vut": {
+        "start_xy": [
+          -422.37602176834,
+          147.428049549079
+        ],
+        "goal_xy": [
+          -428.419785422121,
+          63.245807785169
+        ]
+      }
+    }
+  },
+  "start_points": {
+    "P1": {
+      "s_m": 18.0,
+      "note": "起始车道 72.x 内，距车道末端约 3 m"
+    },
+    "P2": {
+      "s_m": 25.0,
+      "note": "刚进入 71.x 车道"
+    },
+    "P3": {
+      "s_m": 30.0,
+      "note": "实车 case1 起点"
+    },
+    "P4": {
+      "s_m": 38.0,
+      "note": "71.x 车道中段"
+    },
+    "P5": {
+      "s_m": 45.0,
+      "note": "71.x 车道后段"
+    }
+  },
+  "cases": [
+    {
+      "id": "L_P1_T25",
+      "side": "L",
+      "start_point": "P1",
+      "thw_s": 2.5
+    },
+    {
+      "id": "L_P1_T30",
+      "side": "L",
+      "start_point": "P1",
+      "thw_s": 3.0
+    },
+    {
+      "id": "L_P1_T35",
+      "side": "L",
+      "start_point": "P1",
+      "thw_s": 3.5
+    },
+    {
+      "id": "L_P1_T40",
+      "side": "L",
+      "start_point": "P1",
+      "thw_s": 4.0
+    },
+    {
+      "id": "R_P1_T25",
+      "side": "R",
+      "start_point": "P1",
+      "thw_s": 2.5
+    },
+    {
+      "id": "R_P1_T30",
+      "side": "R",
+      "start_point": "P1",
+      "thw_s": 3.0
+    },
+    {
+      "id": "R_P1_T35",
+      "side": "R",
+      "start_point": "P1",
+      "thw_s": 3.5
+    },
+    {
+      "id": "R_P1_T40",
+      "side": "R",
+      "start_point": "P1",
+      "thw_s": 4.0
+    },
+    {
+      "id": "L_P2_T25",
+      "side": "L",
+      "start_point": "P2",
+      "thw_s": 2.5
+    },
+    {
+      "id": "L_P2_T30",
+      "side": "L",
+      "start_point": "P2",
+      "thw_s": 3.0
+    },
+    {
+      "id": "L_P2_T35",
+      "side": "L",
+      "start_point": "P2",
+      "thw_s": 3.5
+    },
+    {
+      "id": "L_P2_T40",
+      "side": "L",
+      "start_point": "P2",
+      "thw_s": 4.0
+    },
+    {
+      "id": "R_P2_T25",
+      "side": "R",
+      "start_point": "P2",
+      "thw_s": 2.5
+    },
+    {
+      "id": "R_P2_T30",
+      "side": "R",
+      "start_point": "P2",
+      "thw_s": 3.0
+    },
+    {
+      "id": "R_P2_T35",
+      "side": "R",
+      "start_point": "P2",
+      "thw_s": 3.5
+    },
+    {
+      "id": "R_P2_T40",
+      "side": "R",
+      "start_point": "P2",
+      "thw_s": 4.0
+    },
+    {
+      "id": "L_P3_T25",
+      "side": "L",
+      "start_point": "P3",
+      "thw_s": 2.5
+    },
+    {
+      "id": "L_P3_T30",
+      "side": "L",
+      "start_point": "P3",
+      "thw_s": 3.0
+    },
+    {
+      "id": "L_P3_T35",
+      "side": "L",
+      "start_point": "P3",
+      "thw_s": 3.5
+    },
+    {
+      "id": "L_P3_T40",
+      "side": "L",
+      "start_point": "P3",
+      "thw_s": 4.0
+    },
+    {
+      "id": "R_P3_T25",
+      "side": "R",
+      "start_point": "P3",
+      "thw_s": 2.5
+    },
+    {
+      "id": "R_P3_T30",
+      "side": "R",
+      "start_point": "P3",
+      "thw_s": 3.0
+    },
+    {
+      "id": "R_P3_T35",
+      "side": "R",
+      "start_point": "P3",
+      "thw_s": 3.5
+    },
+    {
+      "id": "R_P3_T40",
+      "side": "R",
+      "start_point": "P3",
+      "thw_s": 4.0
+    },
+    {
+      "id": "L_P4_T25",
+      "side": "L",
+      "start_point": "P4",
+      "thw_s": 2.5
+    },
+    {
+      "id": "L_P4_T30",
+      "side": "L",
+      "start_point": "P4",
+      "thw_s": 3.0
+    },
+    {
+      "id": "L_P4_T35",
+      "side": "L",
+      "start_point": "P4",
+      "thw_s": 3.5
+    },
+    {
+      "id": "L_P4_T40",
+      "side": "L",
+      "start_point": "P4",
+      "thw_s": 4.0
+    },
+    {
+      "id": "R_P4_T25",
+      "side": "R",
+      "start_point": "P4",
+      "thw_s": 2.5
+    },
+    {
+      "id": "R_P4_T30",
+      "side": "R",
+      "start_point": "P4",
+      "thw_s": 3.0
+    },
+    {
+      "id": "R_P4_T35",
+      "side": "R",
+      "start_point": "P4",
+      "thw_s": 3.5
+    },
+    {
+      "id": "R_P4_T40",
+      "side": "R",
+      "start_point": "P4",
+      "thw_s": 4.0
+    },
+    {
+      "id": "L_P5_T25",
+      "side": "L",
+      "start_point": "P5",
+      "thw_s": 2.5
+    },
+    {
+      "id": "L_P5_T30",
+      "side": "L",
+      "start_point": "P5",
+      "thw_s": 3.0
+    },
+    {
+      "id": "L_P5_T35",
+      "side": "L",
+      "start_point": "P5",
+      "thw_s": 3.5
+    },
+    {
+      "id": "L_P5_T40",
+      "side": "L",
+      "start_point": "P5",
+      "thw_s": 4.0
+    },
+    {
+      "id": "R_P5_T25",
+      "side": "R",
+      "start_point": "P5",
+      "thw_s": 2.5
+    },
+    {
+      "id": "R_P5_T30",
+      "side": "R",
+      "start_point": "P5",
+      "thw_s": 3.0
+    },
+    {
+      "id": "R_P5_T35",
+      "side": "R",
+      "start_point": "P5",
+      "thw_s": 3.5
+    },
+    {
+      "id": "R_P5_T40",
+      "side": "R",
+      "start_point": "P5",
+      "thw_s": 4.0
+    }
+  ]
+}

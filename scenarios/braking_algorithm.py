@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -32,10 +33,24 @@ class VehicleLimits:
     max_acc: float
 
 
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量；读取失败时回退默认值。"""
+
+    raw_value = os.getenv(name, "")
+    if raw_value == "":
+        return float(default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 CFG: dict[str, Any] = {
     "cruise_target_v": 5.0,
-    "target_thw_s": 4.0,
-    "thw_tol_s": 0.1,
+    # 目标触发 THW 与容差支持环境变量覆盖，便于离线批量扫 THW 强度；
+    # 不设环境变量时与原来的常量行为完全一致。
+    "target_thw_s": _env_float("ROS_SCENE_BRAKING_TARGET_THW_S", 4.0),
+    "thw_tol_s": _env_float("ROS_SCENE_BRAKING_THW_TOL_S", 0.1),
     "prepare_plan_t_s": 1.5,
     "prepare_timeout_s": 8.0,
     "prepare_hard_timeout_s": 14.0,
@@ -603,7 +618,14 @@ def _build_line_target_output(
         float(target_v) * float(plan_t) * float(CFG["target_progress_ratio"]),
     )
     if travel_s_override is None:
-        travel_s = max(min_progress, float(target_v) * float(plan_t))
+        # 目标点距离按当前速度到目标速度的线性过渡积分给出（梯形平均速度），
+        # 否则从 0 起步加速到 target_v 时会把目标点放得过远，规划器会因
+        # 速度/位移/时间三者不相容判为动力学不可行。
+        current_v = max(0.0, float(context.ego_vehicle.v))
+        travel_s = max(
+            min_progress,
+            0.5 * (current_v + float(target_v)) * float(plan_t),
+        )
     else:
         travel_s = max(min_progress, float(travel_s_override))
     target_s = _clamp(

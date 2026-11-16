@@ -1,0 +1,788 @@
+{
+  "version": 1,
+  "description": "伴行场景泛化 case：八方位保持、VUT 加速跟随、初始偏差收敛、有限时长完成、退化负样本、主场景协同、多伴行。地图同济测试场 road 288 直线走廊，GVT 只控纵向，不做横向换道。",
+  "map_cache": "xodr_parser/cache/同济测试场.pkl",
+  "scenario_algorithm": "scenarios.companion_algorithm.companion_algorithm",
+  "planner_mode": "scene_target",
+  "corridor": {
+    "vut": {
+      "start_xy": [
+        393.836978,
+        235.736749
+      ],
+      "goal_xy": [
+        157.350323,
+        251.810564
+      ]
+    },
+    "left_goal": [
+      180.323101,
+      248.156222
+    ],
+    "right_goal": [
+      180.170119,
+      252.259999
+    ]
+  },
+  "vehicle_limits": {
+    "max_speed_kph": 25.0,
+    "min_acc": -3.0,
+    "max_acc": 3.0
+  },
+  "simulation": {
+    "dt": 0.1,
+    "steady_min_v_mps": 3.0
+  },
+  "tolerances": {
+    "inside_slot_ratio_min": 0.95,
+    "lane_relation_ratio_min": 0.99,
+    "steady_rel_s_error_max_m": 0.5,
+    "low_speed_rel_s_error_max_m": 1.5,
+    "steady_rel_v_max_mps": 0.3,
+    "completion_time_s": 8.0,
+    "completion_time_tol_s": 0.5,
+    "recover_time_max_s": 5.0,
+    "runway_min_m": 20.0
+  },
+  "anchors": {
+    "front": [
+      381.865704,
+      236.56657
+    ],
+    "rear": [
+      405.80783,
+      234.900871
+    ],
+    "left": [
+      393.580519,
+      232.051046
+    ],
+    "right": [
+      394.095767,
+      239.458079
+    ],
+    "left_front": [
+      385.599716,
+      232.604922
+    ],
+    "right_front": [
+      386.114961,
+      240.011916
+    ],
+    "left_rear": [
+      401.561135,
+      231.494476
+    ],
+    "right_rear": [
+      402.076386,
+      238.90156
+    ],
+    "front_plus20": [
+      373.884652,
+      237.116842
+    ],
+    "rear_minus20": [
+      413.788133,
+      234.339832
+    ]
+  },
+  "cases": [
+    {
+      "id": "A1",
+      "group": "A",
+      "position": "front",
+      "anchor": "front",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "同车道前车保持，目标 rel_s +12 m"
+    },
+    {
+      "id": "A2",
+      "group": "A",
+      "position": "rear",
+      "anchor": "rear",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "同车道后车保持，目标 rel_s -12 m"
+    },
+    {
+      "id": "A3",
+      "group": "A",
+      "position": "left",
+      "anchor": "left",
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左侧并排保持，目标 rel_s 0 m"
+    },
+    {
+      "id": "A4",
+      "group": "A",
+      "position": "right",
+      "anchor": "right",
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "右侧并排保持，目标 rel_s 0 m"
+    },
+    {
+      "id": "A5",
+      "group": "A",
+      "position": "left_front",
+      "anchor": "left_front",
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左前保持，目标 rel_s +8 m"
+    },
+    {
+      "id": "A6",
+      "group": "A",
+      "position": "right_front",
+      "anchor": "right_front",
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "右前保持，目标 rel_s +8 m"
+    },
+    {
+      "id": "A7",
+      "group": "A",
+      "position": "left_rear",
+      "anchor": "left_rear",
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左后保持，目标 rel_s -8 m"
+    },
+    {
+      "id": "A8",
+      "group": "A",
+      "position": "right_rear",
+      "anchor": "right_rear",
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 150,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "右后保持，目标 rel_s -8 m"
+    },
+    {
+      "id": "B1",
+      "group": "B",
+      "position": "left",
+      "anchor": "left",
+      "goal": "left",
+      "vut_motion": "idm",
+      "vut_start_speed": 0.0,
+      "vut_desired_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "VUT 0→5 加速，左侧并排跟随"
+    },
+    {
+      "id": "B2",
+      "group": "B",
+      "position": "front",
+      "anchor": "front",
+      "goal": "vut",
+      "vut_motion": "idm",
+      "vut_start_speed": 0.0,
+      "vut_desired_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "VUT 0→5 加速，前车跟随"
+    },
+    {
+      "id": "B3",
+      "group": "B",
+      "position": "left_front",
+      "anchor": "left_front",
+      "goal": "left",
+      "vut_motion": "idm",
+      "vut_start_speed": 0.0,
+      "vut_desired_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "VUT 0→5 加速，左前跟随"
+    },
+    {
+      "id": "B4",
+      "group": "B",
+      "position": "rear",
+      "anchor": "rear",
+      "goal": "vut",
+      "vut_motion": "idm",
+      "vut_start_speed": 0.0,
+      "vut_desired_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "VUT 0→5 加速，后车跟随"
+    },
+    {
+      "id": "C1",
+      "group": "C",
+      "position": "left",
+      "start_xy": [
+        391.286038,
+        232.210285
+      ],
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左侧相邻车道，起点纵向 +2.3 m（目标 0，窗口 ±2 m），ACQUIRE 收敛"
+    },
+    {
+      "id": "C2",
+      "group": "C",
+      "position": "left",
+      "start_xy": [
+        395.875,
+        231.891807
+      ],
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左侧相邻车道，起点纵向 -2.3 m（目标 0，窗口 ±2 m），ACQUIRE 收敛"
+    },
+    {
+      "id": "C3",
+      "group": "C",
+      "position": "right",
+      "start_xy": [
+        391.601765,
+        239.631153
+      ],
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "右侧相邻车道，起点纵向 +2.5 m（目标 0，窗口 ±2 m），ACQUIRE 收敛"
+    },
+    {
+      "id": "C4",
+      "group": "C",
+      "position": "right",
+      "start_xy": [
+        396.589769,
+        239.285005
+      ],
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "右侧相邻车道，起点纵向 -2.5 m（目标 0，窗口 ±2 m），ACQUIRE 收敛"
+    },
+    {
+      "id": "C5",
+      "group": "C",
+      "position": "front",
+      "anchor": "front_plus20",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "同车道前车，起点 rel_s +20 m（目标 +12，窗口 [8,16]，偏差 +8 m），验证 1.0 m/s 单步限幅修复"
+    },
+    {
+      "id": "C6",
+      "group": "C",
+      "position": "rear",
+      "anchor": "rear_minus20",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 200,
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "同车道后车，起点 rel_s -20 m（目标 -12，窗口 [-16,-8]，偏差 -8 m），验证 1.0 m/s 单步限幅修复"
+    },
+    {
+      "id": "D1",
+      "group": "D",
+      "position": "left",
+      "anchor": "left",
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "duration_s": 8.0,
+      "max_steps": 150,
+      "expect": [
+        "scene_completed"
+      ],
+      "notes": "左侧伴行 8 s 后 COMPLETE"
+    },
+    {
+      "id": "D2",
+      "group": "D",
+      "position": "front",
+      "anchor": "front",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "duration_s": 8.0,
+      "max_steps": 150,
+      "expect": [
+        "scene_completed"
+      ],
+      "notes": "前车伴行 8 s 后 COMPLETE"
+    },
+    {
+      "id": "D3",
+      "group": "D",
+      "position": "left_front",
+      "anchor": "left_front",
+      "goal": "left",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "duration_s": 8.0,
+      "max_steps": 150,
+      "expect": [
+        "scene_completed"
+      ],
+      "notes": "左前伴行 8 s 后 COMPLETE"
+    },
+    {
+      "id": "E1",
+      "group": "E",
+      "archive_group": "负样本/几何不满足",
+      "position": "left",
+      "start_xy": [
+        394.095767,
+        239.458079
+      ],
+      "goal": "right",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "max_steps": 100,
+      "expect": [
+        "waiting_formation_geometry",
+        "degraded_exit"
+      ],
+      "expect_no_stop": true,
+      "notes": "方位为 left 但 GVT 在右车道，几何不满足，只等待不紧急停车"
+    },
+    {
+      "id": "E2",
+      "group": "E",
+      "archive_group": "负样本/道路不足",
+      "position": "left",
+      "start_xy": [
+        391.086518,
+        232.224132
+      ],
+      "goal_xy": [
+        389.091318,
+        232.362632
+      ],
+      "vut_motion": "constant",
+      "vut_start_speed": 0.0,
+      "max_steps": 60,
+      "expect": [
+        "degraded_exit"
+      ],
+      "expect_no_stop": true,
+      "notes": "可用路线不足 3 m，ACQUIRE 阶段进入 degraded_exit，不紧急停车（GVT/VUT 静止，保证停车目标本身可执行）"
+    },
+    {
+      "id": "E3",
+      "group": "E",
+      "archive_group": "负样本/配置非法",
+      "position": "front",
+      "anchor": "front",
+      "goal": "vut",
+      "vut_motion": "constant",
+      "vut_start_speed": 5.0,
+      "rel_s_min_m": 8.0,
+      "rel_s_target_m": -5.0,
+      "rel_s_max_m": 16.0,
+      "max_steps": 100,
+      "expect": [
+        "degraded_exit"
+      ],
+      "expect_no_stop": true,
+      "notes": "目标 rel_s 不在窗口内，配置校验失败，进入 degraded_exit"
+    },
+    {
+      "id": "F1",
+      "group": "F",
+      "multi": {
+        "primary_vehicle_id": "cutin_gvt",
+        "max_steps": 220,
+        "vut": {
+          "start_xy": [
+            393.836978,
+            235.736749
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "motion": "idm",
+          "start_speed": 5.0,
+          "desired_speed": 5.0
+        },
+        "primary": {
+          "id": "cutin_gvt",
+          "algorithm": "scenarios.cut_in_algorithm.cut_in_algorithm",
+          "start_xy": [
+            393.487496,
+            232.057519
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "start_speed": 5.0,
+          "max_speed_kph": 36.0,
+          "environment": {}
+        },
+        "companions": [
+          {
+            "id": "companion_front",
+            "position": "front",
+            "start_xy": [
+              381.865704,
+              236.56657
+            ],
+            "goal_xy": [
+              157.350323,
+              251.810564
+            ],
+            "start_speed": 5.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": 8.0,
+            "rel_s_target_m": 12.0,
+            "rel_s_max_m": 16.0,
+            "primary_ptc_id": "cutin_gvt",
+            "primary_scene_type": "cut_in"
+          }
+        ]
+      },
+      "expect": [
+        "hold_released_gap",
+        "recover_slot"
+      ],
+      "notes": "前车 + 切入主场景：切入车占用前车释放空间，前车应向前释放；切入车完成后仍位于 VUT 与前车之间，原窗口不可恢复，保持 hold_released_gap 属于正确行为"
+    },
+    {
+      "id": "F2",
+      "group": "F",
+      "multi": {
+        "primary_vehicle_id": "cutin_gvt",
+        "max_steps": 220,
+        "vut": {
+          "start_xy": [
+            393.836978,
+            235.736749
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "motion": "idm",
+          "start_speed": 5.0,
+          "desired_speed": 5.0
+        },
+        "primary": {
+          "id": "cutin_gvt",
+          "algorithm": "scenarios.cut_in_algorithm.cut_in_algorithm",
+          "start_xy": [
+            393.487496,
+            232.057519
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "start_speed": 5.0,
+          "max_speed_kph": 36.0,
+          "environment": {}
+        },
+        "companions": [
+          {
+            "id": "companion_rear",
+            "position": "rear",
+            "start_xy": [
+              405.80783,
+              234.900871
+            ],
+            "goal_xy": [
+              157.350323,
+              251.810564
+            ],
+            "start_speed": 5.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": -16.0,
+            "rel_s_target_m": -12.0,
+            "rel_s_max_m": -8.0,
+            "primary_ptc_id": "cutin_gvt",
+            "primary_scene_type": "cut_in"
+          }
+        ]
+      },
+      "expect": [
+        "hold_slot",
+        "recover_slot"
+      ],
+      "notes": "后车 + 切入主场景：切入车在 VUT 前方，后车作为不干扰对照"
+    },
+    {
+      "id": "F3",
+      "group": "F",
+      "multi": {
+        "primary_vehicle_id": "braking_gvt",
+        "max_steps": 350,
+        "vut": {
+          "start_xy": [
+            393.836978,
+            235.736749
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "motion": "idm",
+          "start_speed": 0.0,
+          "desired_speed": 5.0
+        },
+        "primary": {
+          "id": "braking_gvt",
+          "algorithm": "scenarios.braking_algorithm.braking_algorithm",
+          "start_xy": [
+            363.908139,
+            237.801819
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "start_speed": 0.0,
+          "max_speed_kph": 36.0,
+          "environment": {}
+        },
+        "companions": [
+          {
+            "id": "companion_left",
+            "position": "left",
+            "start_xy": [
+              393.580519,
+              232.051046
+            ],
+            "goal_xy": [
+              180.323101,
+              248.156222
+            ],
+            "start_speed": 0.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": -2.0,
+            "rel_s_target_m": 0.0,
+            "rel_s_max_m": 2.0,
+            "primary_ptc_id": "braking_gvt",
+            "primary_scene_type": "emergency_braking"
+          }
+        ],
+        "stop_on_terminal_vehicle_ids": [
+          "braking_gvt"
+        ]
+      },
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "左并排 + 紧急制动主场景：制动车在 VUT 车道，左侧伴行只保持 rel_s 0，不参与释放（前车方案会挡住 VUT 逼近制动车，导致制动永远不触发，已弃用）"
+    },
+    {
+      "id": "F4",
+      "group": "F",
+      "multi": {
+        "primary_vehicle_id": "braking_gvt",
+        "max_steps": 350,
+        "vut": {
+          "start_xy": [
+            393.836978,
+            235.736749
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "motion": "idm",
+          "start_speed": 0.0,
+          "desired_speed": 5.0
+        },
+        "primary": {
+          "id": "braking_gvt",
+          "algorithm": "scenarios.braking_algorithm.braking_algorithm",
+          "start_xy": [
+            363.908139,
+            237.801819
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "start_speed": 0.0,
+          "max_speed_kph": 36.0,
+          "environment": {}
+        },
+        "companions": [
+          {
+            "id": "companion_rear",
+            "position": "rear",
+            "start_xy": [
+              405.80783,
+              234.900871
+            ],
+            "goal_xy": [
+              157.350323,
+              251.810564
+            ],
+            "start_speed": 0.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": -16.0,
+            "rel_s_target_m": -12.0,
+            "rel_s_max_m": -8.0,
+            "primary_ptc_id": "braking_gvt",
+            "primary_scene_type": "emergency_braking"
+          }
+        ],
+        "stop_on_terminal_vehicle_ids": [
+          "braking_gvt"
+        ]
+      },
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "后车 + 紧急制动主场景：VUT 跟随制动，后车保持 -12 m"
+    },
+    {
+      "id": "G1",
+      "group": "G",
+      "multi": {
+        "primary_vehicle_id": "",
+        "max_steps": 220,
+        "vut": {
+          "start_xy": [
+            393.836978,
+            235.736749
+          ],
+          "goal_xy": [
+            157.350323,
+            251.810564
+          ],
+          "motion": "constant",
+          "start_speed": 5.0,
+          "desired_speed": 5.0
+        },
+        "primary": null,
+        "companions": [
+          {
+            "id": "companion_left",
+            "position": "left",
+            "start_xy": [
+              393.580519,
+              232.051046
+            ],
+            "goal_xy": [
+              180.323101,
+              248.156222
+            ],
+            "start_speed": 5.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": -2.0,
+            "rel_s_target_m": 0.0,
+            "rel_s_max_m": 2.0
+          },
+          {
+            "id": "companion_rear",
+            "position": "rear",
+            "start_xy": [
+              405.80783,
+              234.900871
+            ],
+            "goal_xy": [
+              157.350323,
+              251.810564
+            ],
+            "start_speed": 5.0,
+            "max_speed_kph": 36.0,
+            "rel_s_min_m": -16.0,
+            "rel_s_target_m": -12.0,
+            "rel_s_max_m": -8.0
+          }
+        ]
+      },
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "双伴行：左侧并排 + 后车，互不干扰"
+    },
+    {
+      "id": "G2",
+      "group": "G",
+      "multi_config": "configs/emergency_braking_seven_companions.json",
+      "expect": [
+        "hold_slot"
+      ],
+      "notes": "七车伴行 + 紧急制动回归（复用现有配置）"
+    }
+  ]
+}
